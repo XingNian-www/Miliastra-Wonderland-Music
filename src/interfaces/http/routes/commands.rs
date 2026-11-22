@@ -155,6 +155,21 @@ fn validate_reply_items(
         if reply.key.trim().is_empty() || !seen.insert(reply.key.clone()) {
             return Err(bad_request("回复key不能为空且不能重复"));
         }
+        // 静态 key 必须属于该命令；custom: 前缀的自定义行始终允许。
+        //
+        // 这条校验必须放在下面"留空=恢复默认"之前：留空的行同样会被写进保存列表
+        // （行的存在表示"该回复启用"），若跳过 key 校验，任意他命令的静态 key
+        // 只要留空文本就能落库，等于给"静音"开了一条绕过白名单的后门。
+        if !static_keys.contains(reply.key.as_str())
+            && !reply
+                .key
+                .strip_prefix("custom:")
+                .is_some_and(|suffix| !suffix.trim().is_empty())
+        {
+            return Err(bad_request(
+                "静态回复key不属于该命令，自定义key必须使用custom:前缀",
+            ));
+        }
         // 留空 = 使用内置默认，但**仍要保留这一行**。
         //
         // 关键区别：行的存在表示"该回复启用"，行的缺失才表示"该回复被停用"。
@@ -174,17 +189,6 @@ fn validate_reply_items(
         }
         if reply.text.contains('\r') {
             return Err(bad_request("回复文案不能包含回车符，请使用换行"));
-        }
-        // 静态 key 必须属于该命令；custom: 前缀的自定义行始终允许。
-        if !static_keys.contains(reply.key.as_str())
-            && !reply
-                .key
-                .strip_prefix("custom:")
-                .is_some_and(|suffix| !suffix.trim().is_empty())
-        {
-            return Err(bad_request(
-                "静态回复key不属于该命令，自定义key必须使用custom:前缀",
-            ));
         }
         validate_reply_variables(&reply.text).map_err(|reason| bad_request(&reason))?;
         saved.push(StoredReply {
@@ -487,6 +491,28 @@ mod reply_api_tests {
             validate_reply_items(
                 &single_reply_entry(),
                 vec![item("playback.volume.set", "音量 {音量}".to_owned())],
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn blank_rows_still_must_belong_to_the_command() {
+        // 留空 = 恢复默认，但 key 归属校验不能被跳过：否则任意他命令的静态 key
+        // 只要留空文本就能写进本命令的保存列表，等于给“静音”开一条后门。
+        assert!(
+            validate_reply_items(
+                &help_song_entry(),
+                vec![item("playback.volume.set", String::new())],
+            )
+            .is_err(),
+            "留空行不能绕过 key 归属白名单"
+        );
+        // custom: 行本来就不查静态白名单，留空仍应被接受。
+        assert!(
+            validate_reply_items(
+                &help_song_entry(),
+                vec![item("custom:muted", "  ".to_owned())],
             )
             .is_ok()
         );

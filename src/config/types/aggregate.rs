@@ -167,7 +167,7 @@ impl Default for AppConfig {
     /// 校验失败会阻断初始化。screen/ocr/templates 的默认值见各段 Default；
     /// invite/moderation/startup 的段 Default 含 0 值/空路径（位于各自功能模块），
     /// 无法通过校验，因此这里显式给出与完整配置模板一致的有效值。
-    /// 区域坐标沿用 tests/fixtures/config.full.yaml 的 1920x1080 布局，
+    /// 区域坐标沿用 src/config/test.full.yaml 的 1920x1080 布局，
     /// 路径类默认使用发布布局（deps/models、deps/templates、deps/data）。
     fn default() -> Self {
         Self {
@@ -398,13 +398,68 @@ pub struct BootstrapConfig {
     pub logging: LoggingConfig,
 }
 
+/// 发布打包的初始化子命令（`miliastra-wonderland-music --ensure-config-db <path>`）。
+///
+/// 它只在构建机上生成空配置库结构，**不能**把构建机的面板令牌写进
+/// config.yaml 随包分发（否则所有用户共用同一令牌）。
+const INIT_ONLY_FLAG: &str = "--ensure-config-db";
+/// 显式开关：任何调用方（含未改动的入口）都可以用它进入「只建库、不发令牌」模式。
+const INIT_ONLY_ENV: &str = "MILIASTRA_INIT_ONLY";
+/// 初始化模式的内存占位令牌。
+///
+/// 空令牌会让完整校验失败（`http.access_token 不能为空`），所以初始化模式用这个
+/// 明显不可用的占位值走完校验；它**不写 config.yaml、也不落配置库**（http 段不落库），
+/// 进程退出即丢弃。正式启动仍会生成真正的随机令牌并持久化。
+const INIT_ONLY_PLACEHOLDER_TOKEN: &str = "init-only-placeholder-not-a-runtime-token";
+
+/// 引导配置加载模式：正式启动 / 打包初始化。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BootstrapMode {
+    /// 正式启动：空令牌自动生成并回写 config.yaml。
+    Runtime,
+    /// 打包初始化（`--ensure-config-db`）：只建库 + 校验，不回写 config.yaml。
+    InitOnly,
+}
+
+impl BootstrapMode {
+    fn detect() -> Self {
+        if init_only_requested(
+            std::env::var_os(INIT_ONLY_ENV).is_some(),
+            std::env::args_os().skip(1),
+        ) {
+            Self::InitOnly
+        } else {
+            Self::Runtime
+        }
+    }
+}
+
+/// 初始化模式判定（纯函数，便于单测）。
+///
+/// 入口在 `main.rs`：`--ensure-config-db` 分支只做建库/校验，不启动运行时。
+/// 本层不改入口，因此同时识别该子命令参数与显式环境变量；两者任一成立即初始化模式。
+fn init_only_requested(
+    env_switch: bool,
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+) -> bool {
+    env_switch
+        || args
+            .into_iter()
+            .any(|arg| arg.to_str() == Some(INIT_ONLY_FLAG))
+}
+
 impl BootstrapConfig {
     /// 从 config.yaml 加载最小启动配置。
     ///
     /// 严格解析（[`deny_unknown_fields`]）：只允许 database_path、http、logging 三个引导段。
-    /// access_token 缺失时自动生成并持久化；database_path 为相对路径时相对
-    /// `executable_root`（EXE 所在目录）解析为绝对路径。
+    /// 正式启动时 access_token 缺失会自动生成并持久化；打包初始化
+    /// （`--ensure-config-db` / `MILIASTRA_INIT_ONLY`）只校验、不回写。
+    /// database_path 为相对路径时相对 `executable_root`（EXE 所在目录）解析为绝对路径。
     pub fn load(path: &Path, executable_root: &Path) -> Result<Self> {
+        Self::load_with_mode(path, executable_root, BootstrapMode::detect())
+    }
+
+    fn load_with_mode(path: &Path, executable_root: &Path, mode: BootstrapMode) -> Result<Self> {
         const BOOTSTRAP_ONLY_HINT: &str = "config.yaml 只允许 database_path、http、logging 三个引导段，其余配置请通过 Web 面板「配置中心」管理";
         let text = fs::read_to_string(path)
             .with_context(|| format!("读取启动配置失败: {}", path.display()))?;
@@ -418,15 +473,158 @@ impl BootstrapConfig {
             bail!("config.yaml 的 database_path 不能为空。{BOOTSTRAP_ONLY_HINT}");
         }
         if bootstrap.http.access_token.trim().is_empty() {
-            bootstrap.http.access_token = uuid::Uuid::new_v4().simple().to_string();
-            let serialized = serde_norway::to_string(&bootstrap).context("序列化启动配置失败")?;
-            write_atomic(path, serialized.as_bytes(), "启动配置")
-                .with_context(|| format!("写入自动生成的访问令牌失败: {}", path.display()))?;
+            match mode {
+                BootstrapMode::Runtime => {
+                    bootstrap.http.access_token = uuid::Uuid::new_v4().simple().to_string();
+                    let serialized =
+                        serde_norway::to_string(&bootstrap).context("序列化启动配置失败")?;
+                    write_atomic(path, serialized.as_bytes(), "启动配置").with_context(|| {
+                        format!("写入自动生成的访问令牌失败: {}", path.display())
+                    })?;
+                }
+                BootstrapMode::InitOnly => {
+                    bootstrap.http.access_token = INIT_ONLY_PLACEHOLDER_TOKEN.to_string();
+                }
+            }
         }
         if bootstrap.database_path.is_relative() {
             bootstrap.database_path = executable_root.join(&bootstrap.database_path);
         }
         Ok(bootstrap)
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_token_tests {
+    use std::ffi::OsString;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use super::{BootstrapConfig, BootstrapMode, INIT_ONLY_FLAG, init_only_requested};
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "bootstrap-token-{tag}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&root).expect("创建临时目录");
+        root
+    }
+
+    fn write_bootstrap_config(root: &Path) -> PathBuf {
+        let path = root.join("config.yaml");
+        let text = r#"database_path: deps/data/playback.sqlite3
+http:
+  host: 127.0.0.1
+  port: 18888
+  enabled: true
+  access_token: ""
+logging:
+  dir: deps/logs
+  level: info
+  rotate_daily: true
+  retain_days: 7
+"#;
+        fs::write(&path, text).expect("写 config.yaml");
+        path
+    }
+
+    /// B11-P1-1：发布打包的初始化路径不得生成/回写面板令牌。
+    #[test]
+    fn packaging_init_mode_neither_generates_nor_rewrites_the_access_token() {
+        let root = temp_root("init");
+        let path = write_bootstrap_config(&root);
+        let before = fs::read(&path).expect("读取原始 config.yaml");
+
+        let bootstrap = BootstrapConfig::load_with_mode(&path, &root, BootstrapMode::InitOnly)
+            .expect("初始化模式必须能加载并通过引导校验");
+        // 完整校验要求令牌非空，初始化模式只能用「明显不可用」的内存占位值；
+        // 它既没有写进 config.yaml，也不会落库（http 段不落库），进程结束即丢弃。
+        assert_eq!(
+            bootstrap.http.access_token,
+            super::INIT_ONLY_PLACEHOLDER_TOKEN,
+            "初始化模式不得生成真实访问令牌（只允许内存占位）"
+        );
+
+        let after = fs::read(&path).expect("读取初始化后的 config.yaml");
+        assert_eq!(before, after, "初始化模式不得改写 config.yaml");
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// 初始化路径的完整链路：建库 + 完整校验必须成功，且库文件里不得出现令牌。
+    #[test]
+    fn packaging_init_mode_builds_a_valid_database_without_any_token() {
+        let root = temp_root("full-init");
+        let path = write_bootstrap_config(&root);
+        let before = fs::read(&path).expect("读取原始 config.yaml");
+
+        let bootstrap = BootstrapConfig::load_with_mode(&path, &root, BootstrapMode::InitOnly)
+            .expect("初始化模式必须能加载引导配置");
+        let store =
+            crate::config::ConfigStore::open(&bootstrap.database_path, &root, bootstrap.clone())
+                .expect("初始化模式必须能建库");
+        let config = store.load_full().expect("初始化模式必须通过完整配置校验");
+        assert_eq!(
+            config.http.access_token,
+            super::INIT_ONLY_PLACEHOLDER_TOKEN,
+            "内存占位值必须能通过完整校验"
+        );
+        drop(store);
+
+        // config.yaml 原样保留，库文件里也没有任何真实/占位令牌字样。
+        assert_eq!(
+            fs::read(&path).expect("读取初始化后的 config.yaml"),
+            before,
+            "初始化模式不得改写 config.yaml"
+        );
+        let placeholder = super::INIT_ONLY_PLACEHOLDER_TOKEN.as_bytes();
+        let database = fs::read(&bootstrap.database_path).expect("读取初始化后的配置库");
+        assert!(
+            !database
+                .windows(placeholder.len())
+                .any(|window| window == placeholder),
+            "配置库不得写入访问令牌（http 段不落库）"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// 回归另一半：正式启动仍要在首次运行生成并持久化随机令牌。
+    #[test]
+    fn runtime_mode_still_generates_and_persists_the_access_token() {
+        let root = temp_root("runtime");
+        let path = write_bootstrap_config(&root);
+
+        let bootstrap = BootstrapConfig::load_with_mode(&path, &root, BootstrapMode::Runtime)
+            .expect("正式启动必须能加载配置");
+        let token = bootstrap.http.access_token.clone();
+        assert_eq!(token.len(), 32, "必须是 uuid v4 simple 形式的令牌");
+        assert_ne!(token, super::INIT_ONLY_PLACEHOLDER_TOKEN);
+
+        // 第二次加载必须读到同一令牌，且文件内容确实被回写。
+        let persisted = BootstrapConfig::load_with_mode(&path, &root, BootstrapMode::InitOnly)
+            .expect("回写后的配置必须可再次加载");
+        assert_eq!(persisted.http.access_token, token);
+        let text = fs::read_to_string(&path).expect("读取回写后的 config.yaml");
+        assert!(text.contains(&token), "config.yaml 必须持久化访问令牌");
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// 初始化模式判定同时覆盖显式环境变量与发布打包子命令。
+    #[test]
+    fn init_mode_is_detected_from_the_env_switch_or_the_packaging_flag() {
+        assert!(init_only_requested(true, std::iter::empty()));
+        assert!(init_only_requested(
+            false,
+            [
+                OsString::from(INIT_ONLY_FLAG),
+                OsString::from("config.yaml")
+            ]
+        ));
+        assert!(!init_only_requested(
+            false,
+            [OsString::from("--help"), OsString::from("config.yaml")]
+        ));
+        assert!(!init_only_requested(false, std::iter::empty()));
     }
 }
 
@@ -524,6 +722,12 @@ impl AppConfig {
             (
                 self.moderation.confirm_button_region,
                 "moderation.confirm_button_region",
+            ),
+            // 确认弹窗关键词行与确认按钮成对使用（双命中判定子类型），
+            // 越界同样不能落库：ModerationConfig::validate 只看宽高非零，看不到画布。
+            (
+                self.moderation.confirm_message_region,
+                "moderation.confirm_message_region",
             ),
             (
                 self.startup.enter_game_text_region,
@@ -662,6 +866,11 @@ impl AppConfig {
             &mut self.templates.secondary_back,
             &mut self.templates.secondary_hall,
             &mut self.templates.secondary_chat_submit,
+            // 千星主菜单锚点与 F2 大厅两个按钮：与其它模板同一套解析规则。
+            // 漏解析时 CWD≠exe 目录会让相对路径原样传给模板加载，运行期才静默失败。
+            &mut self.templates.main_menu,
+            &mut self.templates.qianxing_f2_hall_list,
+            &mut self.templates.qianxing_f2_invite_player,
             &mut self.templates.qianxing_exit_menu,
             &mut self.templates.qianxing_map_label,
             &mut self.templates.qianxing_profile_page_wishlist,
@@ -722,6 +931,213 @@ impl AppConfig {
                 resolve_path(executable_root, &mut path);
                 *template = path.to_string_lossy().into_owned();
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod runtime_path_and_geometry_tests {
+    use std::path::{Path, PathBuf};
+
+    use super::AppConfig;
+    use crate::config::RectConfig;
+
+    /// 模板路径必须**全部**走 `resolve_runtime_paths`：漏一个，CWD≠exe 目录时
+    /// 相对路径会原样传给模板加载，运行期才静默失败。
+    ///
+    /// 这里用「相对路径 → 必须变成 root 下的绝对路径」逐字段验证，不抄手写清单
+    /// （缺陷正是清单漏项：`main_menu` / `qianxing_f2_hall_list` /
+    /// `qianxing_f2_invite_player` 三个字段在结构体与 schema 里都有，却不在解析清单里）。
+    #[test]
+    fn every_template_path_is_resolved_against_the_executable_root() {
+        let mut config = AppConfig::default();
+        // 全部置成同一个相对名：解析成功的字段会变成 root.join(name)。
+        let relative = PathBuf::from("assets/probe.png");
+        config.templates.blue_marker = relative.clone();
+        config.templates.yellow_marker = relative.clone();
+        config.templates.pink_marker = relative.clone();
+        config.templates.secondary_back = relative.clone();
+        config.templates.secondary_hall = relative.clone();
+        config.templates.secondary_chat_submit = relative.clone();
+        config.templates.main_menu = relative.clone();
+        config.templates.world_wish = relative.clone();
+        config.templates.invite_view_star = relative.clone();
+        config.templates.invite_goto_hall = relative.clone();
+        config.templates.invite_enter_hall = relative.clone();
+        config.templates.friend_panel = relative.clone();
+        config.templates.friend_search_panel = relative.clone();
+        config.templates.friend_more_settings = relative.clone();
+        config.templates.friend_block_chat = relative.clone();
+        config.templates.friend_blacklist = relative.clone();
+        config.templates.confirm_button = relative.clone();
+        config.templates.confirm_message_random_hall = relative.clone();
+        config.templates.confirm_message_return_teyvat = relative.clone();
+        config.templates.confirm_message_block = relative.clone();
+        config.templates.qianxing_f2_hall_list = relative.clone();
+        config.templates.qianxing_f2_invite_player = relative.clone();
+        config.templates.qianxing_exit_menu = relative.clone();
+        config.templates.qianxing_map_label = relative.clone();
+        config.templates.qianxing_profile_page_wishlist = relative.clone();
+        config.templates.qianxing_profile_page_wardrobe = relative.clone();
+        config.templates.teyvat_profile_adventure_rank = relative.clone();
+        config.templates.teyvat_profile_world_level = relative.clone();
+        config.templates.teyvat_profile_add_friend = relative.clone();
+        config.templates.qianxing_profile_domain_level = relative.clone();
+        config.templates.qianxing_profile_add_friend = relative.clone();
+        config.templates.qianxing_profile_view_profile = relative.clone();
+
+        let root = Path::new("/probe/executable/root");
+        config.resolve_runtime_paths(root);
+
+        // 逐字段断言，失败时点名是哪个字段没被解析。
+        let fields: Vec<(&str, &Path)> = vec![
+            ("templates.blue_marker", &config.templates.blue_marker),
+            ("templates.yellow_marker", &config.templates.yellow_marker),
+            ("templates.pink_marker", &config.templates.pink_marker),
+            ("templates.secondary_back", &config.templates.secondary_back),
+            ("templates.secondary_hall", &config.templates.secondary_hall),
+            (
+                "templates.secondary_chat_submit",
+                &config.templates.secondary_chat_submit,
+            ),
+            ("templates.main_menu", &config.templates.main_menu),
+            ("templates.world_wish", &config.templates.world_wish),
+            (
+                "templates.invite_view_star",
+                &config.templates.invite_view_star,
+            ),
+            (
+                "templates.invite_goto_hall",
+                &config.templates.invite_goto_hall,
+            ),
+            (
+                "templates.invite_enter_hall",
+                &config.templates.invite_enter_hall,
+            ),
+            ("templates.friend_panel", &config.templates.friend_panel),
+            (
+                "templates.friend_search_panel",
+                &config.templates.friend_search_panel,
+            ),
+            (
+                "templates.friend_more_settings",
+                &config.templates.friend_more_settings,
+            ),
+            (
+                "templates.friend_block_chat",
+                &config.templates.friend_block_chat,
+            ),
+            (
+                "templates.friend_blacklist",
+                &config.templates.friend_blacklist,
+            ),
+            ("templates.confirm_button", &config.templates.confirm_button),
+            (
+                "templates.confirm_message_random_hall",
+                &config.templates.confirm_message_random_hall,
+            ),
+            (
+                "templates.confirm_message_return_teyvat",
+                &config.templates.confirm_message_return_teyvat,
+            ),
+            (
+                "templates.confirm_message_block",
+                &config.templates.confirm_message_block,
+            ),
+            (
+                "templates.qianxing_f2_hall_list",
+                &config.templates.qianxing_f2_hall_list,
+            ),
+            (
+                "templates.qianxing_f2_invite_player",
+                &config.templates.qianxing_f2_invite_player,
+            ),
+            (
+                "templates.qianxing_exit_menu",
+                &config.templates.qianxing_exit_menu,
+            ),
+            (
+                "templates.qianxing_map_label",
+                &config.templates.qianxing_map_label,
+            ),
+            (
+                "templates.qianxing_profile_page_wishlist",
+                &config.templates.qianxing_profile_page_wishlist,
+            ),
+            (
+                "templates.qianxing_profile_page_wardrobe",
+                &config.templates.qianxing_profile_page_wardrobe,
+            ),
+            (
+                "templates.teyvat_profile_adventure_rank",
+                &config.templates.teyvat_profile_adventure_rank,
+            ),
+            (
+                "templates.teyvat_profile_world_level",
+                &config.templates.teyvat_profile_world_level,
+            ),
+            (
+                "templates.teyvat_profile_add_friend",
+                &config.templates.teyvat_profile_add_friend,
+            ),
+            (
+                "templates.qianxing_profile_domain_level",
+                &config.templates.qianxing_profile_domain_level,
+            ),
+            (
+                "templates.qianxing_profile_add_friend",
+                &config.templates.qianxing_profile_add_friend,
+            ),
+            (
+                "templates.qianxing_profile_view_profile",
+                &config.templates.qianxing_profile_view_profile,
+            ),
+        ];
+        for (field, resolved) in fields {
+            assert!(
+                resolved.is_absolute(),
+                "{field} 必须被解析成绝对路径，实际：{}",
+                resolved.display()
+            );
+            assert!(
+                resolved.ends_with(&relative),
+                "{field} 必须挂在 exe 根下，实际：{}",
+                resolved.display()
+            );
+        }
+    }
+
+    /// 画布越界校验必须覆盖 `moderation.confirm_message_region`：
+    /// 它与 `confirm_button_region` 成对参与「确认按钮 + 文案」双命中判定，
+    /// 只校验按钮会让文案行越界值落库，运行期 OCR 区域跑到画布外。
+    #[test]
+    fn confirm_message_region_is_bounds_checked_against_the_canvas() {
+        // 默认值必须合法（不能因为补校验把默认配置打死）。
+        AppConfig::default()
+            .validate_ui_geometry()
+            .expect("默认配置的确认文案区域必须合法");
+
+        for (x, y, width, height) in [
+            (-1, 460, 620, 90),   // 负坐标
+            (650, -1, 620, 90),   // 负坐标
+            (1920, 460, 620, 90), // 右越界
+            (650, 1080, 620, 90), // 下越界
+        ] {
+            let mut config = AppConfig::default();
+            config.moderation.confirm_message_region = RectConfig {
+                x,
+                y,
+                width,
+                height,
+            };
+            let error = config
+                .validate_ui_geometry()
+                .expect_err("越界的确认文案区域必须被拒绝")
+                .to_string();
+            assert!(
+                error.contains("moderation.confirm_message_region"),
+                "错误信息必须点名 moderation.confirm_message_region，实际：{error}"
+            );
         }
     }
 }

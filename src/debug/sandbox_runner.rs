@@ -2389,9 +2389,14 @@ mod read_only_tests {
 
     #[test]
     fn read_only_full_real_frame_and_state_window_queue_assertions_work_without_mode_change() {
+        if crate::test_support::corpus::skip_without_corpus(
+            "read_only_full_real_frame_and_state_window_queue_assertions_work_without_mode_change",
+        ) {
+            return;
+        }
         // 串行化：这些用例会改全局 ISOLATION，与并行用例互相干扰。
         let _isolation = crate::input_gate::isolation_test_lock();
-        use crate::config::AppConfig;
+        use crate::config::bundled_config;
         use crate::ui::state::{TemplateUiStateClassifier, UiTemplateArgs};
         // 来源沿用 friend_delivery.rs secondary_hall_row_frame 的现有真实私聊截图。
         // 此回归仅验证执行边界和原帧证据保留，不能称为游戏操作验收。
@@ -2400,8 +2405,8 @@ mod read_only_tests {
         );
         assert_eq!(frame.dimensions(), (1920, 1080));
         let calls = Arc::new(Calls::default());
-        let config =
-            AppConfig::load(std::path::Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        // 配置来自编译进二进制的 `src/config/test.full.yaml`；`tests/` 不入库。
+        let config = bundled_config();
         let runtime = UiRuntime::start_with_state_classifier(
             Device {
                 calls: calls.clone(),

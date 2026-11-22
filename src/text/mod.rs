@@ -201,6 +201,14 @@ pub(crate) fn fit_chat_message(label: &str, message: &str) -> Vec<String> {
 }
 
 pub(crate) fn split_numbered_chat_message(label: &str, message: &str) -> Vec<String> {
+    // 纯标签消息不参与正文排版：标签的长度由标签语法决定，走下面的 `raw` 会被
+    // 按显示宽度切成半截标签，还会套上 "1/1：" 编号。
+    // 但也不能整条原样塞回去：`expand_reply_for_sending` 的契约是「一个标签一条
+    // 消息」（游戏内一次只能点开一个表情标签，见 `ui/chat_output.rs` 的说明），
+    // 纯多标签必须展开成多条，否则下游会拿到一条发不出去的复合标签。
+    if emoji::is_tag_only_message(message) {
+        return emoji::expand_reply_for_sending(message);
+    }
     // 标签必须先解析再换行：表情标签是原子消息，不能被宽度切分或截断。
     // 只有含标签前缀时才走展开，普通文本零额外开销。
     if message.contains("{表情包:") {
@@ -209,7 +217,10 @@ pub(crate) fn split_numbered_chat_message(label: &str, message: &str) -> Vec<Str
             return parts
                 .into_iter()
                 .flat_map(|piece| {
-                    if emoji::is_tag_only_message(&piece) {
+                    // 放得下的段原样发送：带标签的短文本若走 `raw`，会给正文
+                    // 加上与内容无关的 "1/1：" 编号噪声。
+                    if emoji::is_tag_only_message(&piece) || display_width(&piece) <= MAX_CHAT_WIDTH
+                    {
                         vec![piece]
                     } else {
                         split_numbered_chat_message_raw(label, &piece)
@@ -438,6 +449,95 @@ mod tests {
         );
         // 分片后拼回原文，确认没有内容丢失。
         assert_eq!(messages.concat(), long);
+    }
+
+    /// B14-P1-2：单个纯标签消息不能被宽度切段、更不能加编号前缀。
+    #[test]
+    fn single_tag_message_is_sent_verbatim_without_numbering() {
+        let single = "{表情包:2:交给我吧}";
+        assert_eq!(
+            split_numbered_chat_message("塔罗", single),
+            vec![single.to_string()],
+            "单个标签必须原样单条发送"
+        );
+
+        // 多候选标签的显示宽度可以超过 80：仍是一条、原样，不按正文宽度重排。
+        // 候选必须互不相同：解析器会对重复候选去重，重复夹具测不到超宽路径。
+        let candidates = (0..8)
+            .map(|index| format!("a{index:09}"))
+            .collect::<Vec<_>>()
+            .join("|");
+        let wide = format!("{{表情包:2:{candidates}}}");
+        assert!(
+            display_width(&wide) > MAX_CHAT_WIDTH,
+            "夹具必须超过单条宽度，否则测不到切分路径"
+        );
+        assert_eq!(
+            split_numbered_chat_message("塔罗", &wide),
+            vec![wide.clone()],
+            "超宽的单标签也不能被宽度切段"
+        );
+    }
+
+    /// `expand_reply_for_sending` 的契约是「一个标签一条消息」：游戏内一次只能
+    /// 点开一个表情标签，纯多标签必须拆成多条，不能作为一条复合标签发出。
+    #[test]
+    fn multi_tag_message_is_expanded_to_one_tag_per_message() {
+        let multiple = "{表情包:1:哈哈}{表情包:2:交给我吧}{表情包:3:好的}";
+        let messages = split_numbered_chat_message("塔罗", multiple);
+        assert_eq!(
+            messages,
+            vec![
+                "{表情包:1:哈哈}".to_string(),
+                "{表情包:2:交给我吧}".to_string(),
+                "{表情包:3:好的}".to_string(),
+            ],
+            "纯多标签必须拆成每条一个标签"
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|message| emoji::is_tag_only_message(message)),
+            "每一段都必须是一个完整标签: {messages:?}"
+        );
+        assert!(
+            messages.iter().all(|message| !message.contains("1/")),
+            "标签消息不该出现编号前缀: {messages:?}"
+        );
+    }
+
+    /// B14-P1-2：带标签的**短**文本在展开后不应被套上 "1/1：" 编号。
+    #[test]
+    fn short_text_with_emoji_tags_is_not_numbered() {
+        let messages = split_numbered_chat_message("塔罗", "今日运势很好{表情包:2:交给我吧}");
+        assert_eq!(
+            messages,
+            vec![
+                "今日运势很好".to_string(),
+                "{表情包:2:交给我吧}".to_string(),
+            ]
+        );
+        assert!(
+            messages.iter().all(|message| !message.contains("1/")),
+            "带标签的短文本不该出现编号前缀: {messages:?}"
+        );
+    }
+
+    /// B14-P1-2：修复不能把无标签超宽文本的切分/编号能力一并砍掉。
+    #[test]
+    fn untagged_overlong_text_is_still_split_and_numbered() {
+        let messages = split_numbered_chat_message("塔罗", &"很长".repeat(80));
+        assert!(messages.len() > 1, "无标签超宽文本仍要分片");
+        assert!(
+            messages[0].starts_with("塔罗1/"),
+            "无标签超宽文本仍要编号: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|message| display_width(message) <= MAX_CHAT_WIDTH),
+            "每段都必须符合游戏宽度限制: {messages:?}"
+        );
     }
 }
 

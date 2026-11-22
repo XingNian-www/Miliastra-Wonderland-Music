@@ -1000,7 +1000,18 @@ impl WgcShared {
         self.ready.notify_all();
     }
 
+    /// 关闭会话并唤醒等待首帧的调用方。
+    ///
+    /// **必须先取住 `latest` 锁再置位 `closed`**：等待者在持锁期间检查 `closed`
+    /// 并调用 `wait_timeout`（该调用原子地释放锁），因此「取锁」与「等待者进入
+    /// 等待」互斥。若先置位再通知，通知可能正好落在等待者检查完 `closed == false`
+    /// 与它真正进入等待之间——那一次 `notify_all` 无人接收，等待者要睡满 3 秒
+    /// 超时才醒来，期间看起来像「窗口关了但采集还卡着」。
     fn mark_closed(&self) {
+        let _guard = self
+            .latest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.closed.store(true, Ordering::SeqCst);
         self.ready.notify_all();
     }
@@ -1364,6 +1375,33 @@ fn send_alt_keypress() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B01-P1-2 回归：`mark_closed` 必须等 `latest` 锁可用后才置位 `closed`。
+    ///
+    /// 这里用「持锁期间 `closed` 仍为 false」锁住取锁顺序：修复前 `mark_closed`
+    /// 不碰锁，会在等待者仍处于「刚检查完 closed、还没进入 wait」的窗口内直接
+    /// 置位并通知，通知丢失后等待者要睡满超时。断言不依赖真实 WGC 会话。
+    #[test]
+    fn mark_closed_acquires_the_latest_lock_before_signalling() {
+        let shared = Arc::new(WgcShared::new());
+        let guard = shared
+            .latest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let closer = Arc::clone(&shared);
+        let handle = std::thread::spawn(move || closer.mark_closed());
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !shared.closed.load(Ordering::SeqCst),
+            "latest 锁未释放前 mark_closed 不得置位 closed，否则唤醒会丢失"
+        );
+        drop(guard);
+        handle.join().expect("closer thread");
+        assert!(
+            shared.closed.load(Ordering::SeqCst),
+            "锁释放后必须完成关闭置位"
+        );
+    }
 
     #[test]
     fn client_size_notice_is_emitted_once_per_size() {

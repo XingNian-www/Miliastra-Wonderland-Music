@@ -78,10 +78,62 @@ const FRIEND_ROW_Y_TOLERANCE: i32 = 6;
 const MAX_FRIEND_LIST_DRAGS: usize = 2;
 const FRIEND_AVATAR_TEXT_OFFSET_X: i32 = 40;
 const FRIEND_DRAG_MAX_EDGE_INSET: i32 = 50;
+/// 已确认的具体好友会话的**脱敏键**（只含指纹，不含昵称/UID）。
+///
+/// 为什么不直接复用 `residency::ConversationRef`：`ConversationRef::Friend` 带
+/// `Vec<String>` 候选名，无法 `Copy`，而 `UiResidencyTarget` 必须保持 `Copy`
+/// （`SendHallBatch` / `EstablishResidency` 等按值复用，见
+/// `friend_delivery/delivery.rs` 里 `request.residency` 的两次按值传参）。
+/// 把候选名搬进对外驻留结论也会把昵称/备注带进日志与文案（隐私泄漏面）。
+///
+/// 因此这里只保留**归一化后**的 FNV-1a 指纹：
+/// - **稳定**：不用 `DefaultHasher`（它不保证跨进程/跨版本一致，见
+///   `config/ai.rs` 里 `prefix_cache_key` 的同类说明），同一会话恒定给同一个键；
+/// - **可区分**：足以判定"确实落在好友会话 X"与"落在别的会话 / 当前大厅"；
+/// - **不可直读**：对外只出现指纹，不出现备注/昵称原文。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ConversationKey(u64);
+
+impl ConversationKey {
+    /// 由会话列表里识别到的备注/昵称生成键。
+    ///
+    /// 先走 `normalize_comparison_text`（折全角 + 去空白 + 小写）：OCR 的全角/空格
+    /// 抖动不能让同一个会话产生两个教科书式的"不同会话"。
+    pub(crate) fn from_identity(identity: &str) -> Self {
+        let normalized = crate::text::normalize_comparison_text(identity);
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in normalized.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        Self(hash)
+    }
+}
+
+impl std::fmt::Display for ConversationKey {
+    /// 日志/文案里的短标识：只暴露指纹的低 32 位，足够区分同屏几个会话。
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "好友会话#{:08x}", self.0 as u32)
+    }
+}
+
+/// 驻留结论/请求的目标界面。
+///
+/// 硬规则（`technical-docs/ui-task-return-design.md:24/55/132`）：
+/// `SecondaryCurrentHall` **只**代表"二级聊天 · 当前大厅会话"，不得用来代表
+/// 任意二级界面；确认落在具体好友会话时用 `SecondaryConversation` 如实上报。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UiResidencyTarget {
+    /// 千星大厅（一级大厅）。
     Primary,
+    /// 二级聊天 · 当前大厅（"大厅"会话）。
     SecondaryCurrentHall,
+    /// 二级聊天 · **已确认**落在某个具体好友会话。
+    ///
+    /// 与 `SecondaryCurrentHall` 的区别只是"哪条会话"：只关心"已在二级聊天"的
+    /// 调用方可以与它等价处理；需要会话身份的地方必须按 `ConversationKey` 区分，
+    /// 不能把好友私聊说成当前大厅。
+    SecondaryConversation(ConversationKey),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -191,6 +243,14 @@ impl FriendDeliveryOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum UiResidencyOutcome {
     Confirmed(UiResidencyTarget),
+    /// 任务声明「不产生聊天驻留」，收尾停在哪里都不构成失败（B16-P1-4）。
+    ///
+    /// 典型场景：冷启动 `EnterGame` 用 `FinishPolicy::Leave` 收尾，结束时停在
+    /// 提瓦特大世界；`residency_for(Overworld)` 给不出聊天目标，旧实现把它翻译
+    /// 成 `Failed`，于是每次冷启动都报「驻留恢复失败」。`NotApplicable` 表示
+    /// 「这个任务本来就不承诺聊天驻留」，与「承诺了但没做到」（仍报 `Failed`）
+    /// 严格区分，调用方不得把它当失败上报。
+    NotApplicable,
     Failed(UiRoutineFailure),
 }
 

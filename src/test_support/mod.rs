@@ -4,6 +4,9 @@ use std::sync::Arc;
 use anyhow::Result;
 use miliastra_kernel::{AtomicFileStore, StateStore};
 
+/// 真实截图/技术文档语料的可用性判定与运行时跳过助手。
+pub(crate) mod corpus;
+
 /// 测试使用的最小文件状态存储，不属于稳定 crate API。
 #[derive(Debug)]
 struct TestStateStore;

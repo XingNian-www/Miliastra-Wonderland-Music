@@ -608,6 +608,136 @@ fn effect_state_machine_does_not_accept_a_repeated_private_batch_result() {
     ));
     assert!(matches!(hall.effect, CardGameEffect::HallDelivery { .. }));
 }
+/// 回归：`accepts`/`continues_after` 同时接受通用 `PrivateBatch` 结果，但
+/// `resume` 只实现了模板版。旧实现先把挂起项 `remove` 掉再落进 `_ => Err`，
+/// 于是这批私聊投递既不会进 `pending_retry`、也不会释放娱乐锁。
+#[test]
+fn generic_private_batch_result_still_resumes_the_outcome_delivery() {
+    let mut service = TestCardGameService::new(LandlordConfig::default());
+    let port = FakeCardGamePort::new(true, true);
+    let now = Instant::now();
+    service
+        .execute("甲", &LandlordCommand::Start, &port, now)
+        .unwrap();
+    service
+        .execute("乙", &LandlordCommand::Join, &port, now)
+        .unwrap();
+    let verification = suspended(
+        service
+            .begin_command("丙", &LandlordCommand::Join, now)
+            .unwrap(),
+    );
+    let hand_batch = match service
+        .resume_claimed_for_test(
+            verification.key,
+            CardGameEffectResult::FriendVerify(Ok(true)),
+        )
+        .unwrap()
+    {
+        CardGameResume::Suspended(request) => request,
+        other => panic!("verified join should deliver one hand batch: {other:?}"),
+    };
+
+    let hall = match service
+        .resume_claimed_for_test(
+            hand_batch.key,
+            CardGameEffectResult::PrivateBatch(Ok(FriendBatchOutcome::Complete)),
+        )
+        .unwrap()
+    {
+        CardGameResume::Suspended(request) => request,
+        other => panic!("generic complete batch should advance to the hall: {other:?}"),
+    };
+    assert!(matches!(hall.effect, CardGameEffect::HallDelivery { .. }));
+}
+
+/// 回归：通用 `PrivateBatch` 的失败项是 `FriendMessage`，不能当成卡牌模板重发。
+/// 折算后 `retryable` 必须为空，提示玩家 `#结束`，并且娱乐锁继续由本局持有。
+#[test]
+fn generic_private_batch_failure_ends_instead_of_retrying() {
+    let mut service = TestCardGameService::new(LandlordConfig::default());
+    let port = FakeCardGamePort::new(true, true);
+    let now = Instant::now();
+    service
+        .execute("甲", &LandlordCommand::Start, &port, now)
+        .unwrap();
+    service
+        .execute("乙", &LandlordCommand::Join, &port, now)
+        .unwrap();
+    let verification = suspended(
+        service
+            .begin_command("丙", &LandlordCommand::Join, now)
+            .unwrap(),
+    );
+    let hand_batch = match service
+        .resume_claimed_for_test(
+            verification.key,
+            CardGameEffectResult::FriendVerify(Ok(true)),
+        )
+        .unwrap()
+    {
+        CardGameResume::Suspended(request) => request,
+        other => panic!("verified join should deliver one hand batch: {other:?}"),
+    };
+
+    let hall = match service
+        .resume_claimed_for_test(
+            hand_batch.key,
+            CardGameEffectResult::PrivateBatch(Ok(FriendBatchOutcome::Failed {
+                retryable: vec![FriendMessage::new("丙", "手牌")],
+                failure: FriendBatchFailure::new(
+                    FriendBatchFailureKind::ResultUnknown,
+                    "test generic batch failure",
+                ),
+            })),
+        )
+        .unwrap()
+    {
+        CardGameResume::Suspended(request) => request,
+        other => panic!("generic failed batch should pause delivery: {other:?}"),
+    };
+    match &hall.effect {
+        CardGameEffect::HallDelivery { message, .. } => {
+            assert!(message.contains("#结束"), "应提示#结束：{message}");
+            assert!(!message.contains("#重试"), "通用结果不能重试：{message}");
+        }
+        other => panic!("期望大厅公告，实际 {other:?}"),
+    }
+    assert_eq!(
+        service.entertainment.active(),
+        Some(EntertainmentKind::Landlord)
+    );
+}
+
+/// 回归：`Join` 回退分支（还没开局 / 不在大厅）也必须传展示名。
+///
+/// 旧实现走 `begin_game_outcome_in_state(entertainment, player, ...)`，把身份键
+/// 同时当展示名，`{玩家}加入牌局` 会把 UUID 渲染到公屏。
+#[test]
+fn join_fallback_uses_display_name_never_the_identity_key() {
+    let uuid = "00000000-0000-4000-8000-000000000002";
+    let mut service = TestCardGameService::new(LandlordConfig::default());
+    let now = Instant::now();
+    // 先直接建一个大厅（不经过 service 的开局效果，避免占用娱乐互斥位），
+    // 让 Join 走「大厅存在但没有活动牌局」的回退分支。
+    service.handle("甲", &LandlordCommand::Start, now).unwrap();
+    let announcement = suspended(
+        service
+            .begin_command_with_display(uuid, "显示名乙", &LandlordCommand::Join, now)
+            .unwrap(),
+    );
+    match &announcement.effect {
+        CardGameEffect::HallDelivery { message, .. } => {
+            assert!(
+                message.contains("显示名乙"),
+                "加入公告应使用展示名：{message}"
+            );
+            assert!(!message.contains(uuid), "加入公告不得泄露内部键：{message}");
+        }
+        other => panic!("期望大厅公告，实际 {other:?}"),
+    }
+}
+
 #[test]
 fn an_old_start_verification_cannot_cancel_a_new_start_reservation() {
     let mut service = TestCardGameService::new(LandlordConfig::default());

@@ -11,6 +11,11 @@
 //! 因此是 `pub(crate)`。
 
 use std::collections::BTreeMap;
+use std::collections::hash_map::RandomState;
+use std::hash::BuildHasher;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // 按消费模块拆分的模板文件：每个模块只写自己的文件，避免并行开发时互相覆盖。
 pub(crate) mod card_games;
@@ -617,6 +622,48 @@ pub(crate) struct RenderedReply {
     pub(crate) missing: Vec<String>,
 }
 
+/// 进程内共享的非确定性随机源：返回 `0..len` 之间的一个下标。
+///
+/// 为什么不能直接用 `SystemTime::now().subsec_nanos() % len`：Windows 的
+/// `FILETIME` 只有 100ns 粒度，`subsec_nanos()` 末两位恒为 `00`，因此
+/// `% 2 / % 4 / % 5 / % 10` 恒等于 0 —— 随机文案与题库选题都会永远选第 1 项。
+/// Linux 上跑测试看不出来，产品却只支持 Windows。
+///
+/// 这里把四路**互不相关**的熵混合后再用 SplitMix64 扩散，逐位都参与：
+/// - `RandomState`：std 的随机 hasher，构造时读取操作系统熵；
+/// - 100ns 时钟：仍然有效，只是不能单独拿去取模；
+/// - 进程内单调计数器：保证同一时刻的连续调用也能取到不同值；
+/// - 线程 id 与进程 id：区分并发线程与多开进程。
+///
+/// 不需要密码学强度，只需要"每次调用看起来不同且分布均匀"。
+pub(crate) fn random_index(len: usize) -> usize {
+    if len <= 1 {
+        return 0;
+    }
+    static HASHER: OnceLock<RandomState> = OnceLock::new();
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let hasher = HASHER.get_or_init(RandomState::new);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or_default();
+    let mixed = hasher.hash_one((
+        counter,
+        nanos,
+        std::process::id(),
+        std::thread::current().id(),
+    ));
+    // SplitMix64 终混：即使上游只有 100ns 粒度的低位差异，也会被扩散到全字。
+    let mut value = mixed
+        .wrapping_add(0x9e37_79b9_7f4a_7c15)
+        .wrapping_add(counter);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^= value >> 31;
+    (value % len as u64) as usize
+}
+
 /// 从 `{选项1|选项2|…}` 里随机取一条。
 ///
 /// 让用户在回复里直接写随机文案，不用去改代码里的标签表：
@@ -636,29 +683,40 @@ fn pick_random_choice(inner: &str) -> Option<&str> {
     if choices.is_empty() {
         return Some("");
     }
-    // 用纳秒做种子：不需要密码学强度，只要每次调用不同即可。
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.subsec_nanos())
-        .unwrap_or_default() as usize;
-    Some(choices[seed % choices.len()])
+    Some(choices[random_index(choices.len())])
 }
 
-/// 渲染一条模板。
+/// 找到从 `open` 处 `{` 起、按花括号配平结束的那个 `}` 的下标。
 ///
-/// override_text 为 Some 且非空白时使用配置覆盖，否则用 spec.default。
-/// 未知占位符原样保留；已知但缺失的变量替换为空串并记入 missing。
-pub(crate) fn render(
-    spec: &ReplyTemplate,
-    override_text: Option<&str>,
-    vars: &ReplyVars,
-) -> RenderedReply {
-    let (template, overridden) = match override_text {
-        Some(text) if !text.trim().is_empty() => (text, true),
-        _ => (spec.default, false),
-    };
-    let mut out = String::with_capacity(template.len() + 32);
-    let mut missing: Vec<String> = Vec::new();
+/// 只用于"外层 `{` 里又套了一层 `{`"的场景：这时第一个 `}` 属于内层，
+/// 直接拿它会切错位置（把内层占位符连同外层一起吞掉）。
+fn matching_close(text: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (offset, ch) in text[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// 渲染循环本体。
+///
+/// 嵌套花括号的处理是这里最容易写错的地方，规则只有两条：
+/// - 后面**再也找不到** `}`：外层 `{` 原样保留，继续扫描剩余文本（不吞掉后续内容）。
+/// - 后面还有 `}`：按"最内层可闭合"解析。`{提示 {歌名}}` 的外层大括号只是
+///   多余的包裹，去掉它后继续渲染内层，`{歌名}` 才会被真正替换。
+///
+/// 例外：`{{名字}}` 保持原样。那是 AI 提示词语法，用户误贴进来时把双花括号
+/// 悄悄展开成变量值更让人困惑；面板保存时也会明确报错提示改成单花括号。
+fn render_into(template: &str, vars: &ReplyVars, out: &mut String, missing: &mut Vec<String>) {
     let mut rest = template;
     while let Some(open) = rest.find('{') {
         out.push_str(&rest[..open]);
@@ -670,10 +728,32 @@ pub(crate) fn render(
             continue;
         };
         let name = &after[..close];
-        if name.is_empty() || name.contains('{') {
-            // 空花括号或嵌套左花括号视为普通文本。
+        if name.is_empty() {
+            // 空花括号视为普通文本。
+            out.push_str(&rest[open..open + 2]);
+            rest = &after[close + 1..];
+            continue;
+        }
+        if name.starts_with('{') {
+            // `{{...}}`：双花括号是 AI 提示词语法，不是这里的变量，原样保留。
             out.push_str(&rest[open..open + 1 + close + 1]);
             rest = &after[close + 1..];
+            continue;
+        }
+        if name.contains('{') {
+            // 外层 `{` 里套了别的花括号：按配平找到外层真正的 `}`，去掉外层包裹，
+            // 再渲染内部，保证内层合法占位符/随机文案仍能生效。
+            match matching_close(rest, open) {
+                Some(end) => {
+                    render_into(&rest[open + 1..end], vars, out, missing);
+                    rest = &rest[end + 1..];
+                }
+                None => {
+                    // 外层没有配平的 `}`：把外层 `{` 当普通文本，继续扫描内层。
+                    out.push('{');
+                    rest = after;
+                }
+            }
             continue;
         }
         // 表情标签必须原样保留：它既不是变量，也不是 `{a|b}` 随机文案。
@@ -684,8 +764,8 @@ pub(crate) fn render(
             rest = &after[close + 1..];
             continue;
         }
-        // \u968f\u673a\u9009\u9879\u6700\u5148\uff1a\u5b83\u4e0d\u4f9d\u8d56\u4efb\u4f55\u4e1a\u52a1\u4e0a\u4e0b\u6587\uff0c
-        // \u800c\u4e14\u7528\u6237\u5199\u5728\u56de\u590d\u91cc\u5c31\u8981\u751f\u6548\u3002
+        // 随机选项最先：它不依赖任何业务上下文，
+        // 而且用户写在回复里就要生效。
         if let Some(choice) = pick_random_choice(name) {
             out.push_str(choice);
             rest = &after[close + 1..];
@@ -704,6 +784,24 @@ pub(crate) fn render(
         rest = &after[close + 1..];
     }
     out.push_str(rest);
+}
+
+/// 渲染一条模板。
+///
+/// override_text 为 Some 且非空白时使用配置覆盖，否则用 spec.default。
+/// 未知占位符原样保留；已知但缺失的变量替换为空串并记入 missing。
+pub(crate) fn render(
+    spec: &ReplyTemplate,
+    override_text: Option<&str>,
+    vars: &ReplyVars,
+) -> RenderedReply {
+    let (template, overridden) = match override_text {
+        Some(text) if !text.trim().is_empty() => (text, true),
+        _ => (spec.default, false),
+    };
+    let mut out = String::with_capacity(template.len() + 32);
+    let mut missing: Vec<String> = Vec::new();
+    render_into(template, vars, &mut out, &mut missing);
     RenderedReply {
         text: out,
         overridden,
@@ -759,6 +857,68 @@ pub(crate) fn stored_override(
     Some(text)
 }
 
+/// 版本升级后**才**出现在产品里的回复 key。
+///
+/// 为什么需要这张表：命令面板的已保存行是"该回复存在"的唯一凭据，用户的库是
+/// 整组快照。旧版本保存过快照的库，不可能含有后来新增的 key——「缺行=停用」
+/// 会把这些新 key 全判成"用户主动关掉了"，升级后这些回复永远不再发送。
+///
+/// 因此这里登记"自上一个已发布快照以来新增的 key"。判定时还要叠加一条：
+/// **该命令下所有新增 key 都缺行**才算升级遗留（说明这个库从没在带这些 key
+/// 的版本上保存过）；只要库里已经有其它新增 key，就说明用户的快照来自新版本，
+/// 此时缺行就是真的停用，必须尊重。
+///
+/// 维护：每次发布后把新增的 key 追加到这里。key 必须真实存在于
+/// [`catalog`]，`upgrade_added_keys_are_real` 测试会拦住拼写错误。
+const UPGRADE_ADDED_KEYS: &[&str] = &[
+    // #数字炸弹 是整条新命令：命令组在旧库里完全不存在，登记它只是为了
+    // 将来该命令内部再增 key 时不必单独处理。
+    "number_bomb.already_active",
+    "number_bomb.disabled",
+    "number_bomb.end.done",
+    "number_bomb.end.no_session",
+    "number_bomb.guess.accepted",
+    "number_bomb.guess.duplicate",
+    "number_bomb.guess.exploded",
+    "number_bomb.guess.not_in_game",
+    "number_bomb.guess.not_number",
+    "number_bomb.guess.not_playing",
+    "number_bomb.guess.not_your_turn",
+    "number_bomb.guess.out_of_range",
+    "number_bomb.lobby.already_joined",
+    "number_bomb.lobby.already_started",
+    "number_bomb.lobby.created",
+    "number_bomb.lobby.full",
+    "number_bomb.lobby.joined",
+    "number_bomb.no_session",
+    "number_bomb.occupied",
+    "number_bomb.only_creator",
+    "number_bomb.start.already_playing",
+    "number_bomb.start.started",
+    "number_bomb.start.too_few",
+    "number_bomb.start.too_many",
+    "number_bomb.status.lobby",
+    "number_bomb.status.no_session",
+    "number_bomb.status.playing",
+    "number_bomb.status.settled",
+    "number_bomb.timeout.auto",
+    // #斗地主 改成传统抢地主流程后新增的竞价/强制过牌回执。
+    "card_games.bidding.call_declined",
+    "card_games.bidding.called",
+    "card_games.bidding.caller_landlord",
+    "card_games.bidding.counter_prompt",
+    "card_games.bidding.counter_robbed",
+    "card_games.bidding.rob_declined",
+    "card_games.bidding.robbed",
+    "card_games.bidding.wrong_phase",
+    "card_games.pass.forced_merged_lead",
+    "card_games.pass.forced_merged_next",
+];
+
+fn introduced_after_release(key: &str) -> bool {
+    UPGRADE_ADDED_KEYS.contains(&key)
+}
+
 /// 某条 key 是否被命令面板静音。
 ///
 /// 两种静音来源，都表示"不要发送"：
@@ -768,6 +928,10 @@ pub(crate) fn stored_override(
 /// 注意行的**存在**表示启用，与文本是否为空无关：留空行表示"使用内置默认"，
 /// 仍会正常发送。若把空文本行当成静音，用户清空文案就会意外关掉回复。
 ///
+/// 唯一的例外是**升级遗留**（[`UPGRADE_ADDED_KEYS`]）：旧库的整组快照里
+/// 不可能有当时还不存在的 key，缺行不能算"用户停用"。判定用的第二条证据是
+/// 同一命令下其它新增 key 是否已经落库——有，说明快照来自新版本，缺行即停用。
+///
 /// 未登记归属的 key 永远不会被静音，避免误吞没有编辑入口的文案。
 pub(crate) fn is_muted(
     stored: &std::collections::BTreeMap<String, Vec<crate::config::StoredReply>>,
@@ -776,9 +940,34 @@ pub(crate) fn is_muted(
     let Some(entry) = command_reply_entry_for_key(key) else {
         return false;
     };
-    stored
-        .get(entry.id)
-        .is_some_and(|rows| rows.is_empty() || !rows.iter().any(|reply| reply.key == key))
+    let Some(rows) = stored.get(entry.id) else {
+        // 整组从未保存过：所有行都按启用处理。
+        return false;
+    };
+    if rows.is_empty() {
+        // 空列表是显式的命令级静音哨兵。
+        return true;
+    }
+    if rows.iter().any(|reply| reply.key == key) {
+        return false;
+    }
+    if introduced_after_release(key) && !command_has_any_released_new_key(entry, rows) {
+        // 该 key 与同命令下其它新增 key 全部缺行：这个库保存快照时还没有它们。
+        return false;
+    }
+    true
+}
+
+/// 该命令下是否已经有任意一条"新增 key"落库。
+///
+/// 用来区分"旧版本保存的整组快照"与"新版本上保存后又手动停用某行"。
+fn command_has_any_released_new_key(
+    entry: CommandReplyCatalogEntry,
+    rows: &[crate::config::StoredReply],
+) -> bool {
+    rows.iter().any(|reply| {
+        introduced_after_release(&reply.key) && entry.keys.contains(&reply.key.as_str())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -933,6 +1122,36 @@ mod tests {
         assert!(seen.len() >= 2, "随机未生效，只见到: {seen:?}");
     }
 
+    /// 回归（B08-P1-1）：Windows 的 `FILETIME` 只有 100ns 粒度。
+    ///
+    /// 修复前 `pick_random_choice` 直接用 `subsec_nanos() % len`：末两位恒为 00，
+    /// 选项数为 2/4/5/10 时取模恒等于 0，模板永远发第一个选项。
+    /// Linux 上跑单测看不出来（纳秒末两位不固定），所以这里改成"只看分布"：
+    /// 200 次调用里 2 项与 5 项模板都必须出现至少两种结果。
+    #[test]
+    fn random_choice_stays_varied_for_the_windows_100ns_granularity() {
+        for (key, default, label) in [
+            ("test.random.two", "[{甲|乙}]", "2 项"),
+            ("test.random.five", "[{一|二|三|四|五}]", "5 项"),
+        ] {
+            let template = ReplyTemplate {
+                key,
+                default,
+                summary: "测试",
+                group: "测试",
+            };
+            let vars = ReplyVars::new();
+            let mut seen = std::collections::BTreeSet::new();
+            for _ in 0..200 {
+                seen.insert(render(&template, None, &vars).text);
+            }
+            assert!(
+                seen.len() >= 2,
+                "{label}模板在 200 次里只出现 {seen:?}：随机源在 Windows 100ns 时钟下失效了"
+            );
+        }
+    }
+
     /// 末尾空选项、连续竖线都要剔除。
     #[test]
     fn random_choice_skips_empty_options() {
@@ -1020,6 +1239,41 @@ mod tests {
             group: "管理",
         };
         assert_eq!(render(&spec, None, &ReplyVars::new()).text, "前缀{未闭合");
+    }
+
+    /// 回归（B08-P1-3）：外层多包一层 `{` 不能吞掉内层合法占位符。
+    ///
+    /// 修复前遇到 `{提示 {歌名}}` 会把外层 `{` 到**内层** `}` 整段当普通文本，
+    /// 结果发出字面量 `{提示 {歌名}}`；正确结果是外层大括号按包裹处理，
+    /// 内层 `{歌名}` 正常替换。
+    #[test]
+    fn a_nested_opening_brace_still_renders_the_inner_placeholder() {
+        let spec = ReplyTemplate {
+            key: "test.nested",
+            default: "{提示 {歌名}}",
+            summary: "测试",
+            group: "管理",
+        };
+        let vars = ReplyVars::new().with("歌名", "晴天");
+        let rendered = render(&spec, None, &vars);
+        assert_eq!(rendered.text, "提示 晴天");
+        assert!(rendered.missing.is_empty(), "内层变量已提供，不该报缺失");
+    }
+
+    /// 嵌套里的随机选项同样要生效：`{说 {甲|乙}}`。
+    #[test]
+    fn a_nested_opening_brace_still_renders_the_inner_random_choice() {
+        let spec = ReplyTemplate {
+            key: "test.nested.random",
+            default: "{说 {甲|乙}}",
+            summary: "测试",
+            group: "管理",
+        };
+        let vars = ReplyVars::new();
+        for _ in 0..40 {
+            let text = render(&spec, None, &vars).text;
+            assert!(text == "说 甲" || text == "说 乙", "实际: {text}");
+        }
     }
 
     #[test]
@@ -1194,6 +1448,7 @@ mod tests {
         assert!(!is_muted(&playlist_muted, "playback.volume.set"));
     }
 
+    #[test]
     fn a_blank_row_means_default_not_muted() {
         // 行的存在 = 该回复启用；行内文本为空 = 用内置默认。
         // 这两件事必须分开：曾经"清空文案"会把唯一一行丢掉，命令变空列表后被
@@ -1302,11 +1557,99 @@ mod tests {
         assert!(!is_muted(&stored, "test.spec"));
     }
 
+    /// 回归（B08-P1-2）：旧库缺少版本新增的 key 时，新 key 不能被判成静音。
+    ///
+    /// 「缺行=停用」是架构契约，不能动；缺陷在于旧库的整组快照里不可能有
+    /// 新版本才出现的 key。用 #斗地主 的真实 key 构造这个场景。
+    #[test]
+    fn keys_added_after_release_stay_enabled_on_an_old_snapshot() {
+        // 旧库快照：只有发布时就存在的 key，新增的 bidding.* 一行都没有。
+        let old_snapshot = std::collections::BTreeMap::from([(
+            "#斗地主".to_string(),
+            vec![
+                crate::config::StoredReply {
+                    key: "card_games.lobby.created".to_string(),
+                    text: String::new(),
+                },
+                crate::config::StoredReply {
+                    key: "card_games.bidding.started".to_string(),
+                    text: String::new(),
+                },
+            ],
+        )]);
+        // 新增 key 缺行 → 视为"从未保存过"，而不是"已停用"。
+        assert!(
+            !is_muted(&old_snapshot, "card_games.bidding.called"),
+            "旧库缺少新增 key 时不能把它当成已停用"
+        );
+        assert!(
+            !is_muted(&old_snapshot, "card_games.bidding.counter_prompt"),
+            "同组其它新增 key 也必须保持启用"
+        );
+        // 老 key 缺行仍然是停用（契约不变）。
+        assert!(is_muted(&old_snapshot, "card_games.hand.initial"));
+
+        // 新版本上保存过：组里已有其它新增 key，此时缺行就是用户真的停用了。
+        let new_snapshot = std::collections::BTreeMap::from([(
+            "#斗地主".to_string(),
+            vec![crate::config::StoredReply {
+                key: "card_games.bidding.called".to_string(),
+                text: String::new(),
+            }],
+        )]);
+        assert!(
+            is_muted(&new_snapshot, "card_games.bidding.counter_prompt"),
+            "保存过新 key 的库，缺行仍是用户主动停用"
+        );
+    }
+
+    /// 新增 key 名单必须都真实存在于模板目录，否则判定永远打不中。
+    #[test]
+    fn upgrade_added_keys_are_real() {
+        let known: std::collections::BTreeSet<&str> = catalog().map(|spec| spec.key).collect();
+        let unknown: Vec<&str> = UPGRADE_ADDED_KEYS
+            .iter()
+            .copied()
+            .filter(|key| !known.contains(key))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "UPGRADE_ADDED_KEYS 里登记了不存在的模板 key：{unknown:?}"
+        );
+        // 每条都必须能解析回唯一的命令，否则 `command_has_any_released_new_key` 判不出来。
+        for key in UPGRADE_ADDED_KEYS {
+            assert!(
+                command_reply_entry_for_key(key).is_some(),
+                "{key} 没有归属命令，升级判定失效"
+            );
+        }
+    }
+
     #[test]
     fn partial_override_does_not_mute_the_remaining_rows() {
-        // 只改一条时，同命令其他 key 仍应正常发送。
-        let stored = stored(&[("playback.volume.set", "音量{音量}")]);
-        assert!(!is_muted(&stored, "playback.volume.set"));
+        // 改一条不影响它自己被发出去，也不影响别的命令。
+        //
+        // 这条断言原来写的是 playback.pause.ok，而容器是 @音量：跨命令的 key
+        // 本来就不在 rows 里，`is_muted` 走的是"别的命令不受影响"分支，根本没
+        // 验证到同命令下的行为。这里换成 @队列（同命令 3 个 key）显式钉住两条：
+        // 1. 保存过的行启用；
+        // 2. **同命令里没被保存的行仍然是停用** —— 这是架构契约
+        //    「非空保存列表里缺失的 key 停用」，面板保存时总会带上所有启用行，
+        //    所以缺行只可能来自用户主动停用（或升级遗留，见
+        //    `keys_added_after_release_stay_enabled_on_an_old_snapshot`）。
+        let stored = std::collections::BTreeMap::from([(
+            "@队列".to_string(),
+            vec![crate::config::StoredReply {
+                key: "playback.queue.header".to_string(),
+                text: "{数量}首".to_string(),
+            }],
+        )]);
+        assert!(!is_muted(&stored, "playback.queue.header"));
+        assert!(
+            is_muted(&stored, "playback.queue.entry"),
+            "契约：非空保存列表里缺失的 key 停用"
+        );
+        // 别的命令完全不受影响。
         assert!(!is_muted(&stored, "playback.pause.ok"));
     }
 

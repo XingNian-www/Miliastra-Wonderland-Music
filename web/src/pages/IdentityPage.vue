@@ -1,12 +1,12 @@
 <template>
   <h1 class="page-title">身份映射</h1>
-  <p class="page-subtitle">游戏昵称 / 备注 ↔ 记忆键；账号 UID 是授权与归属的优先依据</p>
+  <p class="page-subtitle">游戏备注（OCR 匹配键 / 授权依据）/ 显示昵称（仅展示）↔ 记忆键；账号 UID 是授权与归属的优先依据</p>
   <div class="loading-card" v-if="!loaded">加载中…</div>
   <div v-else class="identity-page">
     <div v-if="loadError" class="config-message err">{{ loadError }}</div>
 
     <div class="identity-toolbar">
-      <input v-model="search" placeholder="搜索昵称 / 备注 / UID…" aria-label="搜索身份映射" />
+      <input v-model="search" placeholder="搜索游戏备注 / 显示昵称 / UID…" aria-label="搜索身份映射" />
       <span class="config-field-hint">共 {{ rows.length }} 条，当前显示 {{ filteredRows.length }} 条</span>
       <span style="flex: 1"></span>
       <button class="btn small" type="button" @click="addRow">添加映射</button>
@@ -17,8 +17,8 @@
       <table class="identity-table">
         <thead>
           <tr>
-            <th style="width: 120px">游戏备注</th>
-            <th style="width: 120px">显示昵称</th>
+            <th style="width: 120px" title="游戏内好友备注：屏幕显示名 / OCR 精确匹配键 / 授权依据（JSON 键 nickname）">游戏备注</th>
+            <th style="width: 120px" title="软件内显示昵称：仅用于展示，可空，不参与授权（JSON 键 note）">显示昵称</th>
             <th style="width: 120px">真实昵称</th>
             <th style="width: 100px">角色</th>
             <th>账号（game:uid，逗号分隔）</th>
@@ -27,8 +27,22 @@
         </thead>
         <tbody>
           <tr v-for="row in filteredRows" :key="row.id || row.key" :class="{ dirty: row.dirty }">
-            <td><input v-model="row.note" placeholder="备注" @input="markDirty(row)" /></td>
-            <td><input v-model="row.nickname" placeholder="显示昵称" @input="markDirty(row)" /></td>
+            <td>
+              <input
+                v-model="row.remark"
+                placeholder="游戏内备注"
+                title="写入 JSON 键 nickname：屏幕显示名 / OCR 匹配键 / 授权依据"
+                @input="markDirty(row)"
+              />
+            </td>
+            <td>
+              <input
+                v-model="row.displayName"
+                placeholder="显示昵称（可空）"
+                title="写入 JSON 键 note：软件内显示昵称，仅展示，不授权"
+                @input="markDirty(row)"
+              />
+            </td>
             <td><input v-model="row.real_nickname" placeholder="真实昵称" @input="markDirty(row)" /></td>
             <td>
               <select v-model="row.role" @change="markDirty(row)">
@@ -74,6 +88,9 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { getJson } from '../api.js'
 import { saveSections, toast } from '../store.js'
+// 表格行 ↔ 后端 JSON 的换算全在 util/identityRow.js（纯函数、有单测钉死 nickname↔remark /
+// note↔displayName 的方向）。这里只做状态与渲染，不要再把换算逻辑写回本文件。
+import { blankRow, toMapping, toRow } from '../util/identityRow.js'
 
 const data = ref(null)
 const rows = ref([])
@@ -87,65 +104,18 @@ const jsonText = ref('')
 const jsonDirty = ref(false)
 const jsonError = ref('')
 
-let rowSeq = 0
-
 const dirtyCount = computed(() => rows.value.filter((row) => row.dirty).length)
 const filteredRows = computed(() => {
   const keyword = search.value.trim().toLowerCase()
   if (!keyword) return rows.value
-  return rows.value.filter((row) => [row.note, row.nickname, row.real_nickname, row.accountsText].join(' ').toLowerCase().includes(keyword))
+  return rows.value.filter((row) =>
+    [row.remark, row.displayName, row.real_nickname, row.accountsText].join(' ').toLowerCase().includes(keyword),
+  )
 })
-
-function accountsText(accounts) {
-  return (accounts || [])
-    .filter((item) => item && (item.game || item.uid))
-    .map((item) => `${item.game || 'genshin'}:${item.uid || ''}`)
-    .join(', ')
-}
-
-function toRow(mapping, index) {
-  rowSeq += 1
-  return {
-    key: `${mapping.id || 'row'}-${rowSeq}`,
-    id: mapping.id || '',
-    role: mapping.role || 'friend',
-    note: mapping.note || '',
-    nickname: mapping.nickname || '',
-    real_nickname: mapping.real_nickname || '',
-    accounts: Array.isArray(mapping.accounts) ? mapping.accounts.map((item) => ({ ...item })) : [],
-    accountsText: accountsText(mapping.accounts),
-    raw: { ...mapping },
-    dirty: false,
-  }
-}
 
 function markDirty(row) {
   row.dirty = true
   message.value = ''
-}
-
-function parseAccounts(text) {
-  return String(text || '')
-    .split(',')
-    .map((part) => part.trim())
-    .filter(Boolean)
-    .map((part) => {
-      const [game, ...rest] = part.split(':')
-      const uid = rest.join(':').trim()
-      return rest.length ? { game: game.trim() || 'genshin', uid } : { game: 'genshin', uid: game.trim() }
-    })
-    .filter((item) => item.uid)
-}
-
-function toMapping(row) {
-  const mapping = { ...row.raw }
-  mapping.role = row.role
-  mapping.note = row.note
-  mapping.nickname = row.nickname
-  mapping.real_nickname = row.real_nickname
-  mapping.accounts = parseAccounts(row.accountsText)
-  if (!mapping.id) mapping.id = crypto.randomUUID ? crypto.randomUUID() : `mapping-${Date.now()}-${rowSeq}`
-  return mapping
 }
 
 function buildMappings() {
@@ -224,22 +194,11 @@ function applyJson() {
 }
 
 function addRow() {
-  rows.value.unshift({
-    key: `new-${Date.now()}`,
-    id: '',
-    role: 'friend',
-    note: '',
-    nickname: '',
-    real_nickname: '',
-    accountsText: '',
-    accounts: [],
-    raw: {},
-    dirty: true,
-  })
+  rows.value.unshift(blankRow())
 }
 
 function removeRow(row) {
-  const label = row.note || row.real_nickname || row.nickname || row.id
+  const label = row.displayName || row.real_nickname || row.remark || row.id
   if (!window.confirm(`删除「${label || '未命名'}」这条映射？保存后生效。`)) return
   rows.value = rows.value.filter((item) => item !== row)
 }

@@ -1868,12 +1868,30 @@ fn record_question_activity(session: &mut TurtleSoupSession, observed_at: Instan
     );
 }
 
+/// `wait_for_job` 的取任务结果。
+///
+/// 必须把「暂时没有任务」与「任务通道已经不能再用」分开：前者可以继续等，
+/// 后者继续等会立刻再次返回，线程会以 0 毫秒节奏空转并占满一个核。
+enum TurtleSoupWaitOutcome {
+    /// 取到一个需要裁决的任务。
+    Job(TurtleSoupJob),
+    /// 本轮等待窗口内没有任务，可以继续等下一轮。
+    Idle,
+    /// 任务通道已真正断开（发送端释放），本线程应当退出。
+    ///
+    /// 注意：队列互斥锁中毒**不**属于这里。中毒的 `Mutex` 仍可 `into_inner()`
+    /// 取回有效数据，把它当成关闭会让一次 panic 污染永久停掉所有 AI 线程。
+    Closed,
+}
+
 impl TurtleSoupWorker {
     fn run(&self, index: usize, completion_port: Arc<dyn TurtleSoupAiCompletionPort>) {
         log::debug!("海龟汤 AI 线程 {} 已就绪", index);
         while !self.shutting_down.load(Ordering::SeqCst) {
-            let Some(job) = self.wait_for_job() else {
-                continue;
+            let job = match self.wait_for_job() {
+                TurtleSoupWaitOutcome::Job(job) => job,
+                TurtleSoupWaitOutcome::Idle => continue,
+                TurtleSoupWaitOutcome::Closed => break,
             };
             let context = ReviewContext {
                 puzzle: job.puzzle.clone(),
@@ -1884,22 +1902,41 @@ impl TurtleSoupWorker {
         log::debug!("海龟汤 AI 线程 {} 已停止", index);
     }
 
-    fn wait_for_job(&self) -> Option<TurtleSoupJob> {
+    fn wait_for_job(&self) -> TurtleSoupWaitOutcome {
         loop {
             if self.shutting_down.load(Ordering::SeqCst) {
-                return None;
+                return TurtleSoupWaitOutcome::Closed;
             }
-            let receiver = self.receiver.lock().ok()?;
+            let receiver = match self.receiver.lock() {
+                Ok(receiver) => receiver,
+                Err(poisoned) => {
+                    // 互斥锁被别的线程 panic 污染，但 `Receiver` 本身仍然有效：
+                    // 中毒只说明「有线程持锁时 panic 过」，数据并没有损坏。取回
+                    // 内部数据继续取任务是可恢复的；把中毒当成「通道不可用」会
+                    // 让所有海龟汤 AI 线程永久退出，必须重启程序才能恢复裁决。
+                    log::warn!(
+                        "海龟汤 AI 线程的任务队列互斥锁曾被其他线程的中断污染（步骤：锁定任务队列），已取回队列内部数据继续取任务，不退出线程"
+                    );
+                    poisoned.into_inner()
+                }
+            };
             match receiver.recv_timeout(Duration::from_millis(100)) {
                 Ok(job) if !self.shutting_down.load(Ordering::SeqCst) => {
                     if job.generation <= self.cancelled_through.load(Ordering::SeqCst) {
                         continue;
                     }
-                    return Some(job);
+                    return TurtleSoupWaitOutcome::Job(job);
                 }
                 Ok(_) => continue,
-                Err(mpsc::RecvTimeoutError::Timeout) => return None,
-                Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+                Err(mpsc::RecvTimeoutError::Timeout) => return TurtleSoupWaitOutcome::Idle,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    // 发送端已释放（服务先于线程组被销毁）：`recv_timeout` 会立刻返回断连，
+                    // 若继续循环就是 0 毫秒空转，必须显式退出本线程。
+                    log::warn!(
+                        "海龟汤 AI 线程等待新任务时任务通道已关闭（步骤：等待新任务），任务发送端已释放，本线程退出；后续提问不再被裁决"
+                    );
+                    return TurtleSoupWaitOutcome::Closed;
+                }
             }
         }
     }
@@ -2186,9 +2223,17 @@ pub(crate) fn parse_question_message(
 ///
 /// 关键：这些 marker 必须与实际发出的文案**同源**，否则用户一旦在
 /// `replies.overrides` 里改了分段提示的前缀，机器人就会把自己的提示
-/// 当成玩家提问去解析（把 "#暂存[xxx]" 当成真问题）。
-/// 所以这里从模板取，而不是写死字面量。
+/// 当成玩家提问去解析（把 "#暂存[xxx]" 当成真问题），于是自问自答、
+/// 无限回声。所以这里分两层判定：
+///
+/// 1. **精确比对**：前缀取模板默认值（含 `BATCH_CLEARED`，原来漏了它，
+///    `@取消` 之后那条「清空[xxx]:完成」会被当成新问题）。
+/// 2. **结构比对**：前缀是一个可被用户覆盖的自由文本，比对不到默认值时，
+///    退而识别 `前缀[玩家]:##编号` / `前缀[玩家]:后缀` 这个**由
+///    `templates::BATCH_NOTICE` 固定下来的外壳**。后缀仍然从模板取默认值，
+///    所以玩家手打的 `昵称：##1 内容` 不会被误吞（我们没有那种方括号外壳）。
 fn is_generated_batch_notice(text: &str) -> bool {
+    let text = text.trim();
     let prefixes = [
         &templates::BATCH_SAVED,
         &templates::BATCH_MISSING,
@@ -2196,6 +2241,9 @@ fn is_generated_batch_notice(text: &str) -> bool {
         &templates::BATCH_EMPTY_PART,
         &templates::BATCH_NO_DRAFT,
         &templates::BATCH_FORMAT,
+        // `@取消` 的清空回执原来漏在集合外：用户自定义前缀后它会被当成提问，
+        // 机器人于是"回答"自己刚发的清空提示。
+        &templates::BATCH_CLEARED,
     ];
     if prefixes.iter().any(|spec| {
         let prefix = render_reply(spec, &ReplyVars::new());
@@ -2204,9 +2252,54 @@ fn is_generated_batch_notice(text: &str) -> bool {
     }) {
         return true;
     }
+    if looks_like_batch_notice_shell(text) {
+        return true;
+    }
     // 历史消息里还有一种带"海龟汤长答案:"前缀的分段提示，现在已不再发出，
     // 但旧消息可能仍在会话里，保留识别以免被当成提问。两种冒号都接受。
     text.contains("海龟汤长答案:") || text.contains("海龟汤长答案：")
+}
+
+/// 识别 `前缀[玩家]:后缀` 这个由 `BATCH_NOTICE` 固定的外壳。
+///
+/// 只用来兜住"前缀被 `replies.overrides` 改过"的情况，所以对两侧都收紧：
+/// - 前缀：非空、短、不含命令符号（`#`/`@`/方括号/冒号）；
+/// - 玩家名：非空、不含方括号；
+/// - 后缀：只接受 `BATCH_SUBMIT` / `BATCH_DONE` / `BATCH_FORMAT_HINT` 的默认值，
+///   或 `##` + 纯数字（`BATCH_SAVED`/`BATCH_MISSING`/`BATCH_LIMIT` 那几种）。
+///
+/// 玩家真正的分段命令是 `昵称：##1 内容`（没有方括号外壳），因此不会命中。
+fn looks_like_batch_notice_shell(text: &str) -> bool {
+    let Some(separator) = text.rfind("]:") else {
+        return false;
+    };
+    let (head, suffix) = (&text[..separator], text[separator + 2..].trim());
+    let Some(name_start) = head.rfind('[') else {
+        return false;
+    };
+    let prefix = head[..name_start].trim();
+    let player = &head[name_start + 1..];
+    if prefix.is_empty()
+        || display_width(prefix) > 12
+        || prefix.contains(['#', '＃', '@', '＠', '[', ']', ':', '：'])
+    {
+        return false;
+    }
+    if player.trim().is_empty() || player.contains(['[', ']']) {
+        return false;
+    }
+    let known_suffixes = [
+        render_reply(&templates::BATCH_SUBMIT, &ReplyVars::new()),
+        render_reply(&templates::BATCH_DONE, &ReplyVars::new()),
+        render_reply(&templates::BATCH_FORMAT_HINT, &ReplyVars::new()),
+    ];
+    if known_suffixes.iter().any(|candidate| candidate == suffix) {
+        return true;
+    }
+    match suffix.strip_prefix("##") {
+        Some(rest) => !rest.is_empty() && rest.chars().all(|ch| ch.is_ascii_digit()),
+        None => false,
+    }
 }
 
 fn parse_question_payload(payload: &str) -> (TurtleSoupQuestionKind, String) {
@@ -2354,11 +2447,13 @@ fn save_used_state(path: &Path, state: &UsedQuestionState, store: &dyn StateStor
     store.write_atomic(path, text.as_bytes(), "海龟汤使用记录")
 }
 
+/// 从题库里挑一道没用过的题。
+///
+/// 必须走 [`crate::features::reply_template::random_index`]：原来这里直接用
+/// `SystemTime::as_nanos() % len`，而 Windows 的 `FILETIME` 只有 100ns 粒度，
+/// 偶数题量（2/4/10/20/50/100…）下余数恒定，等于永远抽第一道题。
 fn pseudo_random_index(len: usize) -> usize {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos() as usize % len.max(1))
-        .unwrap_or(0)
+    crate::features::reply_template::random_index(len.max(1))
 }
 
 fn settlement_messages(
@@ -2727,6 +2822,121 @@ mod tests {
         workers.shutdown();
     }
 
+    fn test_worker(receiver: Receiver<TurtleSoupJob>) -> TurtleSoupWorker {
+        test_worker_shared(Arc::new(Mutex::new(receiver)))
+    }
+
+    fn test_worker_shared(receiver: Arc<Mutex<Receiver<TurtleSoupJob>>>) -> TurtleSoupWorker {
+        let clock = Arc::new(ManualClock::new(Instant::now()));
+        TurtleSoupWorker {
+            config: TurtleSoupConfig::default(),
+            openai: test_openai(),
+            ai: test_ai_config(),
+            receiver,
+            shutting_down: Arc::new(AtomicBool::new(false)),
+            cancelled_through: Arc::new(AtomicU64::new(0)),
+            clock: clock.clone(),
+            retry_delay: clock,
+        }
+    }
+
+    #[test]
+    fn worker_wait_reports_closed_instead_of_none_when_the_job_channel_disconnects() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = test_worker(receiver);
+        drop(sender);
+
+        let started = Instant::now();
+        let outcome = worker.wait_for_job();
+
+        assert!(
+            matches!(outcome, TurtleSoupWaitOutcome::Closed),
+            "任务通道断连必须报告 Closed：报告 Idle/无任务会让调用方立刻重试并以 0 毫秒节奏空转"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "断连必须以一次立即返回的方式被识别，不能靠反复轮询"
+        );
+    }
+
+    #[test]
+    fn worker_thread_exits_instead_of_spinning_when_the_job_channel_disconnects() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = Arc::new(test_worker(receiver));
+        let shutting_down = worker.shutting_down.clone();
+        drop(sender);
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            worker.run(1, Arc::new(DiscardedAiCompletionPort));
+            let _ = done_tx.send(());
+        });
+
+        let finished = done_rx.recv_timeout(Duration::from_secs(2));
+        if finished.is_err() {
+            // 旧实现会在这里 0 毫秒空转，只能靠关停标志打断，避免变异验证挂住整个测试进程。
+            shutting_down.store(true, Ordering::SeqCst);
+        }
+        handle.join().expect("海龟汤 AI 线程不应崩溃");
+
+        assert!(
+            finished.is_ok(),
+            "任务通道断连后线程必须自行退出，不能持续空转占满 CPU"
+        );
+    }
+
+    /// 回归（A4-P2）：队列互斥锁中毒不能当成「通道关闭」。
+    ///
+    /// 中毒只说明有线程持锁时 panic 过，`Receiver` 本身仍然有效。旧实现直接返回
+    /// `Closed`，让所有海龟汤 AI 线程永久退出、必须重启程序才能恢复裁决；这里必须
+    /// 取回内部数据继续取任务：队列里有 Job 就照常取出，没有就退化为 `Idle`。
+    #[test]
+    fn poisoned_receiver_mutex_keeps_the_worker_working() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        sender
+            .try_send(TurtleSoupJob {
+                generation: 1,
+                request_id: 7,
+                player: "玩家".to_string(),
+                player_key: "玩家键".to_string(),
+                question: "他是灯塔管理员吗？".to_string(),
+                puzzle: TurtleSoupPuzzle {
+                    id: "poison-test".to_string(),
+                    title: "解毒测试".to_string(),
+                    surface: "汤面".to_string(),
+                    bottom: "汤底".to_string(),
+                    adjudication_notes: "裁决备注".to_string(),
+                    enabled: true,
+                },
+            })
+            .expect("测试通道容量足够");
+        let receiver = Arc::new(Mutex::new(receiver));
+        // 在另一个线程持锁 panic，把互斥锁污染成 poison 状态。
+        let poisoning = Arc::clone(&receiver);
+        let poisoned = thread::spawn(move || {
+            let _guard = poisoning.lock().expect("首次加锁不应中毒");
+            panic!("测试用：持锁 panic 制造 poison");
+        })
+        .join();
+        assert!(poisoned.is_err(), "测试线程必须 panic 才能制造 poison");
+        assert!(receiver.is_poisoned(), "互斥锁必须已经中毒");
+
+        let worker = test_worker_shared(receiver);
+        match worker.wait_for_job() {
+            TurtleSoupWaitOutcome::Job(job) => assert_eq!(job.request_id, 7),
+            TurtleSoupWaitOutcome::Idle => {
+                panic!("队列里还有任务时必须取出，不能当成暂时空闲")
+            }
+            TurtleSoupWaitOutcome::Closed => {
+                panic!("锁中毒不是通道断开，线程不应退出，否则所有 AI 线程永久停摆")
+            }
+        }
+        assert!(
+            matches!(worker.wait_for_job(), TurtleSoupWaitOutcome::Idle),
+            "取空后应退化为 Idle 继续下一轮，而不是 Closed 退出线程"
+        );
+    }
+
     #[test]
     fn turtle_ai_defaults_fall_back_to_the_shared_connection() {
         let config = TurtleSoupConfig::default();
@@ -2994,6 +3204,67 @@ mod tests {
                 is_generated_batch_notice(&notice),
                 "模板 {} 发出的分段提示应被识别: {notice}",
                 spec.key
+            );
+        }
+    }
+
+    /// 回归（B09-P1-7）：用户覆盖分段前缀后，机器人自己发的提示仍要被认出来。
+    ///
+    /// 修复前 marker 只比对模板默认值，覆盖后「自定义[Alice]:##1」既不含
+    /// `暂存[` 也不含其它默认前缀，于是被当成玩家的新提问 → 自回声死循环。
+    /// 另外 `BATCH_CLEARED`（`@取消` 的回执）原来不在识别集合里。
+    #[test]
+    fn overridden_batch_prefixes_and_the_cleared_notice_stay_recognized() {
+        // 1. 用户把「暂存」改成「自定义」后的实际发出文案（通过覆盖渲染得到）。
+        let overridden = crate::features::reply_template::render(
+            &templates::BATCH_NOTICE,
+            Some("{前缀}[{玩家}]:{后缀}"),
+            &ReplyVars::new()
+                .with("玩家", "Alice")
+                .with("前缀", "自定义")
+                .with("后缀", "##1"),
+        );
+        assert_eq!(overridden.text, "自定义[Alice]:##1");
+        assert!(is_generated_batch_notice(&overridden.text));
+        assert!(
+            parse_question_message(&overridden.text, None).is_none(),
+            "改过前缀的分段提示不能被当成玩家提问"
+        );
+
+        // 2. `@取消` 的清空回执：前缀是 BATCH_CLEARED，后缀是 BATCH_DONE。
+        let cleared = format_batch_notice(
+            TurtleSoupReplyText::keyed(&templates::BATCH_CLEARED, ReplyVars::new()),
+            "Alice",
+            TurtleSoupReplyText::keyed(&templates::BATCH_DONE, ReplyVars::new()),
+        )
+        .render_default();
+        assert!(cleared.starts_with("清空["), "实际: {cleared}");
+        assert!(
+            is_generated_batch_notice(&cleared),
+            "清空回执必须被识别: {cleared}"
+        );
+
+        // 3. 玩家自己打的普通分段命令不能被误吞。
+        assert!(!is_generated_batch_notice("Alice：##1 第一段"));
+        assert!(!is_generated_batch_notice("##提交"));
+    }
+
+    /// 回归（B09-P1-8）：题库随机不能退化成"永远第 0 题"。
+    ///
+    /// Windows 的 `FILETIME` 只有 100ns 粒度，`as_nanos() % 偶数` 恒为 0；
+    /// 这里只验证分布（200 次里 2/5 道题都必须出现至少两种结果）。
+    #[test]
+    fn pseudo_random_index_is_not_biased_to_the_first_slot() {
+        for len in [2usize, 5] {
+            let mut seen = std::collections::BTreeSet::new();
+            for _ in 0..200 {
+                let index = pseudo_random_index(len);
+                assert!(index < len, "下标越界: {index} >= {len}");
+                seen.insert(index);
+            }
+            assert!(
+                seen.len() >= 2,
+                "{len} 道题时 200 次只抽到 {seen:?}：随机源在 Windows 100ns 时钟下退化了"
             );
         }
     }

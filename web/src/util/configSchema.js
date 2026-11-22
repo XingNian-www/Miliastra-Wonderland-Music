@@ -57,6 +57,22 @@ export function kindOf(field) {
   return field && field.kind ? field.kind.type : 'string'
 }
 
+/**
+ * 后端 secret 清除协议（`src/config/store/codec.rs` 的 `SECRET_CLEAR_MARKER`）：
+ * 只有提交 `{"__clear__": true}` 才会清空已保存的密钥；`null` / 空串 / `SECRET_MASK`
+ * 都会被后端当成「保留旧值」。**不要自创其他标记。**
+ */
+export const SECRET_CLEAR_MARKER = '__clear__'
+
+export function isSecretField(field) {
+  return kindOf(field) === 'secret'
+}
+
+/** 构造 secret 字段的清除提交值；恢复默认/清除必须走它，不能写空串。 */
+export function secretClearValue() {
+  return { [SECRET_CLEAR_MARKER]: true }
+}
+
 /** 用于样式钩子 `data-kind`，让不同控件有各自的排版（number / path / rect …）。 */
 export function kindClass(field) {
   return KIND_CLASSES[kindOf(field)] || 'other'
@@ -258,7 +274,11 @@ export function coerceField(field, out, segments) {
     return
   }
 
-  if (kind === 'secret') return
+  if (kind === 'secret') {
+    // 空串 / null / SECRET_MASK 都表示「保留旧值」；清除标记必须原样保留，
+    // 不能被这里的规整逻辑改写成字符串或丢掉 __clear__。
+    return
+  }
 
   // string / path / text / modelName
   if (value === null) {

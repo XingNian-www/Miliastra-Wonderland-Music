@@ -82,15 +82,24 @@ impl DecisionState {
         Ok(id)
     }
 
+    /// 对外可见的待裁决快照。
+    ///
+    /// **已提交但尚未 `finish` 的记录不再算「待裁决」**：提交那一刻玩家的决定已经
+    /// 交给等待方，继续把它报给 Web/事件流会重复广播 `decision.pending`（同一个 id
+    /// 在提交到 finish 之间可能被广播多次），外部控制器据此会重复决策。记录本身保留到
+    /// `finish`，以便 `submit` 的幂等拒绝与「已提交」错误文案仍然成立。
     pub(crate) fn snapshot(&mut self) -> Option<DecisionSnapshot> {
         self.expire_current();
-        self.current.as_ref().map(|record| DecisionSnapshot {
-            id: record.id,
-            label: record.label.clone(),
-            allow_switch_source: record.allow_switch_source,
-            allow_ai: record.allow_ai,
-            deadline_at_ms: record.deadline_at_ms,
-        })
+        self.current
+            .as_ref()
+            .filter(|record| !record.submitted)
+            .map(|record| DecisionSnapshot {
+                id: record.id,
+                label: record.label.clone(),
+                allow_switch_source: record.allow_switch_source,
+                allow_ai: record.allow_ai,
+                deadline_at_ms: record.deadline_at_ms,
+            })
     }
 
     pub(crate) fn submit(&mut self, id: u64, action: DecisionAction) -> Result<(), String> {

@@ -1397,6 +1397,10 @@ fn handle_request(
             cors_headers(&request, &state.config.http.host, state.config.http.port),
         ));
     }
+    // 静态资源分两张表：文本（js/css/svg…）走 `PANEL_ASSETS`，图片/字体等
+    // 二进制走 `PANEL_BINARY_ASSETS`（build.rs 按扩展名分流，两张表互斥）。
+    // 必须先查文本、未命中再查二进制：文本侧保持原来的 `String` 响应路径不变，
+    // 二进制侧才需要按字节回包。
     if let Some((body, mime)) = crate::interfaces::http::panel::asset(&request.path) {
         if request.method != "GET" {
             return Err(method_not_allowed("静态资源仅支持GET请求"));
@@ -1407,6 +1411,16 @@ fn handle_request(
             body.to_string(),
             cors_headers(&request, &state.config.http.host, state.config.http.port),
         ));
+    }
+    if let Some((body, mime)) = crate::interfaces::http::panel::binary_asset(&request.path) {
+        if request.method != "GET" {
+            return Err(method_not_allowed("静态资源仅支持GET请求"));
+        }
+        let mut headers = cors_headers(&request, &state.config.http.host, state.config.http.port);
+        // 二进制资源（png/woff2）必须显式给长度：响应体是字节流，浏览器按
+        // Content-Length 判完整；和文本分支一样只按字节原样返回，不做编码转换。
+        headers.push(("Content-Length".to_string(), body.len().to_string()));
+        return Ok(bytes_response(StatusCode::OK, mime, body.to_vec(), headers));
     }
     if request.path == "/favicon.ico" {
         return Ok(empty_response(

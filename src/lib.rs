@@ -206,6 +206,9 @@ pub fn watchdog_restart_ms(config_path: &std::path::Path) -> anyhow::Result<u64>
 mod tests {
     use super::*;
     use std::path::Path;
+    // 只有 Windows 用例用到 `PathBuf`；按平台导入，避免 Linux 测试构建出现 unused import。
+    #[cfg(windows)]
+    use std::path::PathBuf;
 
     #[cfg(windows)]
     #[test]

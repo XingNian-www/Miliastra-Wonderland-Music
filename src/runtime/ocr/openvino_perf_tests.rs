@@ -1,4 +1,7 @@
 //! Equivalence and native-resource checks for the OpenVINO hot path.
+// `super` 只在 Windows 上导入 `PathBuf`，测试主体却无条件使用，故显式引入以保持跨平台可编译。
+use std::path::PathBuf;
+
 use super::*;
 
 #[test]

@@ -690,22 +690,29 @@ impl ModerationService {
             }
             match polled {
                 Ok(messages) => {
+                    // 一帧里的多条同用户投票只代表「这一帧看到这个人表过一次态」。
+                    // 先按用户聚合成一张表（同一帧同一用户取**最后一条**），再按用户
+                    // 累加样本；否则一帧里连续两条 `@同意` 会被算成两票，直接绕过
+                    // `stable_vote_samples`（它要求的是**跨帧**稳定采样）。
+                    let mut frame_votes: HashMap<String, bool> = HashMap::new();
                     for message in messages {
                         let Some((username, agreed)) =
                             parse_friend_moderation_vote(message.sender.as_deref(), &message.text)
                         else {
                             continue;
                         };
-                        let key = (username.clone(), agreed);
+                        frame_votes.insert(username, agreed);
+                    }
+                    let needed = if port.requires_repeated_samples() {
+                        self.vote_thresholds().0.max(1)
+                    } else {
+                        1
+                    };
+                    for (username, agreed) in frame_votes {
                         let count = samples
-                            .entry(key)
+                            .entry((username.clone(), agreed))
                             .and_modify(|value| *value += 1)
                             .or_insert(1);
-                        let needed = if port.requires_repeated_samples() {
-                            self.vote_thresholds().0.max(1)
-                        } else {
-                            1
-                        };
                         if *count >= needed {
                             stable_votes.insert(username, agreed);
                         }
@@ -1117,6 +1124,8 @@ mod tests {
         running: bool,
         finished: bool,
         poll_advance: Duration,
+        /// 实际读取可见消息的轮数：用来区分「第一轮就凑够票」与「一直等到超时」。
+        poll_calls: usize,
         polls: VecDeque<Result<Vec<VisibleVoteMessage>>>,
     }
 
@@ -1137,6 +1146,7 @@ mod tests {
                 running: true,
                 finished: false,
                 poll_advance: Duration::ZERO,
+                poll_calls: 0,
                 polls,
             }
         }
@@ -1156,6 +1166,7 @@ mod tests {
         }
 
         fn poll_visible_friend_messages(&mut self) -> Result<Vec<VisibleVoteMessage>> {
+            self.poll_calls += 1;
             self.polls.pop_front().unwrap_or_else(|| Ok(Vec::new()))
         }
 
@@ -1720,6 +1731,75 @@ mod tests {
         assert!(task.approved);
         assert!(vote_port.finished);
         assert!(service.is_active(&command()).unwrap());
+    }
+
+    /// B07-P1-3：一帧里同用户的两条 `@不同意` 只算 1 个样本。
+    ///
+    /// `stable_vote_samples` 的语义是「跨帧稳定采样」：一帧只代表一次观察。
+    /// 修复前这两条会被算成 2 个样本，直接凑满阈值并判出一张稳定的反对票；
+    /// 修复后只有 1 个样本，达不到阈值，超时按「无稳定反对票」通过。
+    #[test]
+    fn duplicate_votes_inside_one_frame_count_as_one_sample() {
+        let service = service(2, 1);
+        let mut command_port = FakeCommandPort::new();
+        let work = start(&service, &mut command_port);
+        let mut vote_port = FakeVotePort::new([
+            vec!["[甲]：@不同意".to_string(), "[甲]：@不同意".to_string()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ]);
+        let task_port = FakeTaskPort::new();
+
+        service.run_vote(work, &mut vote_port, &task_port).unwrap();
+
+        assert!(
+            task_port.take().approved,
+            "同一帧里同用户的两条投票只能算 1 个样本，够不到 stable_vote_samples=2"
+        );
+    }
+
+    /// 跨帧仍然累加：两帧各读到一条同用户投票就是 2 个样本，能凑满阈值。
+    #[test]
+    fn votes_accumulate_across_frames() {
+        let service = service(2, 1);
+        let mut command_port = FakeCommandPort::new();
+        let work = start(&service, &mut command_port);
+        let mut vote_port = FakeVotePort::new([
+            vec!["[甲]：@不同意".to_string()],
+            vec!["[甲]：@不同意".to_string()],
+        ]);
+        let task_port = FakeTaskPort::new();
+
+        service.run_vote(work, &mut vote_port, &task_port).unwrap();
+
+        assert!(
+            !task_port.take().approved,
+            "跨两帧的同用户投票应累加为 2 个样本，达到阈值后按反对处理"
+        );
+    }
+
+    /// 同一帧里不同用户各算 1 票：第一轮就能达到目标差值，不必等到超时。
+    #[test]
+    fn different_users_each_count_one_sample_in_the_same_frame() {
+        let service = service(1, 2);
+        let mut command_port = FakeCommandPort::new();
+        let work = start(&service, &mut command_port);
+        let mut vote_port = FakeVotePort::new([
+            vec!["[甲]：@同意".to_string(), "[乙]：@同意".to_string()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ]);
+        let task_port = FakeTaskPort::new();
+
+        service.run_vote(work, &mut vote_port, &task_port).unwrap();
+
+        assert!(task_port.take().approved);
+        assert_eq!(
+            vote_port.poll_calls, 1,
+            "两名不同用户在同一帧各算 1 票，第一轮差值已达 2，不应等到超时"
+        );
     }
 
     #[test]

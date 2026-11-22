@@ -83,12 +83,22 @@ fn vision_residency_label(residency: &crate::ui::routines::UiResidencyOutcome) -
         UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary) => {
             "游戏界面停在千星大厅（一级大厅）".to_string()
         }
+        // 只有确实落在"大厅"会话时才这么说：好友私聊不是当前大厅
+        // （`technical-docs/ui-task-return-design.md:24/55/132`）。
         UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall) => {
             "游戏界面已回到二级大厅当前会话".to_string()
+        }
+        // 已确认落在具体好友会话：文案必须区分"当前大厅"与"好友私聊"，
+        // 否则用户会以为回复发到了大厅。键是脱敏指纹，不含昵称/UID。
+        UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryConversation(key)) => {
+            format!("游戏界面已回到二级好友会话（{key}）")
         }
         UiResidencyOutcome::Failed(failure) => {
             format!("未确认停稳，恢复驻留时{failure}")
         }
+        // 任务声明不产生聊天驻留（如 Leave 收尾的启动/旁路任务）：截图本身成功，
+        // 只是天然没有「停在聊天界面」这个结论可报，不能写成失败文案。
+        UiResidencyOutcome::NotApplicable => "本次任务不承诺聊天驻留，无需恢复界面".to_string(),
     }
 }
 
@@ -827,6 +837,12 @@ impl AppServices {
                 };
                 // 末端防泄露：只删除完整 remark 字符串，display_name/real_nickname 不动。
                 let known_remarks = self.shared.live_configs.identity.remark_texts();
+                // 落库前必须脱敏：历史答案会作为 few-shot 回灌（memory → prompt），
+                // 也会被抽成长期事实（all_turns → rebuild_facts），问题同样原样落库。
+                // 未脱敏的备注串等于把备注永久写进库；对外显示用的 `rendered` 不变，
+                // 这里只改落库副本。
+                let (stored_question, stored_answer) =
+                    turn_for_storage(question, &answer.raw, &known_remarks);
                 let filtered_rendered = crate::features::identity::redact_remark_strings(
                     &answer.rendered,
                     &known_remarks,
@@ -842,30 +858,36 @@ impl AppServices {
                 }
                 let rendered = rendered_filtered.as_str();
                 let now_ms = command_now_ms();
-                // 事实抽取与记忆压缩**完全异步**：各自在后台线程里完成
-                // 「读库 → 调模型 → 写库」，正式任务发完回复立刻结束，不再等
-                // 这两个模型调用——线上实测串行等待让 BOT 发言后的下一条命令
-                // 多等约 9 秒。
-                //
-                // 旧实现把提交留在正式任务线程，靠串行保证 forget/rebuild 的顺序；
-                // 现在改用「记忆代际」：入队时快照 generation，提交前发现期间执行过
-                // @忘记我 / 面板重建就丢弃结果。
-                if !rendered.is_empty() {
-                    self.spawn_fact_extraction(
-                        actor.clone(),
-                        actor_display.clone(),
-                        question.to_string(),
-                        rendered.to_string(),
-                        config.clone(),
-                        now_ms,
-                    );
-                    self.spawn_memory_compression(&actor, &config, now_ms);
-                }
                 if !rendered.is_empty() {
                     let lines = crate::text::split_numbered_chat_message("", rendered);
                     let refs = lines.iter().map(String::as_str).collect::<Vec<_>>();
-                    // 发送失败或仅部分发送时，不把完整回答写入下一轮会话。
-                    self.reply_batch(&refs, 0)?;
+                    // 顺序契约：**先**把最终回话整批发出去，**成功之后**才把完整回答
+                    // 交给事实抽取/记忆压缩。发送失败或仅部分发送时 `reply_batch`
+                    // 返回 Err，两个后台任务都不启动——玩家没收到（或只收到一半）的
+                    // 回答不能变成下一轮的长期事实。
+                    //
+                    // 事实抽取与记忆压缩**完全异步**：各自在后台线程里完成
+                    // 「读库 → 调模型 → 写库」，正式任务发完回复立刻结束，不再等
+                    // 这两个模型调用——线上实测串行等待让 BOT 发言后的下一条命令
+                    // 多等约 9 秒。
+                    //
+                    // 旧实现把提交留在正式任务线程，靠串行保证 forget/rebuild 的顺序；
+                    // 现在改用「记忆代际」：入队时快照 generation，提交前发现期间执行过
+                    // @忘记我 / 面板重建就丢弃结果。
+                    run_after_successful_reply(
+                        || self.reply_batch(&refs, 0),
+                        || {
+                            self.spawn_fact_extraction(
+                                actor.clone(),
+                                actor_display.clone(),
+                                stored_question.clone(),
+                                rendered.to_string(),
+                                config.clone(),
+                                now_ms,
+                            );
+                            self.spawn_memory_compression(&actor, &config, now_ms);
+                        },
+                    )?;
                     // 文字回复已发送后再入队语音，保证顺序。
                     for (text, options) in pending_speaks.drain(..) {
                         let text =
@@ -881,12 +903,13 @@ impl AppServices {
                             log::warn!("AI 语音入队失败（文字回复已发送）：{error}");
                         }
                     }
-                    // 历史存原始 JSON：模型在 few-shot 里看到「上一轮就是这种格式」，
-                    // 才会继续按格式输出；存渲染后的散文会让它以为自由文本也可以。
+                    // 历史存脱敏后的原始 JSON 结构：模型在 few-shot 里看到「上一轮就是
+                    // 这种格式」，才会继续按格式输出；存渲染后的散文会让它以为自由文本
+                    // 也可以。备注串在落库前已按字段删掉（见 `turn_for_storage`）。
                     self.business.ai_chat_memory.record_turn(
                         &actor,
-                        question,
-                        &answer.raw,
+                        &stored_question,
+                        &stored_answer,
                         config.actor_token_budget,
                         now_ms,
                     )?;
@@ -894,7 +917,7 @@ impl AppServices {
                     // 只有以关键词开头、真正触发 AI 的内容才进来，普通闲聊不入记忆。
                     self.business.ai_chat_memory.record_hall_line(
                         &actor_display,
-                        question,
+                        &stored_question,
                         crate::features::ai_chat::HallSpeakerRole::Player,
                         &actor,
                         config.hall_token_budget,
@@ -1080,59 +1103,24 @@ impl AppServices {
         // 不分开就会出现「重建出来的事实里带 UUID」，与日常增量抽取口径不一致。
         actor_display: &str,
     ) -> Result<usize> {
-        let turns = memory.all_turns(actor)?;
-        if turns.is_empty() {
-            return Ok(0);
-        }
-        let mut facts: Vec<String> = Vec::new();
-        for (question, answer) in &turns {
-            if answer.trim().is_empty() {
-                continue;
-            }
-            let existing_text = if facts.is_empty() {
-                "（暂无）".to_string()
-            } else {
-                facts
-                    .iter()
-                    .enumerate()
-                    .map(|(index, fact)| format!("{}. {fact}", index + 1))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
-            // 重放同样要传 actor，否则重建出来的事实仍然没有名字，
-            // 用户点一次「重建记忆」就把问题打回原形。
-            let prompt = crate::features::ai_chat::fact_extraction_prompt(
-                actor_display,
-                &existing_text,
-                question,
-                answer,
-            );
-            let reply = crate::config::ai::request_json(
-                openai,
-                connection,
-                &crate::config::ai::AiCallOptions {
-                    model: config.model.clone(),
-                    reasoning: config.reasoning,
-                },
-                &config.extract_prompt,
-                &prompt,
-                crate::features::ai_chat::FACT_EXTRACT_MAX_TOKENS,
-                timeout,
-            );
-            let Ok(reply) = reply else {
-                log::debug!("重放抽取失败，跳过该轮");
-                continue;
-            };
-            let (new_facts, remove) = crate::features::ai_chat::parse_fact_update(&reply);
-            facts.retain(|fact| !remove.iter().any(|item| item.trim() == fact.trim()));
-            for fact in new_facts {
-                if !facts.iter().any(|item| item.trim() == fact.trim()) {
-                    facts.push(fact);
-                }
-            }
-        }
-        memory.replace_facts(actor, &facts, command_now_ms())?;
-        Ok(facts.len())
+        let options = rebuild_call_options(config);
+        rebuild_facts_from_memory(
+            memory,
+            actor,
+            actor_display,
+            &config.extract_prompt,
+            |system, user| {
+                crate::config::ai::request_json(
+                    openai,
+                    connection,
+                    &options,
+                    system,
+                    user,
+                    crate::features::ai_chat::FACT_EXTRACT_MAX_TOKENS,
+                    timeout,
+                )
+            },
+        )
     }
 
     /// 大厅记忆里代表 BOT 自己的名字。
@@ -1463,6 +1451,171 @@ fn extract_and_commit_facts(
     Ok(())
 }
 
+/// 重建事实的调用参数：思考强度固定 `Unset`。
+///
+/// 与日常增量抽取同一口径。重建是**逐轮全量重放**，同一份输出预算要被「思考 +
+/// JSON」共用；沿用配置里的思考强度会让 reasoning_tokens 吃满预算、JSON 被截断，
+/// 于是「重建成功」却只写回一堆半截事实。
+fn rebuild_call_options(
+    config: &crate::features::ai_chat::AiChatConfig,
+) -> crate::config::ai::AiCallOptions {
+    crate::config::ai::AiCallOptions {
+        model: config.model.clone(),
+        reasoning: crate::config::ai::ReasoningEffort::Unset,
+    }
+}
+
+/// 重放历史重建事实，写回记忆库；返回最终事实条数。
+///
+/// 与 [`extract_and_commit_facts`] 同形：把模型调用作为闭包注入，边界才能被单测
+/// 钉死。调用方拿返回值整表覆盖玩家的长期记忆，空表等于**永久删光**，而且会像
+/// 一次「成功重建 0 条事实」——所以有两条致命边界都要挡在 `replace_facts` 之前：
+///
+/// 1. 全部轮次都失败（[`replay_facts_from_turns`] 返回 `Err`）；
+/// 2. 调用都成功、却没有产出任何事实：历史答案全是截断的 JSON 残片（没有可重放
+///    正文），或模型只回非 JSON 散文（`parse_fact_update` 解析不出东西）。这两种
+///    情况下 `facts` 为空只是「抽取退化」的证据，**不能**据此清空既有事实，也不
+///    能返回 `Ok(0)` 冒充「重建成功、只是没有事实」。
+fn rebuild_facts_from_memory(
+    memory: &crate::features::ai_chat::AiChatMemory,
+    actor: &str,
+    actor_display: &str,
+    extract_prompt: &str,
+    call_model: impl FnMut(&str, &str) -> Result<String>,
+) -> Result<usize> {
+    let turns = memory.all_turns(actor)?;
+    if turns.is_empty() {
+        // 没有任何历史可重放：不动既有事实，也不算失败。
+        return Ok(0);
+    }
+    let facts = replay_facts_from_turns(&turns, actor_display, extract_prompt, call_model)?;
+    if facts.is_empty() {
+        anyhow::bail!(
+            "记忆重建已中止（步骤：逐轮重放历史抽取事实）：共 {} 轮历史对话没有产出任何事实，本次没有改动既有事实，玩家的长期记忆保持重建前的状态；原因可能是历史答案全是截断的 JSON 残片，或模型没有返回事实更新 JSON",
+            turns.len()
+        );
+    }
+    memory.replace_facts(actor, &facts, command_now_ms())?;
+    Ok(facts.len())
+}
+
+/// 逐轮重放历史问答，累加抽取出的事实。
+///
+/// 只要存在有效对话轮，就要求至少一轮抽取成功；全部失败时返回 `Err`，**绝不**
+/// 返回空表——返回空表会被调用方当成「这个玩家没有任何事实」写回库里。
+///
+/// 「有效对话轮」= 答案里还能还原出正文的轮次。全部轮次都是截断 JSON 残片时
+/// `valid_turns == 0`，这同样是失败而不是「没有历史」：既有事实必须原样保留。
+fn replay_facts_from_turns(
+    turns: &[(String, String)],
+    actor_display: &str,
+    extract_prompt: &str,
+    mut call_model: impl FnMut(&str, &str) -> Result<String>,
+) -> Result<Vec<String>> {
+    let mut facts: Vec<String> = Vec::new();
+    let mut valid_turns = 0usize;
+    let mut succeeded = 0usize;
+    let mut last_error: Option<anyhow::Error> = None;
+    for (question, answer) in turns {
+        // 库里存的是原始 JSON；直接喂给抽取模型等于让它把 JSON 语法当玩家信息。
+        let answer = replay_answer_text(answer);
+        if answer.trim().is_empty() {
+            continue;
+        }
+        valid_turns += 1;
+        let existing_text = if facts.is_empty() {
+            "（暂无）".to_string()
+        } else {
+            facts
+                .iter()
+                .enumerate()
+                .map(|(index, fact)| format!("{}. {fact}", index + 1))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // 重放同样要传 actor_display，否则重建出来的事实仍然没有名字，
+        // 用户点一次「重建记忆」就把问题打回原形。
+        let prompt = crate::features::ai_chat::fact_extraction_prompt(
+            actor_display,
+            &existing_text,
+            question,
+            &answer,
+        );
+        let reply = match call_model(extract_prompt, &prompt) {
+            Ok(reply) => reply,
+            Err(error) => {
+                // 单轮失败不中止：其余轮次仍可能抽到有效事实。
+                log::debug!("重建记忆时这一轮抽取失败，跳过并继续下一轮：{error:#}");
+                last_error = Some(error);
+                continue;
+            }
+        };
+        if !reply_is_fact_update(&reply) {
+            // 非 JSON 散文在 `parse_fact_update` 里与「模型明确说本轮没有新事实」的
+            // `{"facts":[],"remove":[]}` 完全同形。重建不能把前者当成「玩家没信息」，
+            // 否则一次跑偏的模型输出就会把既有事实清空，所以按失败轮计。
+            log::debug!("重建记忆时这一轮模型没有返回事实更新 JSON，按失败跳过并继续下一轮");
+            last_error = Some(anyhow::anyhow!("模型没有返回事实更新 JSON"));
+            continue;
+        }
+        succeeded += 1;
+        let (new_facts, remove) = crate::features::ai_chat::parse_fact_update(&reply);
+        facts.retain(|fact| !remove.iter().any(|item| item.trim() == fact.trim()));
+        for fact in new_facts {
+            if !facts.iter().any(|item| item.trim() == fact.trim()) {
+                facts.push(fact);
+            }
+        }
+    }
+    if valid_turns == 0 {
+        anyhow::bail!(
+            "记忆重建已中止（步骤：逐轮重放历史抽取事实）：共 {} 轮历史对话全部没有可重放的正文（多半是被截断的 JSON 残片），本次没有改动既有事实，玩家的长期记忆保持重建前的状态",
+            turns.len()
+        );
+    }
+    if succeeded == 0 {
+        let reason = last_error
+            .map(|error| format!("{error:#}"))
+            .unwrap_or_else(|| "模型没有返回可解析的事实更新".to_string());
+        anyhow::bail!(
+            "记忆重建已中止（步骤：逐轮重放历史抽取事实）：共 {valid_turns} 轮有效对话全部抽取失败，本次没有改动既有事实，玩家的长期记忆保持重建前的状态；原因：{reason}"
+        );
+    }
+    Ok(facts)
+}
+
+/// 模型回复是否是一份「事实更新」JSON（至少带 `facts` 或 `remove` 数组）。
+///
+/// [`crate::features::ai_chat::parse_fact_update`] 对非 JSON 散文返回空对，与
+/// 「模型明确说本轮没有新事实」的 `{"facts":[],"remove":[]}` 完全同形。重建必须
+/// 区分这两者：前者是抽取失败（不能据此清空既有事实），后者是合法的空产出。
+fn reply_is_fact_update(reply: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(reply.trim()) else {
+        return false;
+    };
+    ["facts", "remove"]
+        .iter()
+        .any(|key| value.get(key).is_some_and(serde_json::Value::is_array))
+}
+
+/// 历史答案落库时是原始 JSON（`{"action":…,"text":…}`），重放前还原成纯文本。
+///
+/// 抽取模型看到 `{"action":"猫耳一抖","text":"…"}` 会把键名与花括号也当成玩家
+/// 信息，于是重建出来的事实里混进 JSON 语法。解析不出正文的残片（被截断的
+/// JSON）直接返回空串，让这一轮按「没有有效内容」跳过。
+fn replay_answer_text(stored: &str) -> String {
+    let reply = crate::features::ai_chat::parse_reply(stored);
+    let rendered = crate::features::ai_chat::render_reply(&reply);
+    if !rendered.trim().is_empty() {
+        return rendered;
+    }
+    let trimmed = stored.trim();
+    if trimmed.starts_with('{') {
+        return String::new();
+    }
+    trimmed.to_string()
+}
+
 /// 命令前缀字符（用于提示词里展示可用命令）。
 fn command_prefix_char(prefix: crate::features::command::CommandPrefix) -> char {
     match prefix {
@@ -1480,6 +1633,20 @@ fn command_now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// 「先回复、后记忆维护」的顺序契约（B01-P0-6）。
+///
+/// 只有 `reply` 整批成功（`Ok(())`）才执行 `start_maintenance`；发送失败或仅部分
+/// 发送时 `reply` 返回 `Err`，事实抽取/记忆压缩一律不启动。两个动作用闭包注入，
+/// 回归测试才能在不依赖真实聊天输出端口的情况下断言调用顺序。
+fn run_after_successful_reply(
+    reply: impl FnOnce() -> Result<()>,
+    start_maintenance: impl FnOnce(),
+) -> Result<()> {
+    reply()?;
+    start_maintenance();
+    Ok(())
+}
+
 /// 工具命令的去重键：去掉所有空白与全角空格，避免同一条命令换个空格就绕过。
 ///
 /// 项目约定命令不依赖空格分隔（`@点歌晴天` 与 `@点歌 晴天` 等价），
@@ -1491,6 +1658,50 @@ fn normalize_tool_command(command: &str) -> String {
         .collect()
 }
 
+/// 历史落库副本的脱敏：问题整串替换，答案按 JSON 逐字段替换后重新序列化。
+///
+/// 为什么答案要逐字段而不是整串：`answer.raw` 是模型输出的原始 JSON（见
+/// `record_turn` 的注释），整串替换一旦备注里含 `"` 或 `\`，few-shot 里那段
+/// 历史就不再是合法 JSON，模型会以为自由文本也可以；逐字段替换 + `serde_json`
+/// 重新转义既去掉备注，又保证结构可解析。
+fn turn_for_storage(question: &str, answer_raw: &str, remarks: &[String]) -> (String, String) {
+    let question = crate::features::identity::redact_remark_strings(question, remarks);
+    (question, redact_answer_for_storage(answer_raw, remarks))
+}
+
+/// 答案 JSON 逐字符串字段脱敏；不是 JSON 时退回整串脱敏。
+fn redact_answer_for_storage(raw: &str, remarks: &[String]) -> String {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(mut value) => {
+            redact_json_string_values(&mut value, remarks);
+            serde_json::to_string(&value)
+                .unwrap_or_else(|_| crate::features::identity::redact_remark_strings(raw, remarks))
+        }
+        Err(_) => crate::features::identity::redact_remark_strings(raw, remarks),
+    }
+}
+
+/// 只动字符串**值**，不动对象键：键是协议字段（`action`/`text`），
+/// 改名会让 few-shot 与解析方都认不出结构。
+fn redact_json_string_values(value: &mut serde_json::Value, remarks: &[String]) {
+    match value {
+        serde_json::Value::String(text) => {
+            *text = crate::features::identity::redact_remark_strings(text, remarks);
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_json_string_values(item, remarks);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values_mut() {
+                redact_json_string_values(item, remarks);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1499,6 +1710,253 @@ mod tests {
 
     fn memory() -> AiChatMemory {
         AiChatMemory::from_connection(rusqlite::Connection::open_in_memory().unwrap()).unwrap()
+    }
+
+    /// 回归：重建记忆时全部模型调用失败，绝不允许清空玩家已有的长期事实。
+    ///
+    /// 旧实现只 `continue` 跳过失败轮，循环结束后无条件 `replace_facts`：
+    /// 网络抖动、限流或欠费一次，就会把该玩家的全部长期记忆永久删光，而且
+    /// 一路返回 `Ok(0)`，看起来像「重建成功、只是没有事实」。
+    #[test]
+    fn rebuild_keeps_existing_facts_when_every_extraction_fails() {
+        let memory = memory();
+        memory.add_fact("actor", "玩家自称：小A", 1).unwrap();
+        memory
+            .record_turn(
+                "actor",
+                "以前叫我小A",
+                r#"{"action":"点头","text":"好的，小A"}"#,
+                100,
+                2,
+            )
+            .unwrap();
+
+        let error =
+            rebuild_facts_from_memory(&memory, "actor", "小明", "抽取提示", |_, _| {
+                Err(anyhow::anyhow!("模拟模型接口不可用"))
+            })
+            .expect_err("全部轮次抽取失败时必须报错，不能当作重建成功");
+
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("记忆重建已中止"),
+            "失败原因必须说明重建已中止，实际：{text}"
+        );
+        assert_eq!(
+            memory.facts("actor").unwrap(),
+            ["玩家自称：小A"],
+            "全部抽取失败时既有的长期事实必须原样保留"
+        );
+    }
+
+    /// 回归（A4-P1）：历史答案全部是截断的 JSON 残片 → 没有任何可重放正文。
+    ///
+    /// `replay_answer_text` 对残片返回空串，旧实现于是得到 `valid_turns == 0`、
+    /// `Ok(vec![])`，接着无条件 `replace_facts(&[])` 把既有事实删光。这里必须
+    /// 在写库前中止，并且不能返回 `Ok(0)` 冒充「重建成功、只是没有事实」。
+    #[test]
+    fn rebuild_keeps_existing_facts_when_every_answer_is_truncated_json() {
+        let memory = memory();
+        memory.add_fact("actor", "玩家自称：小A", 1).unwrap();
+        memory
+            .record_turn(
+                "actor",
+                "以前叫我小A",
+                r#"{"action":"点头","text":"好的，小A"#,
+                100,
+                2,
+            )
+            .unwrap();
+
+        let error =
+            rebuild_facts_from_memory(&memory, "actor", "小明", "抽取提示", |_, _| {
+                unreachable!("全部轮次都没有可重放正文时不应再调用模型")
+            })
+            .expect_err("没有可重放正文时必须报错，不能当作重建成功");
+
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("记忆重建已中止") && text.contains("没有可重放的正文"),
+            "失败原因必须说明历史没有可重放正文，实际：{text}"
+        );
+        assert_eq!(
+            memory.facts("actor").unwrap(),
+            ["玩家自称：小A"],
+            "历史全是截断 JSON 时既有的长期事实必须原样保留"
+        );
+    }
+
+    /// 回归（A4-P1）：模型返回非 JSON 散文 → `request_json` 成功但解析不出事实。
+    ///
+    /// `parse_fact_update` 对散文返回空对，与「明确没有新事实」同形；旧实现把它
+    /// 当成成功、返回 `Ok(0)` 并清空既有事实。散文必须计为抽取失败轮。
+    #[test]
+    fn rebuild_keeps_existing_facts_when_the_model_returns_prose() {
+        let memory = memory();
+        memory.add_fact("actor", "玩家自称：小A", 1).unwrap();
+        memory
+            .record_turn(
+                "actor",
+                "以前叫我小A",
+                r#"{"action":"点头","text":"好的，小A"}"#,
+                100,
+                2,
+            )
+            .unwrap();
+        let calls = std::cell::Cell::new(0usize);
+
+        let error =
+            rebuild_facts_from_memory(&memory, "actor", "小明", "抽取提示", |_, _| {
+                calls.set(calls.get() + 1);
+                Ok("好的，我记住了，小A。".to_string())
+            })
+            .expect_err("模型返回非 JSON 散文时必须报错，不能清空既有事实");
+
+        assert_eq!(calls.get(), 1, "有效对话轮仍应尝试一次抽取");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("记忆重建已中止"),
+            "失败原因必须说明重建已中止，实际：{text}"
+        );
+        assert_eq!(
+            memory.facts("actor").unwrap(),
+            ["玩家自称：小A"],
+            "模型返回散文时既有的长期事实必须原样保留"
+        );
+    }
+
+    /// 回归（A4-P1）：模型成功解析、但明确没有任何事实产出时同样不写库。
+    ///
+    /// 这一条与「全部调用失败」不同：`succeeded > 0`，只是产出为空。空表仍然
+    /// 不能覆盖既有事实。
+    #[test]
+    fn rebuild_keeps_existing_facts_when_the_model_reports_nothing() {
+        let memory = memory();
+        memory.add_fact("actor", "玩家自称：小A", 1).unwrap();
+        memory
+            .record_turn(
+                "actor",
+                "以前叫我小A",
+                r#"{"action":"点头","text":"好的，小A"}"#,
+                100,
+                2,
+            )
+            .unwrap();
+
+        let error =
+            rebuild_facts_from_memory(&memory, "actor", "小明", "抽取提示", |_, _| {
+                Ok(r#"{"facts":[],"remove":[]}"#.to_string())
+            })
+            .expect_err("没有任何事实产出时必须报错，不能用空表覆盖既有事实");
+
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("没有产出任何事实"),
+            "失败原因必须说明没有产出，实际：{text}"
+        );
+        assert_eq!(
+            memory.facts("actor").unwrap(),
+            ["玩家自称：小A"],
+            "没有产出时既有的长期事实必须原样保留"
+        );
+    }
+
+    /// 回归：正常抽取仍然写入事实（保护不能把成功路径一起挡掉）。
+    #[test]
+    fn rebuild_still_writes_facts_when_extraction_succeeds() {
+        let memory = memory();
+        memory.add_fact("actor", "玩家自称：小A", 1).unwrap();
+        memory
+            .record_turn(
+                "actor",
+                "以后叫我小C",
+                r#"{"action":"点头","text":"好的，小C"}"#,
+                100,
+                2,
+            )
+            .unwrap();
+
+        let count =
+            rebuild_facts_from_memory(&memory, "actor", "小明", "抽取提示", |_, _| {
+                Ok(r#"{"facts":["玩家自称：小C"],"remove":["玩家自称：小A"]}"#.to_string())
+            })
+            .expect("正常抽取必须能重建");
+
+        assert_eq!(count, 1);
+        assert_eq!(
+            memory.facts("actor").unwrap(),
+            ["玩家自称：小C"],
+            "正常抽取必须整表替换成新结论"
+        );
+    }
+
+    /// 回归：重放历史时喂给模型的是纯文本，不是落库的原始 JSON。
+    #[test]
+    fn rebuild_replays_answers_as_plain_text() {
+        let memory = memory();
+        memory
+            .record_turn(
+                "actor",
+                "以后叫我小B",
+                r#"{"action":"点头","text":"好的，小B"}"#,
+                100,
+                2,
+            )
+            .unwrap();
+        let prompts = std::cell::RefCell::new(Vec::<String>::new());
+        let count =
+            rebuild_facts_from_memory(&memory, "actor", "小明", "抽取提示", |_, prompt| {
+                prompts.borrow_mut().push(prompt.to_string());
+                Ok(r#"{"facts":["玩家自称：小B"],"remove":[]}"#.to_string())
+            })
+            .expect("单轮抽取成功即可重建");
+
+        let prompts = prompts.into_inner();
+        assert_eq!(prompts.len(), 1, "每一轮有效对话调用一次抽取");
+        let prompt = &prompts[0];
+        assert!(
+            prompt.contains("好的，小B"),
+            "重放必须带上答案正文，实际提示词：{prompt}"
+        );
+        assert!(
+            !prompt.contains("\"action\""),
+            "重放不得把落库的 JSON 键名当玩家信息喂给模型，实际提示词：{prompt}"
+        );
+        assert_eq!(count, 1);
+        assert_eq!(memory.facts("actor").unwrap(), ["玩家自称：小B"]);
+    }
+
+    /// 重建的思考强度必须固定 Unset：否则 reasoning 吃满输出预算，JSON 被截断。
+    #[test]
+    fn rebuild_drops_the_configured_reasoning_effort() {
+        let mut config = AiChatConfig::default();
+        config.model = "测试模型".to_string();
+        config.reasoning = crate::config::ai::ReasoningEffort::High;
+        let options = rebuild_call_options(&config);
+        assert_eq!(options.model, "测试模型");
+        assert_eq!(
+            options.reasoning,
+            crate::config::ai::ReasoningEffort::Unset,
+            "重建必须固定 Unset，避免思考额度挤掉事实 JSON"
+        );
+    }
+
+    /// 落库答案的还原：JSON 取正文，纯文本原样，残片丢弃。
+    #[test]
+    fn replay_answer_text_extracts_the_body_from_stored_json() {
+        assert_eq!(
+            replay_answer_text(r#"{"action":"点头","text":"好的"}"#),
+            "*点头* 好的"
+        );
+        assert_eq!(
+            replay_answer_text("就是一句普通的回答"),
+            "就是一句普通的回答"
+        );
+        assert_eq!(
+            replay_answer_text(r#"{"action":"猫耳一抖","text":"哼"#),
+            "",
+            "被截断的 JSON 残片不能当玩家信息重放"
+        );
     }
 
     #[test]
@@ -1520,6 +1978,44 @@ mod tests {
         )
         .unwrap();
         assert_eq!(memory.facts("actor").unwrap(), ["玩家自称：小B"]);
+    }
+
+    /// B01-P0-6 回归：事实抽取/记忆压缩必须在回复整批成功之后启动。
+    ///
+    /// 用可注入的假端口（两个闭包）断言调用顺序；成功时顺序必须是
+    /// 「先回复、后维护」，失败或仅部分发送时维护一次都不能调用。
+    #[test]
+    fn fact_extraction_starts_only_after_a_successful_reply() {
+        use std::cell::RefCell;
+        let calls = RefCell::new(Vec::new());
+        run_after_successful_reply(
+            || {
+                calls.borrow_mut().push("reply");
+                Ok(())
+            },
+            || calls.borrow_mut().push("maintenance"),
+        )
+        .unwrap();
+        assert_eq!(calls.into_inner(), ["reply", "maintenance"]);
+    }
+
+    #[test]
+    fn fact_extraction_is_skipped_when_the_reply_fails() {
+        use std::cell::RefCell;
+        let calls = RefCell::new(Vec::new());
+        let outcome = run_after_successful_reply(
+            || {
+                calls.borrow_mut().push("reply");
+                anyhow::bail!("发送失败或仅部分发送")
+            },
+            || calls.borrow_mut().push("maintenance"),
+        );
+        assert!(outcome.is_err(), "回复失败必须把错误交给调用方");
+        assert_eq!(
+            calls.into_inner(),
+            ["reply"],
+            "回复失败时不得启动事实抽取/记忆压缩"
+        );
     }
 
     /// 提问者本人在路由层的形态：外部聊天源（蓝色大厅）消息，可带 UID。
@@ -1768,5 +2264,68 @@ mod tests {
             false,
             &anyhow::anyhow!("HTTP 500 model not found")
         ));
+    }
+
+    /// B01-P0-5(v2) 回归：历史落库副本必须脱敏。
+    ///
+    /// 这份副本会经 `memory::context()` → `prompt::injected_conversation_history`
+    /// 作为 few-shot 回灌，也会经 `all_turns()` → `rebuild_facts_with` 抽成长期
+    /// 事实；问题同样原样落库。备注串一旦进来就再也删不掉。
+    #[test]
+    fn stored_turn_redacts_remarks_in_question_and_json_answer() {
+        let memory = memory();
+        let remarks = vec!["老板".to_string()];
+        let (question, answer) = turn_for_storage(
+            "老板帮我点一首歌",
+            r#"{"action":"say","text":"老板，这就点","confidence":0.9}"#,
+            &remarks,
+        );
+        assert!(question.contains("点一首歌"), "脱敏不能清空问题正文");
+        memory
+            .record_turn("actor", &question, &answer, 32_000, 1)
+            .unwrap();
+        let turns = memory.all_turns("actor").unwrap();
+        let (stored_question, stored_answer) = &turns[0];
+        assert!(
+            !stored_question.contains("老板"),
+            "问题里的备注串必须在落库前脱敏：{stored_question}"
+        );
+        assert!(
+            !stored_answer.contains("老板"),
+            "答案里的备注串必须在落库前脱敏：{stored_answer}"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(stored_answer).expect("历史答案必须仍是合法 JSON");
+        assert_eq!(parsed["action"], "say");
+        assert_eq!(parsed["confidence"], 0.9);
+        assert!(
+            parsed["text"].as_str().unwrap().contains("这就点"),
+            "逐字段脱敏不能丢正文"
+        );
+    }
+
+    /// 备注里含引号/反斜杠时，逐字段脱敏 + 重新序列化仍必须是合法 JSON。
+    ///
+    /// 整串 `replace` 后再拼 JSON 会破坏结构；本用例锁住“结构可解析、字段保留”。
+    #[test]
+    fn stored_answer_remains_parseable_when_remark_has_quotes_and_backslashes() {
+        let remark = "老\"板\\酱";
+        let remarks = vec![remark.to_string()];
+        let raw = serde_json::json!({
+            "action": "say",
+            "text": format!("你好，{remark}，再见"),
+            "nested": {"note": format!("{remark} 的备注")},
+            "items": [1, format!("{remark}!")],
+        })
+        .to_string();
+        let (_, stored) = turn_for_storage("普通问题", &raw, &remarks);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&stored).expect("备注含引号/反斜杠也不能破坏 JSON");
+        assert_eq!(parsed["action"], "say");
+        assert_eq!(parsed["text"], "你好，，再见");
+        assert_eq!(parsed["nested"]["note"], "的备注");
+        assert_eq!(parsed["items"][0], 1);
+        assert_eq!(parsed["items"][1], "!");
+        assert!(!stored.contains("板"), "备注串必须被整体删除");
     }
 }

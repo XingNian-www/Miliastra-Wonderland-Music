@@ -240,18 +240,53 @@ impl ConfigStore {
         base_revision: u64,
         sections: Map<String, Value>,
     ) -> std::result::Result<ConfigSaveOutcome, ConfigSaveError> {
-        // 应用候选：并集合并、剔除注入段、secret 空值/掩码保留、
-        // `{"__clear__": true}` 标记强制清除（写入空串，绕过保留规则）。
-        let current_sections = self.read_all_sections()?;
-        self.build_config(&current_sections)?;
+        // B04-P1-5：合并基准必须在事务内读（见 `save_merged_transactionally`），
+        // 否则两个并发保存会基于同一份旧配置互相覆盖（丢更新）。
+        let executable_root = self.executable_root.clone();
+        self.save_merged_transactionally(base_revision, |current_sections| {
+            // 应用候选：并集合并、剔除注入段、secret 空值/掩码保留、
+            // `{"__clear__": true}` 标记强制清除（写入空串，绕过保留规则）。
+            let mut merged = merge_sections(current_sections, &sections);
+            let mut forced_cleared = BTreeSet::new();
+            apply_secret_clear_markers(&mut merged, &mut forced_cleared);
+            retain_secret_fields(&mut merged, current_sections, &forced_cleared);
+            normalize_path_fields(&mut merged, &executable_root, false);
+            merged
+        })
+    }
+
+    /// 事务内的公共写入路径：在 `BEGIN IMMEDIATE` 之后读取合并基准，由 `prepare`
+    /// 基于**同一事务视图**的 sections 产出待写入的完整配置，再校验、比对
+    /// `base_revision`、写段 + 快照 + meta。
+    ///
+    /// 合并基准留在事务内是并发正确性的前提：读到旧基准再取写锁，两个并发保存
+    /// 会各自覆盖对方刚提交的段（B04-P1-5）。校验失败时事务 drop 回滚，不写任何行。
+    fn save_merged_transactionally<F>(
+        &mut self,
+        base_revision: u64,
+        prepare: F,
+    ) -> std::result::Result<ConfigSaveOutcome, ConfigSaveError>
+    where
+        F: FnOnce(&Map<String, Value>) -> Map<String, Value>,
+    {
+        // Immediate：立即取写锁，避免 HTTP 并发保存时 deferred 事务互相升级
+        // 造成 SQLite busy 死锁（busy_timeout=5000 已有）。
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current_sections = read_sections_from(&transaction)?;
         let normalized_current = merge_sections(&current_sections, &Map::new());
-        let mut merged = merge_sections(&current_sections, &sections);
-        let mut forced_cleared = BTreeSet::new();
-        apply_secret_clear_markers(&mut merged, &mut forced_cleared);
-        retain_secret_fields(&mut merged, &current_sections, &forced_cleared);
-        normalize_path_fields(&mut merged, &self.executable_root, false);
-        // 组装完整配置并校验；失败返回字段级错误，不写库。
-        let mut config = match self.build_config(&merged) {
+        let mut merged = prepare(&current_sections);
+        // B04-P1-4：落库前同步清理废弃命令覆盖项。只在下面的类型化 `config` 上
+        // sanitize 会让 `merged`（真正写进 config_sections 与历史快照的那份）继续
+        // 保留死条目，导致「读得进、存不回」：load_full 丢掉后，用户一保存又写回去。
+        sanitize_deprecated_overrides_in_merged(&mut merged);
+        // 组装完整配置并校验；失败返回字段级错误，不写库（事务 drop 即回滚）。
+        let mut config = match AppConfig::from_db_value(
+            Value::Object(merged.clone()),
+            &self.bootstrap,
+            &self.executable_root,
+        ) {
             Ok(config) => config,
             Err(error) => {
                 return Err(ConfigSaveError::Other(
@@ -268,12 +303,7 @@ impl ConfigStore {
         }
         // 单事务：写/更新 config_sections、插入完整快照（含 secret 明文，DB 本地）、
         // 更新 config_meta.revision；事务内重读 revision 与基线比对保证并发安全。
-        // Immediate：立即取写锁，避免 HTTP 并发保存时 deferred 事务互相升级
-        // 造成 SQLite busy 死锁（busy_timeout=5000 已有）。
         let timestamp = now_ms() as i64;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let stored_revision: i64 =
             transaction.query_row("SELECT revision FROM config_meta WHERE id = 1", [], |row| {
                 row.get(0)
@@ -346,8 +376,12 @@ impl ConfigStore {
     }
 
     /// 回滚到目标版本：读目标快照作为候选全段（secret 字段保留当前值，
-    /// 防止历史快照中的掩码或旧值覆盖当前密钥），走 save 校验/事务，
-    /// 记录新版本（当前 +1）。
+    /// 防止历史快照中的掩码或旧值覆盖当前密钥），走与 [`Self::save`] 相同的
+    /// 校验/事务路径，记录新版本（当前 +1）。
+    ///
+    /// B04-P1-6：合并基准（当前 sections 的 secret 值）与写回必须在**同一个**
+    /// 事务里读。既有实现先读基准、再调 `save()`（`save()` 会再读一次），
+    /// 两次读取之间若有并发保存，回滚会把别人刚提交的密钥回退成旧快照的值。
     pub fn rollback(
         &mut self,
         target_revision: u64,
@@ -370,10 +404,13 @@ impl ConfigStore {
             .cloned()
             .ok_or_else(|| anyhow!("目标版本快照必须是对象"))?;
         // 历史快照必须完整符合当前结构，不用当前段或默认值补齐。
+        // 这一步只做结构预检（不碰库），与 save 的快速失败语义一致。
         self.build_config(&sections)?;
-        let current_sections = self.read_all_sections()?;
-        force_retain_secret_fields(&mut sections, &current_sections);
-        self.save(base_revision, sections)
+        // 合并基准由事务内读取的 current_sections 提供，不再经由 save() 二次读库。
+        self.save_merged_transactionally(base_revision, move |current_sections| {
+            force_retain_secret_fields(&mut sections, current_sections);
+            sections
+        })
     }
 
     /// 测试读取启动引导配置，确认脱敏不会修改运行态密钥。
@@ -415,5 +452,125 @@ impl ConfigStore {
                  BEGIN SELECT RAISE(ABORT, '注入的写盘故障'); END",
         )?;
         Ok(())
+    }
+}
+
+/// 从待落库的 sections 里删掉已废弃命令的覆盖项（B04-P1-4）。
+///
+/// 与 `CommandAccessConfig::sanitize_deprecated_overrides`（类型化配置）同源：
+/// 命令 id 清单只维护一份，这里只做 JSON 键删除，不重写其它字段，保证落库内容与
+/// `load_full` / `LiveConfigs::apply` 实际使用的一致。
+fn sanitize_deprecated_overrides_in_merged(merged: &mut Map<String, Value>) {
+    let Some(overrides) = merged
+        .get_mut("command_access")
+        .and_then(Value::as_object_mut)
+        .and_then(|section| section.get_mut("overrides"))
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    for id in crate::features::command_access::DEPRECATED_POLICY_IDS {
+        if overrides.remove(*id).is_some() {
+            log::warn!(
+                "命令权限配置里的「{}」已废弃并忽略：点歌已拆分为五个平台命令（@QQ点歌/@网易点歌/@酷狗点歌/@B站点歌/@AI点歌），保存时已同步从配置库移除，请改用对应的平台条目",
+                id
+            );
+        }
+    }
+}
+
+/// B04-P1-4 的回归测试放在 `mod.rs` 内联：本批修复只允许改三个文件，
+/// 不改同目录的 `tests.rs`。测试仍用真实临时 SQLite 文件与独立连接读库。
+#[cfg(test)]
+mod save_deprecated_override_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn temp_database(name: &str) -> (PathBuf, PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("config-store-{name}-{}", uuid::Uuid::new_v4()));
+        let database_path = root.join("deps/data/playback.sqlite3");
+        std::fs::create_dir_all(database_path.parent().unwrap()).unwrap();
+        (root, database_path)
+    }
+
+    fn bootstrap(database_path: &Path) -> BootstrapConfig {
+        BootstrapConfig {
+            database_path: database_path.to_path_buf(),
+            http: crate::config::HttpConfig::default(),
+            logging: crate::config::LoggingConfig::default(),
+        }
+    }
+
+    fn stored_section(database_path: &Path, section: &str) -> Value {
+        let connection = rusqlite::Connection::open(database_path).unwrap();
+        let text: String = connection
+            .query_row(
+                "SELECT value_json FROM config_sections WHERE section = ?1",
+                rusqlite::params![section],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str(&text).unwrap()
+    }
+
+    fn latest_snapshot(database_path: &Path) -> Value {
+        let connection = rusqlite::Connection::open(database_path).unwrap();
+        let text: String = connection
+            .query_row(
+                "SELECT snapshot_json FROM config_revisions ORDER BY revision DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str(&text).unwrap()
+    }
+
+    #[test]
+    fn save_drops_deprecated_song_override_from_persisted_sections() {
+        // 只在类型化 config 上 sanitize 时，`load_full` 会丢掉 `@点歌`，
+        // 但保存又把这条死配置写回 config_sections/历史快照。
+        let (root, database_path) = temp_database("save-drops-deprecated-override");
+        let mut store =
+            ConfigStore::open(&database_path, &root, bootstrap(&database_path)).unwrap();
+        let legacy = json!({
+            "overrides": {
+                "@点歌": {"enabled": false, "minimum_role": "admin"},
+                "@QQ点歌": {"enabled": true, "minimum_role": "user"}
+            }
+        });
+        store
+            .connection
+            .execute(
+                "UPDATE config_sections SET value_json = ?1 WHERE section = 'command_access'",
+                rusqlite::params![serde_json::to_string(&legacy).unwrap()],
+            )
+            .unwrap();
+        let revision = store.current_revision().unwrap();
+        // 空候选段 = 把当前库原样写回；落库仍须清掉已废弃条目。
+        store.save(revision, Map::new()).unwrap();
+        drop(store);
+
+        let stored = stored_section(&database_path, "command_access");
+        let overrides = stored["overrides"]
+            .as_object()
+            .expect("command_access.overrides 必须是对象");
+        assert!(
+            !overrides.contains_key("@点歌"),
+            "落库内容不得保留已废弃命令覆盖项: {stored}"
+        );
+        assert!(
+            overrides.contains_key("@QQ点歌"),
+            "同段的其它有效条目必须原样保留: {stored}"
+        );
+        let snapshot = latest_snapshot(&database_path);
+        assert!(
+            !snapshot["command_access"]["overrides"]
+                .as_object()
+                .expect("历史快照里的 overrides 必须是对象")
+                .contains_key("@点歌"),
+            "历史快照同样必须是清理后的内容: {snapshot}"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

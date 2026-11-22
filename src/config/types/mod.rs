@@ -31,3 +31,8 @@ pub(crate) use ui::{
     ChatSourceConfig, ChatSourceDisconnectAction, HallTimingConfig, InputTimingConfig, OcrConfig,
     TemplateConfig, TimingConfig,
 };
+// `OpenVinoConfig` 结构体本身没有 feature gate，但唯一引用方 `runtime::ocr::engine`
+// 只在 `ocr-openvino` 下导入它；无条件导出会在默认特性下产生 unused_imports 告警，
+// 而 CI 的零警告门禁跑的正是 `--lib --no-default-features`，故按使用方门控。
+#[cfg(feature = "ocr-openvino")]
+pub(crate) use ui::OpenVinoConfig;

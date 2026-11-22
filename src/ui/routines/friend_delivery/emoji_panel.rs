@@ -66,13 +66,6 @@ pub(crate) fn scale_point(point: Point, scale: f32) -> Point {
     )
 }
 
-pub(crate) fn to_design(value: i32, scale: f32) -> i32 {
-    if scale <= 0.0 {
-        value
-    } else {
-        (value as f32 / scale).round() as i32
-    }
-}
 pub(crate) fn capture_emoji_frame(
     context: &mut UiRoutineContext<'_>,
     stage: &'static str,
@@ -165,11 +158,17 @@ pub(crate) fn emoji_tab_center(heart: Point, pack: u32, scale: f32) -> Option<Po
 }
 
 /// 在 OCR 结果里精确匹配候选；多命中视为歧义，拒绝点击。
+///
+/// **坐标系**：`offset` 是网格 ROI 在**实际画布**上的左上角（`scale_rect` 的结果），
+/// `OcrLine::bbox` 是相对该裁剪图的坐标，因此两者相加就已经是实际画布坐标。
+/// 返回值同样是实际画布坐标，调用方直接 `click_point` 即可，
+/// **不得再乘/除 `scale`**：同函数内按钮与页签都走 `scale_point`（乘 scale），
+/// 候选卡片若反过来除 scale，非 1920×1080 下两者会落在完全不同的位置。
 pub(crate) fn select_emoji_candidate(
     lines: &[crate::runtime::ocr::OcrLine],
     candidates: &[String],
     offset: Point,
-    scale: f32,
+    _scale: f32,
 ) -> Result<Option<Point>, &'static str> {
     let mut matches: Vec<(String, Point)> = Vec::new();
     for candidate in candidates {
@@ -189,10 +188,7 @@ pub(crate) fn select_emoji_candidate(
             let center = hit.bbox.center();
             matches.push((
                 candidate.clone(),
-                Point::new(
-                    to_design(offset.x + center.x, scale),
-                    to_design(offset.y + center.y, scale),
-                ),
+                Point::new(offset.x + center.x, offset.y + center.y),
             ));
         }
     }
@@ -292,6 +288,13 @@ pub(crate) fn send_emoji_segment(
     let grid_frame = capture_emoji_frame(context, stage)?;
     save_emoji_debug(&grid_frame, config, "pack-grid");
     let grid = scale_rect(EMOJI_GRID_DESIGN, scale);
+    // 收藏页为空时点页签只会停在页签行，上方仍然是聊天画面；不判网格就 OCR
+    // 会把聊天正文当成表情标签并**点进聊天**。扫描路径早已有这个门，发送路径漏调
+    // （`technical-docs/emoji-send-design.md` §14.4：白色卡片占比 >= 0.2 才算网格存在）。
+    if !emoji_grid_visible(&grid_frame, grid) {
+        close_emoji_panel(context, stage);
+        return Err(emoji_failure(stage, "emoji_grid_not_visible"));
+    }
     let crop = crop_canvas(&grid_frame, grid)
         .map_err(|error| emoji_failure(stage, &format!("emoji_crop_failed: {error:#}")))?;
     let lines = ocr
@@ -592,4 +595,66 @@ pub(crate) fn ordered_emoji_labels(lines: &[crate::runtime::ocr::OcrLine]) -> Ve
         labels.push(text);
     }
     labels
+}
+
+#[cfg(test)]
+mod tests {
+    use image::{DynamicImage, Rgb, RgbImage};
+
+    use super::*;
+
+    fn line(text: &str, x: i32, y: i32) -> crate::runtime::ocr::OcrLine {
+        crate::runtime::ocr::OcrLine {
+            text: text.to_string(),
+            confidence: 0.99,
+            bbox: Rect::new(x, y, 40, 20),
+        }
+    }
+
+    /// B15-P0-1：候选卡片坐标必须落在**实际画布**坐标系。
+    ///
+    /// `offset` 是 `scale_rect(EMOJI_GRID_DESIGN, scale)` 的结果（已乘 scale），
+    /// `bbox` 是裁剪图内的相对坐标；两者相加就是画面坐标，不能再除一次 scale。
+    /// 旧实现用 `to_design` 除 scale：1280×720（scale≈0.667）下把应有的 x 算成 1.5 倍，
+    /// 直接点到网格外面。
+    #[test]
+    fn candidate_click_point_uses_live_canvas_coordinates() {
+        let scale = 1280.0 / 1920.0;
+        // 与实际调用一致：网格 ROI 先按 scale 换算到当帧画布。
+        let grid = scale_rect(EMOJI_GRID_DESIGN, scale);
+        let lines = vec![line("交给我吧", 100, 50)];
+        let candidates = vec!["交给我吧".to_string()];
+
+        let pick = select_emoji_candidate(&lines, &candidates, Point::new(grid.x, grid.y), scale)
+            .unwrap()
+            .expect("应命中");
+
+        // bbox center = (100+20, 50+10)。
+        assert_eq!(
+            (pick.x, pick.y),
+            (grid.x + 120, grid.y + 60),
+            "候选坐标 = 网格偏移 + 裁剪图内中心，不得再除 scale"
+        );
+        assert!(
+            pick.x >= grid.x
+                && pick.x <= grid.right()
+                && pick.y >= grid.y
+                && pick.y <= grid.bottom(),
+            "候选点击点必须落在网格 ROI 内：{pick:?} grid={grid:?}"
+        );
+    }
+
+    /// B15-P1-3：发送路径也必须先判网格存在，否则空收藏页会把聊天正文当表情点。
+    #[test]
+    fn empty_pack_grid_is_not_mistaken_for_emoji_cards() {
+        let grid = Rect::new(5, 5, 20, 20);
+        let bright = DynamicImage::ImageRgb8(RgbImage::from_pixel(40, 40, Rgb([240, 240, 240])));
+        let chat_background =
+            DynamicImage::ImageRgb8(RgbImage::from_pixel(40, 40, Rgb([30, 40, 50])));
+        assert!(emoji_grid_visible(&bright, grid), "网格存在时必须放行 OCR");
+        assert!(
+            !emoji_grid_visible(&chat_background, grid),
+            "收藏为空（只剩页签行 + 聊天画面）时必须判为网格不存在"
+        );
+    }
 }

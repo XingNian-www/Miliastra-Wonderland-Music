@@ -23,6 +23,16 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   LIBCLANG_PATH: C:\Program Files\LLVM\bin
+  # Windows 预编译依赖的路径变量。原先放在仓库的 `.cargo/config.toml` 里 `[env]`，
+  # 但 cargo 的 `[env]` 对**所有 target** 生效且不支持按 target 限定
+  # （`[target.'cfg(windows)'.env]` 会被判为 unused key），于是 Linux 门禁也会读到
+  # 指向 Windows 目录的 FFMPEG_DIR，ffmpeg-sys-next 因此不再走 pkg-config，
+  # `cargo test` 链接阶段直接红。改用「谁需要谁导出」的方式：只在 Windows 构建里给，
+  # Linux 那边保持不设，让它正常走 pkg-config。
+  # 用 `${{ github.workspace }}` 展开成绝对路径（顶层 env 允许 github 上下文）。
+  FFMPEG_DIR: ${{ github.workspace }}\vendor\ffmpeg\8.1\windows-x64
+  MNN_INCLUDE_DIR: ${{ github.workspace }}\vendor\mnn\3.6.0\windows-x64\include
+  MNN_LIB_DIR: ${{ github.workspace }}\vendor\mnn\3.6.0\windows-x64\lib
   # OCR 源码与模型固定到 Cargo.lock 锁定的提交。
   # 下载步骤另外校验 SHA-256，确保模型内容符合预期。
   OCR_MODEL_BASE_URL: https://raw.githubusercontent.com/zibo-chen/rust-paddle-ocr/7368dfa292ab988e8431de4ec952f015bec40635/models
@@ -123,6 +133,16 @@ jobs:
                 exit 1
                 ;;
             esac
+            # 严格白名单：只允许 `X.Y.Z` 或 `X.Y.Z-<预发布串>`，字符集限定在
+            # 字母/数字/点/连字符。这条校验不是防手滑，而是**安全边界**：
+            # version 会被下游步骤拼进 PowerShell 脚本（如
+            # `.github/release-notes/${{ needs.version-gate.outputs.version }}.md`），
+            # 只要有引号、分号、`$()`、反引号之类的字符就能越出字符串插进命令。
+            # 下游同时已改成通过 step `env:` 传递（不再直接插值），这里是第二道。
+            if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$'; then
+              echo "::error::版本号格式非法: '$version'（只允许 X.Y.Z 或 X.Y.Z-预发布串，字符集 0-9 A-Z a-z . - ）"
+              exit 1
+            fi
           }
 
           cargo_version="$(read_package_version "$(cat Cargo.toml)")"
@@ -380,8 +400,13 @@ jobs:
           npm run build
 
       - name: 编译 Release EXE
+        shell: pwsh
+        env:
+          # 用 env 传值，不要把 `${{ ... }}` 直接插进 PowerShell 源码：
+          # 插值是在脚本解析**之前**做的，值里的引号/分号/`$()` 会变成代码。
+          LLD_LINK: ${{ steps.linker.outputs.lld_link }}
         run: |
-          $lldLink = '${{ steps.linker.outputs.lld_link }}'
+          $lldLink = $env:LLD_LINK
           if ($lldLink) {
             $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = $lldLink
           }
@@ -407,6 +432,9 @@ jobs:
       - name: 准备产物
         shell: pwsh
         run: |
+          # 显式声明：PowerShell 默认对非终止错误继续往下跑，必须 Stop 才能让
+          # 「拷贝/重命名失败」真正中断步骤（对照下载/解压步骤已做的同一件事）。
+          $ErrorActionPreference = 'Stop'
           $dist = 'dist/miliastra-wonderland-music-windows-x64'
           if (Test-Path -LiteralPath $dist) {
             Remove-Item -LiteralPath $dist -Recurse -Force
@@ -455,7 +483,16 @@ jobs:
             Copy-Item -LiteralPath $source -Destination (Join-Path $dist 'deps/docs') -Force
           }
           Copy-Item 'turtle_soup.example.yaml', 'undercover.example.yaml', 'README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md' (Join-Path $dist 'deps/docs')
-          Copy-Item 'docs' (Join-Path $dist 'deps/docs') -Recurse
+          # 复制 docs/ 的**内容**，不是 docs 目录本身：目标 deps/docs 已经存在
+          # （上一行 New-Item 建好、许可证也放进去了），此时 `Copy-Item 'docs' ... -Recurse`
+          # 会把源目录作为子目录塞进去，产物变成 deps/docs/docs/…。
+          # 用 'docs\*' 并且去掉 -Recurse 之外的东西：-Recurse 对通配符展开后的
+          # 目录项依然生效，子目录会被完整复制。
+          Copy-Item 'docs\*' (Join-Path $dist 'deps/docs') -Recurse -Force
+          # 校验扁平布局：docs/docs 是这次修掉的旧 bug，出现即失败。
+          if (Test-Path -LiteralPath (Join-Path $dist 'deps/docs/docs') -PathType Container) {
+            throw '发布包布局错误：出现 deps/docs/docs（docs 被当成子目录复制了）'
+          }
           # 预置配置库：用主程序自身初始化 deps/data/playback.sqlite3，避免为同一操作再链接一个 example 可执行文件。
           & 'target/x86_64-pc-windows-msvc/release/miliastra-wonderland-music.exe' --ensure-config-db (Join-Path $dist 'config.yaml')
           if ($LASTEXITCODE -ne 0) { throw '发布配置库初始化失败' }
@@ -495,7 +532,11 @@ jobs:
             'deps\docs\turtle_soup.example.yaml',
             'deps\docs\undercover.example.yaml',
             'deps\docs\README.md',
-            'deps\docs\THIRD_PARTY_NOTICES.md'
+            'deps\docs\THIRD_PARTY_NOTICES.md',
+            # docs/ 是扁平复制进来的（见上面的 Copy-Item 'docs\*'），
+            # 抽查一个文档确认复制真的发生了，而不是只建了空目录。
+            'deps\docs\index.md',
+            'deps\docs\user-guide.md'
           )
           $requiredFiles += @(
             'deps\models\PP-OCRv6_small_det.xml',
@@ -518,6 +559,9 @@ jobs:
       - name: 生成精简包（MNN-only）
         shell: pwsh
         run: |
+          # 显式声明：PowerShell 默认对非终止错误继续往下跑，必须 Stop 才能让
+          # 「拷贝/重命名失败」真正中断步骤（对照下载/解压步骤已做的同一件事）。
+          $ErrorActionPreference = 'Stop'
           # 同一个 EXE 就能当 MNN-only 用：OpenVINO 通过 libloading 在运行时加载，
           # 不在 PE 导入表里；删掉 deps/openvino 后运行时会 warn 并回落到 cpu(MNN)。
           # 因此不必再编译一次，只复制一份产物并移除 OpenVINO 相关文件即可。
@@ -563,9 +607,15 @@ jobs:
 
       - name: 打包 Release zip
         shell: pwsh
+        env:
+          ZIP_FULL_NAME: ${{ needs.version-gate.outputs.zip_full }}
+          ZIP_BASIC_NAME: ${{ needs.version-gate.outputs.zip_basic }}
         run: |
-          $full = '${{ needs.version-gate.outputs.zip_full }}'
-          $basic = '${{ needs.version-gate.outputs.zip_basic }}'
+          $full = $env:ZIP_FULL_NAME
+          $basic = $env:ZIP_BASIC_NAME
+          if (-not $full -or -not $basic) {
+            throw 'zip 名称未从 version-gate 取得'
+          }
           Compress-Archive -Path 'dist/miliastra-wonderland-music-windows-x64' -DestinationPath "dist/$full" -Force
           Compress-Archive -Path 'dist/miliastra-wonderland-music-windows-x64-mnn' -DestinationPath "dist/$basic" -Force
           "ZIP_FULL=dist/$full" >> $env:GITHUB_ENV
@@ -586,8 +636,12 @@ jobs:
       - name: 解析发布说明文件
         id: release_notes
         shell: pwsh
+        env:
+          # 版本号来自 workflow_dispatch 输入，绝不能直接插值进脚本正文；
+          # 上游 validate_version 已做严格白名单，这里再走 env 传一遍。
+          RELEASE_VERSION: ${{ needs.version-gate.outputs.version }}
         run: |
-          $path = ".github/release-notes/${{ needs.version-gate.outputs.version }}.md"
+          $path = ".github/release-notes/$env:RELEASE_VERSION.md"
           if (Test-Path -LiteralPath $path -PathType Leaf) {
             "body_path=$path" >> $env:GITHUB_OUTPUT
           } else {

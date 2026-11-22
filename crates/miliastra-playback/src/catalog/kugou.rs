@@ -665,10 +665,15 @@ pub fn kugou_register_device(
 }
 
 fn classify_request_error_blocking(error: reqwest::Error) -> CatalogError {
-    if error.is_timeout() {
-        CatalogError::TimedOut(error.to_string())
+    // 隐私红线：`reqwest::Error` 的 Display 会附上完整请求 URL，而请求查询串里带着
+    // token / signature 等凭据；CatalogError 会被 `#[error(transparent)]` 透出到日志，
+    // 因此取文本前必须先剥离 URL。
+    let timed_out = error.is_timeout();
+    let detail = error.without_url().to_string();
+    if timed_out {
+        CatalogError::TimedOut(detail)
     } else {
-        CatalogError::Transient(error.to_string())
+        CatalogError::Transient(detail)
     }
 }
 
@@ -3190,10 +3195,13 @@ fn find_kugou_root_business_number(value: &Value, field: &str) -> Option<i64> {
 }
 
 fn classify_request_error(error: reqwest::Error) -> CatalogError {
-    if error.is_timeout() {
-        CatalogError::TimedOut(error.to_string())
+    // 同 classify_request_error_blocking：日志路径不得携带请求 URL。
+    let timed_out = error.is_timeout();
+    let detail = error.without_url().to_string();
+    if timed_out {
+        CatalogError::TimedOut(detail)
     } else {
-        CatalogError::Transient(error.to_string())
+        CatalogError::Transient(detail)
     }
 }
 
@@ -4331,5 +4339,19 @@ mod tests {
         );
         assert_eq!(parse_kugou_datetime_ms(""), None);
         assert_eq!(parse_kugou_datetime_ms("2026-09-12"), None);
+    }
+}
+
+/// B18-P1-1 回归：请求失败文本不得携带 URL / 查询参数（token、signature 等）。
+#[cfg(test)]
+mod request_error_redaction_tests {
+    use super::{classify_request_error, classify_request_error_blocking};
+    use crate::catalog::request_error_probe::assert_classified_error_is_redacted;
+
+    #[test]
+    fn classified_request_errors_never_carry_the_request_url() {
+        // 两条分类路径（async 与 blocking 客户端）都必须剥离 URL。
+        assert_classified_error_is_redacted(classify_request_error);
+        assert_classified_error_is_redacted(classify_request_error_blocking);
     }
 }

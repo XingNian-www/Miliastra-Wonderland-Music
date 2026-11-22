@@ -281,6 +281,11 @@ mod tests {
 
     #[test]
     fn fixed_secondary_chat_blocks_preserve_title_and_friend_row_ids() {
+        if crate::test_support::corpus::skip_without_corpus(
+            "fixed_secondary_chat_blocks_preserve_title_and_friend_row_ids",
+        ) {
+            return;
+        }
         let image = image::open("tests/fixtures/ui/secondary-chat-scrolled-1920x1080.jpg")
             .expect("open fixed secondary-chat screenshot");
         let runtime = OcrRuntime::start(FixedFixtureBlockDevice, 1).unwrap();

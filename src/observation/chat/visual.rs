@@ -293,6 +293,11 @@ mod tests {
 
     #[test]
     fn real_secondary_chat_only_exposes_left_incoming_avatars() {
+        if crate::test_support::corpus::skip_without_corpus(
+            "real_secondary_chat_only_exposes_left_incoming_avatars",
+        ) {
+            return;
+        }
         let image = image::open(
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures/ui/secondary-chat-scrolled-1920x1080.jpg"),

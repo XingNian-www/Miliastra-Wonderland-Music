@@ -649,3 +649,74 @@ mod provider_contract_tests {
         assert!(!serialized.contains("session-secret"));
     }
 }
+
+/// 适配器请求失败的回归测试辅助。
+///
+/// B18-P1-1：`reqwest::Error` 的 `Display` 会附上完整请求 URL，查询串里的 `token` /
+/// `wxrefresh_token` / `musickey` / `key` 因此会经 `CatalogError` 的
+/// `#[error(transparent)]` 进入 `warn!(%error)` 日志。这些辅助函数构造**真实**携带
+/// 敏感 URL 的请求错误，让各适配器就地断言自己的 `classify_request_error*` 已剥离 URL。
+#[cfg(test)]
+pub(crate) mod request_error_probe {
+    use super::CatalogError;
+
+    /// 必须为真的泄漏标记：原始 `reqwest::Error` 文本里存在，脱敏后的文本里必须消失。
+    const FORBIDDEN_MARKERS: [&str; 4] = ["http://", "token=", "wxrefresh_token=", "musickey="];
+
+    pub(crate) struct Probe {
+        /// 未脱敏的 `reqwest::Error` 文本，用于证明该错误确实携带 URL（否则测不到泄漏）。
+        pub(crate) raw: String,
+        pub(crate) error: reqwest::Error,
+    }
+
+    /// 连接一个先绑定后释放的本地端口，必然得到带 URL 的 `reqwest::Error`。
+    ///
+    /// 不访问外部网络：端口释放后同机连接会立即被拒绝，而 `reqwest` 仍会把完整
+    /// 请求 URL 附加到错误上。
+    pub(crate) fn secret_request_error() -> Probe {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe port");
+        let address = listener.local_addr().expect("probe address");
+        drop(listener);
+        let url = format!(
+            "http://{address}/probe?token=secret-token-value&wxrefresh_token=secret-refresh-value&musickey=secret-music-key"
+        );
+        let error = reqwest::blocking::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("probe client")
+            .get(url)
+            .send()
+            .expect_err("a released loopback port must refuse the connection");
+        Probe {
+            raw: error.to_string(),
+            error,
+        }
+    }
+
+    /// 断言分类结果保持"可重试"语义，且 URL 与查询参数没有进入错误文本。
+    pub(crate) fn assert_classified_error_is_redacted(
+        classify: fn(reqwest::Error) -> CatalogError,
+    ) {
+        let probe = secret_request_error();
+        assert!(
+            probe.raw.contains("token=secret-token-value"),
+            "precondition: the raw reqwest error must carry the query string: {}",
+            probe.raw
+        );
+        let classified = classify(probe.error);
+        let detail = match &classified {
+            CatalogError::TimedOut(detail) | CatalogError::Transient(detail) => detail,
+            other => panic!("request failures must stay retryable, got {other:?}"),
+        };
+        for marker in FORBIDDEN_MARKERS {
+            assert!(
+                !detail.contains(marker),
+                "error detail leaked {marker}: {detail}"
+            );
+            assert!(
+                !classified.to_string().contains(marker),
+                "CatalogError Display leaked {marker}: {classified}"
+            );
+        }
+    }
+}

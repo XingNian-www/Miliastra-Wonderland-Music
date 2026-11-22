@@ -237,6 +237,44 @@ pub(crate) fn cache_file_name(hash: &str, complete: bool) -> String {
     }
 }
 
+/// 缓存文件的两个阶段：下载中的 `.part` 与已完成 `.complete`。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CacheFileStage {
+    Part,
+    Complete,
+}
+
+/// 严格识别缓存文件名：32 位小写十六进制（`cache_key_hash` 的 md5 输出）+ 阶段后缀。
+///
+/// 缓存目录来自用户可配置的 `playback.audio_cache.directory`，可能直接指向
+/// 用户目录（甚至在磁盘根目录）。启动清理与容量淘汰**只能**删除本模块生成
+/// 的文件，绝不能按 `.part`/`.complete` 后缀误删用户文件。
+fn cache_file_stage(name: &str) -> Option<(&str, CacheFileStage)> {
+    let (stem, suffix) = name.rsplit_once('.')?;
+    let stage = match suffix {
+        "part" => CacheFileStage::Part,
+        "complete" => CacheFileStage::Complete,
+        _ => return None,
+    };
+    if stem.len() != 32
+        || !stem
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return None;
+    }
+    Some((stem, stage))
+}
+
+/// 记一条 debug：目录里出现了形如缓存文件、但文件名不是本缓存生成的条目。
+///
+/// 只在后缀匹配 `.part`/`.complete` 时记录，避免对用户目录中的无关文件刷日志。
+fn log_skipped_cache_candidate(name: &str, action: &str) {
+    if name.ends_with(".part") || name.ends_with(".complete") {
+        log::debug!("跳过非缓存命名的文件（仅处理 32 位小写 hex 文件名）: {name}, {action}");
+    }
+}
+
 pub(crate) fn cache_key_hash(key: &SongKey) -> String {
     let digest = md5::compute(format!("{}:{}", key.source, key.id));
     format!("{digest:x}")
@@ -287,8 +325,14 @@ pub(crate) struct CacheInner {
     pub(crate) client: reqwest::Client,
     pub(crate) active_downloads: Arc<AtomicUsize>,
     pub(crate) downloaded_bytes: Arc<AtomicUsize>,
-    /// 并发下载槽位：限制同时进行的源站下载任务数。
+    /// 并发下载槽位：限制同时进行的源站下载任务数（点播与预取的共享上限）。
     pub(crate) download_slots: Arc<tokio::sync::Semaphore>,
+    /// 预取专用名额：只占共享槽位的一部分，保证点播永远能立即拿到空槽。
+    ///
+    /// 预取绝不会排进 [`Self::download_slots`] 的等待队列：拿不到空槽就直接
+    /// 让位（见 `download::run_download`），否则预热会饿死点播——代理已经写出
+    /// `200`，客户端却只能等到 `seek_wait_timeout` 后断流。
+    pub(crate) prefetch_slots: Arc<tokio::sync::Semaphore>,
     /// SQLite 元数据索引（曲目身份/完整状态/歌词正文）。
     metadata_store: Arc<std::sync::Mutex<metadata::MetadataStore>>,
     /// 串行化容量淘汰，避免并发扫描并重复删除同一批文件。
@@ -307,6 +351,14 @@ fn lock_metadata_store(
 
 fn inner_concurrency(configured: usize) -> usize {
     if configured == 0 { 1 } else { configured }
+}
+
+/// 预取名额：共享并发上限中预留至少 1 个点播槽位。
+///
+/// `max_concurrent_downloads == 1` 时预取名额为 0：单槽位下预取会让点播
+/// 排队饥饿，因此预取整体让位于点播（播放时再按需下载）。
+fn prefetch_concurrency(download_slots: usize) -> usize {
+    download_slots.saturating_sub(1)
 }
 
 /// 注册表容量淘汰：超出上限时按最近使用移除非下载条目。
@@ -408,6 +460,9 @@ impl AudioCache {
             active_downloads: Arc::new(AtomicUsize::new(0)),
             downloaded_bytes: Arc::new(AtomicUsize::new(0)),
             download_slots: Arc::new(tokio::sync::Semaphore::new(download_slots)),
+            prefetch_slots: Arc::new(tokio::sync::Semaphore::new(prefetch_concurrency(
+                download_slots,
+            ))),
             metadata_store: Arc::new(std::sync::Mutex::new(metadata)),
             trim_lock: Mutex::new(()),
         });
@@ -670,7 +725,7 @@ impl AudioCache {
             return false;
         }
         let hash = cache_key_hash(key);
-        match download::start_download(inner, &hash).await {
+        match download::start_download(inner, &hash, download::DownloadPriority::Prefetch).await {
             Some(download::DownloadView::Complete { .. })
             | Some(download::DownloadView::InProgress(_)) => true,
             None => false,
@@ -859,6 +914,9 @@ pub enum CacheError {
 }
 
 /// 删除上次运行残留的半成品文件。
+///
+/// 只处理文件名严格匹配 `^[0-9a-f]{32}\.part$` 的残留；缓存目录可能被
+/// 配置到用户目录，其它 `*.part` 一律跳过（debug 记录）。
 fn cleanup_partial_files(inner: &CacheInner) -> Result<(), CacheError> {
     let Ok(entries) = std::fs::read_dir(&inner.config.directory) else {
         return Ok(());
@@ -868,8 +926,14 @@ fn cleanup_partial_files(inner: &CacheInner) -> Result<(), CacheError> {
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if name.ends_with(".part") {
-            let _ = std::fs::remove_file(&path);
+        match cache_file_stage(name) {
+            Some((_, CacheFileStage::Part)) => {
+                let _ = std::fs::remove_file(&path);
+            }
+            Some((_, CacheFileStage::Complete)) => {
+                // 完整文件由对账/容量淘汰处理，不在启动清理阶段删除。
+            }
+            None => log_skipped_cache_candidate(name, "startup_cleanup"),
         }
     }
     Ok(())
@@ -905,16 +969,22 @@ fn trim_cache_blocking(inner: &CacheInner, max_bytes: u64) -> Vec<String> {
     if total <= max_bytes {
         return Vec::new();
     }
-    let mut complete_files: Vec<(PathBuf, u64, u64)> = Vec::new();
+    let mut complete_files: Vec<(PathBuf, u64, u64, String)> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&inner.config.directory) {
         for entry in entries.flatten() {
             let path = entry.path();
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
-            if !name.ends_with(".complete") {
-                continue;
-            }
+            // 只淘汰本缓存生成的 `[0-9a-f]{32}.complete`：缓存目录可指向用户目录，
+            // 按后缀删除会把用户自己的 `*.complete` 当成缓存清掉。
+            let hash = match cache_file_stage(name) {
+                Some((hash, CacheFileStage::Complete)) => hash.to_owned(),
+                _ => {
+                    log_skipped_cache_candidate(name, "trim_cache");
+                    continue;
+                }
+            };
             let Ok(metadata) = path.metadata() else {
                 continue;
             };
@@ -924,12 +994,12 @@ fn trim_cache_blocking(inner: &CacheInner, max_bytes: u64) -> Vec<String> {
                 .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
                 .map(|duration| duration.as_secs())
                 .unwrap_or(0);
-            complete_files.push((path, metadata.len(), modified));
+            complete_files.push((path, metadata.len(), modified, hash));
         }
     }
-    complete_files.sort_by_key(|(_, _, modified)| *modified);
+    complete_files.sort_by_key(|(_, _, modified, _)| *modified);
     let mut removed = Vec::new();
-    for (path, size, _) in complete_files {
+    for (path, size, _, hash) in complete_files {
         if total <= max_bytes {
             break;
         }
@@ -937,12 +1007,10 @@ fn trim_cache_blocking(inner: &CacheInner, max_bytes: u64) -> Vec<String> {
             total = total.saturating_sub(size);
             saturating_sub_atomic(&inner.downloaded_bytes, size as usize);
             // 只清除音频完整状态，保留曲目身份、元数据和歌词正文。
-            if let Some(hash) = path.file_stem().and_then(|name| name.to_str()) {
-                removed.push(hash.to_owned());
-                let store = lock_metadata_store(&inner.metadata_store);
-                if let Err(error) = store.clear_complete(hash) {
-                    log::warn!("音频缓存淘汰后清除完整状态失败: {error}");
-                }
+            removed.push(hash.clone());
+            let store = lock_metadata_store(&inner.metadata_store);
+            if let Err(error) = store.clear_complete(&hash) {
+                log::warn!("音频缓存淘汰后清除完整状态失败: {error}");
             }
         }
     }
@@ -977,7 +1045,10 @@ fn reconcile_metadata(inner: &CacheInner) -> u64 {
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
-            let Some(hash) = name.strip_suffix(".complete") else {
+            // 与淘汰同口径：只认本缓存生成的 32 位 hex 文件名，避免把用户目录里的
+            // 其它 `*.complete` 计入缓存占用、进而触发对真实缓存的误淘汰。
+            let Some((hash, CacheFileStage::Complete)) = cache_file_stage(name) else {
+                log_skipped_cache_candidate(name, "reconcile");
                 continue;
             };
             let Ok(metadata) = path.metadata() else {
@@ -1244,17 +1315,26 @@ mod tests {
 
         let source_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let source_address = source_listener.local_addr().unwrap();
-        let source_body = b"truncated-audio-prefix";
+        // 先发足 64 KiB 再截断：代理因此能拿到首块数据并写出 `200 chunked` 响应头，
+        // 用例走「边下边播中途断流」这条主路径，而不是在源站快速失败时退化成
+        // 「代理不写响应头」的连接层错误。`Content-Length` 仍声明得比实际发送量大，
+        // 所以源站依旧是截断的（不能改成发完整 body，否则测不到截断）。
+        let source_body = vec![0x5a_u8; 64 * 1024];
+        let declared_length = source_body.len() + 4096;
+        // 由用例控制掐断时机：代理已经回包之后再让源站断开，消除调度抖动。
+        let (close_source, wait_close) = tokio::sync::oneshot::channel::<()>();
         let source = tokio::spawn(async move {
             let (mut stream, _) = source_listener.accept().await.unwrap();
             let mut request = [0u8; 1024];
             let _ = stream.read(&mut request).await.unwrap();
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                source_body.len() + 4096
+                "HTTP/1.1 200 OK\r\nContent-Length: {declared_length}\r\nConnection: close\r\n\r\n"
             );
             stream.write_all(response.as_bytes()).await.unwrap();
-            stream.write_all(source_body).await.unwrap();
+            stream.write_all(&source_body).await.unwrap();
+            stream.flush().await.unwrap();
+            let _ = wait_close.await;
+            let _ = stream.shutdown().await;
         });
 
         let directory = std::env::temp_dir().join(format!(
@@ -1284,12 +1364,27 @@ mod tests {
             )
             .await;
 
-        let response = reqwest::get(proxy_stream.url).await.unwrap();
-        let body = response.bytes().await;
-        assert!(
-            body.is_err(),
-            "proxy must not mark a truncated source as a clean chunked EOF"
-        );
+        match reqwest::get(proxy_stream.url).await {
+            Ok(response) => {
+                let status = response.status();
+                // 代理已回包，此刻再让源站截断。
+                let _ = close_source.send(());
+                // 两种形态都满足「不得把截断源当成干净的 chunked EOF」：
+                // - 代理已写出 `200 chunked`：响应体必须在流中途报错；
+                // - 代理未写响应头（显式 503 或连接层直接失败）：调用方看到的是
+                //   明确的失败，同样不是「干净结束」。
+                if status.is_success() {
+                    assert!(
+                        response.bytes().await.is_err(),
+                        "proxy must not mark a truncated source as a clean chunked EOF"
+                    );
+                }
+            }
+            // 连接层就明确失败（新逻辑在写响应头之前判定源站失败）：
+            Err(_) => {
+                let _ = close_source.send(());
+            }
+        }
         source.await.unwrap();
 
         cache.shutdown().await;
@@ -1355,6 +1450,289 @@ mod tests {
                 Some(lyrics_json.as_slice())
             );
         }
+        cache.shutdown().await;
+        drop(cache);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// 回归（B17-P1-2）：缓存目录可被配置到用户目录，清理只能删本模块生成的文件。
+    #[tokio::test]
+    async fn cleanup_only_removes_cache_owned_partial_files() {
+        let directory =
+            std::env::temp_dir().join(format!("miliastra-cache-cleanup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let owned_hash = cache_key_hash(&SongKey::new("kugou", "owned").unwrap());
+        let owned_part = directory.join(cache_file_name(&owned_hash, false));
+        std::fs::write(&owned_part, b"stale").unwrap();
+        // 用户目录里的同名后缀文件：绝不能被清理。
+        let user_part = directory.join("notes.part");
+        let user_complete = directory.join("backup.complete");
+        let uppercase_part = directory.join(format!("{}.part", owned_hash.to_uppercase()));
+        let short_hex_part = directory.join("abc123.part");
+        for path in [&user_part, &user_complete, &uppercase_part, &short_hex_part] {
+            std::fs::write(path, b"user data").unwrap();
+        }
+
+        let cache = AudioCache::spawn(AudioCacheConfig {
+            directory: directory.clone(),
+            metadata_directory: directory.join("index"),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            !owned_part.exists(),
+            "本缓存的残留 .part 必须在启动清理时删除"
+        );
+        for path in [&user_part, &user_complete, &uppercase_part, &short_hex_part] {
+            assert!(
+                path.exists(),
+                "非缓存命名的文件不得被删除: {}",
+                path.display()
+            );
+        }
+
+        cache.shutdown().await;
+        drop(cache);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn cache_file_stage_requires_exactly_32_lowercase_hex_chars() {
+        assert_eq!(
+            cache_file_stage("0123456789abcdef0123456789abcdef.part"),
+            Some(("0123456789abcdef0123456789abcdef", CacheFileStage::Part))
+        );
+        assert_eq!(
+            cache_file_stage("0123456789abcdef0123456789abcdef.complete"),
+            Some(("0123456789abcdef0123456789abcdef", CacheFileStage::Complete))
+        );
+        // 大小写不一致、长度不符、非 hex、无后缀、其它后缀：全部拒绝。
+        assert_eq!(
+            cache_file_stage("0123456789ABCDEF0123456789abcdef.part"),
+            None
+        );
+        assert_eq!(
+            cache_file_stage("0123456789abcdef0123456789abcde.part"),
+            None
+        );
+        assert_eq!(
+            cache_file_stage("0123456789abcdef0123456789abcdefg.part"),
+            None
+        );
+        assert_eq!(cache_file_stage("0123456789abcdef0123456789abcdef"), None);
+        assert_eq!(cache_file_stage("notes.part"), None);
+        assert_eq!(
+            cache_file_stage("0123456789abcdef0123456789abcdef.tmp"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn trim_never_deletes_files_that_are_not_cache_files() {
+        let directory = std::env::temp_dir().join(format!(
+            "miliastra-cache-trim-guard-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let cache = AudioCache::spawn(AudioCacheConfig {
+            directory: directory.clone(),
+            metadata_directory: directory.join("index"),
+            max_bytes: 16,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        // 用户文件：后缀相同但不是 32 位 hex 文件名。
+        let user_complete = directory.join("user-backup.complete");
+        std::fs::write(&user_complete, vec![9u8; 4096]).unwrap();
+        // 本缓存的真实条目，应当被淘汰。
+        let key = SongKey::new("kugou", "trim-guard").unwrap();
+        let hash = cache_key_hash(&key);
+        let owned_complete = directory.join(cache_file_name(&hash, true));
+        std::fs::write(&owned_complete, vec![1u8; 4096]).unwrap();
+        // 人为抬高统计占用，触发淘汰。
+        cache.inner.downloaded_bytes.store(4096, Ordering::SeqCst);
+
+        trim_cache(cache.inner.clone(), 16).await;
+
+        assert!(
+            user_complete.exists(),
+            "淘汰不得删除非缓存命名的 .complete 文件"
+        );
+        assert!(!owned_complete.exists(), "本缓存的完整文件应被淘汰");
+
+        cache.shutdown().await;
+        drop(cache);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// 回归（B17-P1-1）：预取名额耗尽时不占位、点播仍能立即拿到槽位。
+    #[tokio::test]
+    async fn prefetch_yields_so_on_demand_downloads_never_starve() {
+        // 2 个共享槽位 → 预取上限 1：另一个槽位永远留给点播。
+        assert_eq!(prefetch_concurrency(2), 1);
+        assert_eq!(prefetch_concurrency(1), 0);
+        assert_eq!(prefetch_concurrency(8), 7);
+
+        let directory = std::env::temp_dir().join(format!(
+            "miliastra-cache-prefetch-slots-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cache = AudioCache::spawn(AudioCacheConfig {
+            directory: directory.clone(),
+            metadata_directory: directory.join("index"),
+            max_concurrent_downloads: 2,
+            request_timeout: Duration::from_millis(200),
+            seek_wait_timeout: Duration::from_millis(200),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        // 预取名额占满：后续预取必须直接放弃（不创建 Downloading 占位）。
+        let first = cache.inner.prefetch_slots.clone().try_acquire_owned();
+        assert!(first.is_ok(), "第一个预取应能拿到名额");
+        let prefetch_key = SongKey::new("kugou", "prefetch-blocked").unwrap();
+        cache
+            .rewrite(
+                &prefetch_key,
+                None,
+                None,
+                StreamSource {
+                    url: "http://127.0.0.1:1/unreachable.mp3".parse().unwrap(),
+                    headers: Default::default(),
+                    expires_at_epoch_ms: None,
+                },
+            )
+            .await;
+        assert!(
+            !cache.prefetch(&prefetch_key).await,
+            "预取名额耗尽时必须直接让位，而不是排队或占位"
+        );
+        let hash = cache_key_hash(&prefetch_key);
+        assert!(
+            matches!(
+                cache
+                    .inner
+                    .entries
+                    .read()
+                    .await
+                    .get(&hash)
+                    .map(|e| &e.state),
+                Some(EntryState::Idle)
+            ),
+            "放弃的预取不得留下 Downloading 占位"
+        );
+
+        // 点播仍能拿到共享槽位（预取未占用等待队列）。
+        let on_demand = cache.inner.download_slots.clone().try_acquire_owned();
+        assert!(on_demand.is_ok(), "点播必须能立即拿到下载槽位");
+
+        drop(first);
+        cache.shutdown().await;
+        drop(cache);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// 回归（B17-P1-1）：点播在等待窗口内拿不到数据（槽位饱和）时，代理必须
+    /// 在写出响应头之前回 503 + Retry-After，而不是先 200 再断流。
+    #[tokio::test]
+    async fn proxy_returns_503_when_the_download_never_produces_bytes() {
+        let directory = std::env::temp_dir().join(format!(
+            "miliastra-cache-proxy-503-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cache = AudioCache::spawn(AudioCacheConfig {
+            directory: directory.clone(),
+            metadata_directory: directory.join("index"),
+            max_concurrent_downloads: 1,
+            request_timeout: Duration::from_millis(500),
+            seek_wait_timeout: Duration::from_millis(150),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        // 占满唯一的下载槽位：点播只能排队，等待窗口内不会产出任何字节。
+        let held = cache
+            .inner
+            .download_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let key = SongKey::new("kugou", "starved-source").unwrap();
+        let proxy_stream = cache
+            .rewrite(
+                &key,
+                None,
+                None,
+                StreamSource {
+                    url: "http://127.0.0.1:1/starved.mp3".parse().unwrap(),
+                    headers: Default::default(),
+                    expires_at_epoch_ms: None,
+                },
+            )
+            .await;
+
+        let response = reqwest::get(proxy_stream.url).await.unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "拿不到下载槽位时必须返回 503（而不是 200 后等到超时断流）"
+        );
+        assert!(
+            response
+                .headers()
+                .contains_key(reqwest::header::RETRY_AFTER),
+            "503 必须带 Retry-After"
+        );
+
+        drop(held);
+        cache.shutdown().await;
+        drop(cache);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// 源站失败（而非排队饥饿）时保持既有语义：不写响应头，客户端看到连接错误，
+    /// 绝不能被当作干净的 chunked EOF。
+    #[tokio::test]
+    async fn proxy_reports_source_failure_without_a_response_head() {
+        let directory = std::env::temp_dir().join(format!(
+            "miliastra-cache-proxy-source-fail-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cache = AudioCache::spawn(AudioCacheConfig {
+            directory: directory.clone(),
+            metadata_directory: directory.join("index"),
+            request_timeout: Duration::from_millis(200),
+            seek_wait_timeout: Duration::from_millis(500),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let key = SongKey::new("kugou", "unavailable-source").unwrap();
+        let proxy_stream = cache
+            .rewrite(
+                &key,
+                None,
+                None,
+                StreamSource {
+                    // 端口 1 不可达：下载必然失败。
+                    url: "http://127.0.0.1:1/unavailable.mp3".parse().unwrap(),
+                    headers: Default::default(),
+                    expires_at_epoch_ms: None,
+                },
+            )
+            .await;
+
+        let response = reqwest::get(proxy_stream.url).await;
+        assert!(
+            response.is_err(),
+            "源站失败时不得返回任何响应头（否则会被当成干净的 EOF）"
+        );
+
         cache.shutdown().await;
         drop(cache);
         let _ = std::fs::remove_dir_all(&directory);

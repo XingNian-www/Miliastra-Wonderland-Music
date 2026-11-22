@@ -31,6 +31,14 @@ ASSETS = ROOT / "assets"
 ORIGINALS = ROOT / "technical-docs" / "ui-state-evidence" / "evidence-gallery" / "template-originals"
 
 
+class UnknownTemplate(Exception):
+    """原图存在、但既没有裁剪策略也不在跳过清单里。"""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.name = name
+
+
 # ---------------------------------------------------------------------------
 # 基础图像操作
 # ---------------------------------------------------------------------------
@@ -272,6 +280,12 @@ def cream_content_inside_plate(rgb, plate_refs, plate_tol=26, low=8, high=34):
 # 文字内容模板由 `scripts/pure-text-templates.py` 统一生成（只保留字形，并裁到
 # 字形 bbox + 小 padding）。本脚本跳过它们，避免把纯文字资产覆盖回“按钮面/描边”
 # 版本；下面同名的例外分支是历史入口，已不可达，保留仅作记录。
+#
+# 这份清单必须与 `scripts/pure-text-templates.py` 的 CONFIG 键、以及
+# `src/ui/template/cache.rs` 的 TEXT_TEMPLATE_FILE_NAMES **三处一致**
+# （toolchain.md 里写明的人工契约）。此前只登记了 20 项，比 CONFIG 少两个
+# `qianxing-profile-page-*`，于是这两个模板两头都没人负责：pure-text 会写它们，
+# 但本脚本既不在 PURE_TEXT 里跳过、也没有裁剪策略，一跑到就 SystemExit。
 PURE_TEXT = {
     "ui-main-menu-return.png",
     "invite-enter-hall.png",
@@ -293,6 +307,10 @@ PURE_TEXT = {
     "teyvat-profile-world-level.png",
     "qianxing-profile-domain-level.png",
     "qianxing-profile-add-friend.png",
+    # 以下两项此前缺失：pure-text-templates.py 的 CONFIG 与
+    # TEXT_TEMPLATE_FILE_NAMES 都已收录，本清单漏登记。
+    "qianxing-profile-page-wishlist.png",
+    "qianxing-profile-page-wardrobe.png",
 }
 
 PLATE_WHITE = [(248, 248, 248), (240, 240, 240), (232, 232, 232), (236, 229, 216)]
@@ -414,7 +432,12 @@ def build_alpha(name: str, rgb: np.ndarray) -> np.ndarray:
         # 0.9013 误命中（阈值 0.90），二级聊天判据被地图抢走。只去掉圆外四角。
         return radial_keep(np.ones((h, w), dtype=np.float32), (w - 1) / 2, (h - 1) / 2, min(w, h) / 2 - 0.5)
 
-    raise SystemExit(f"没有为 {name} 定义裁剪策略")
+    # 既不在 PURE_TEXT（由 `scripts/pure-text-templates.py` 负责）、也不在 UNTOUCHED、
+    # 又没有显式策略：这是「新增了原图却忘了登记」的信号。
+    # 不在这里 raise —— 主流程要把它降级成 warning 并跳过，让整批还能跑完
+    # （旧行为是 SystemExit，跑到第 N 张就整脚本退出，前面的已写盘、后面的没跑，
+    # 资产停在“混合版本”状态，还看不出是哪一张坏了）。
+    raise UnknownTemplate(name)
 
 
 # ---------------------------------------------------------------------------
@@ -427,9 +450,11 @@ def main() -> int:
     if not originals:
         raise SystemExit(f"找不到原图备份目录: {ORIGINALS}")
     report = []
+    skipped = []
     for original in originals:
         name = original.name
         if name in PURE_TEXT:
+            # 由 `scripts/pure-text-templates.py` 负责（字形 matte + 按 bbox 裁剪）。
             continue
         if name in UNTOUCHED:
             # 这些模板不能改：直接按原字节覆盖，连编码都不变。
@@ -446,8 +471,25 @@ def main() -> int:
                 }
             )
             continue
-        rgb = load_rgb(name)
-        alpha = np.clip(build_alpha(name, rgb), 0.0, 1.0)
+        if not (ASSETS / name).is_file():
+            # 原图在、assets/ 里却没有同名模板：说明它不是生产模板（已下线、或
+            # 由别的流程产出）。这类条目没有可裁剪的输入，旧的 `load_rgb()` 会直接
+            # FileNotFoundError，旧的 SystemExit 更糟——整批中途死掉、前后资产版本不一致。
+            print(f"warning: {name} 在 assets/ 里没有同名模板，跳过（不是生产模板或已下线）", file=sys.stderr)
+            skipped.append(name)
+            continue
+        try:
+            rgb = load_rgb(name)
+            alpha = np.clip(build_alpha(name, rgb), 0.0, 1.0)
+        except UnknownTemplate:
+            # 有 assets/ 同名模板，但没人认领：新增模板忘了登记策略。
+            print(
+                f"warning: {name} 没有定义裁剪策略，保持 assets/ 原样跳过"
+                f"（请在 build_alpha 里补分支，或登记进 PURE_TEXT / UNTOUCHED）",
+                file=sys.stderr,
+            )
+            skipped.append(name)
+            continue
         alpha[alpha < 0.02] = 0.0
         opaque = float((alpha >= 0.5).mean())
         alpha_bytes = np.round(alpha * 255).astype(np.uint8)
@@ -464,6 +506,11 @@ def main() -> int:
         if not dry_run:
             Image.fromarray(rgba, "RGBA").save(ASSETS / name, optimize=True)
     print(json.dumps(report, ensure_ascii=False, indent=1))
+    if skipped:
+        print(
+            f"\n跳过 {len(skipped)} 个原图（无归属或无策略）：{', '.join(skipped)}",
+            file=sys.stderr,
+        )
     return 0
 
 

@@ -173,10 +173,21 @@ impl SequenceFreshness {
 
         // 0) 首屏没有聊天界面（冷基线已被消费）：之后第一帧内容一律按新命令处理，
         //    粉色与蓝色同一规则；过期的基线事件不得作用于这一帧。
+        //
+        //    但可信性判定必须最先执行：不可信帧不构成“内容真的出现了”的证据，
+        //    不得推进冷基线（也不得清 cold_absent / pending_discontinuity），
+        //    否则一次坏 OCR 就能把首屏历史洗成新命令。
         if self.cold_absent && len > 0 {
+            if !frame.trusted {
+                self.phase = ViewPhase::Discontinuity;
+                return all(ViewPhase::Discontinuity, Freshness::Unknown);
+            }
             self.cold_absent = false;
             self.phase = ViewPhase::Streaming;
             self.prev = frame.bubbles.iter().map(Snapshot::of).collect();
+            self.initialized = true;
+            // “可信后首次确认”才清不连续标记，与下面的常规分支保持一致。
+            self.pending_discontinuity = false;
             let mut decision = FrameDecision {
                 freshness: vec![Freshness::Seen; len],
                 matched: vec![None; len],
@@ -326,8 +337,10 @@ fn command_text_equal(left: &str, right: &str) -> bool {
 fn text_similar(left: &str, right: &str) -> bool {
     let a = normalize_chat_text(left);
     let b = normalize_chat_text(right);
+    // 空串只与空串相似：一侧空、一侧非空是两条不同的气泡。
+    // 旧实现两侧任一为空都返回 true，任何归一化后为空的文本都能锚定到任意非空气泡。
     if a.is_empty() || b.is_empty() {
-        return true;
+        return a.is_empty() && b.is_empty();
     }
     if a == b {
         return true;
@@ -534,5 +547,42 @@ mod tests {
         );
         assert_eq!(new_of(&d, 3), Freshness::New);
         assert_eq!(new_of(&d, 0), Freshness::Seen);
+    }
+
+    #[test]
+    fn empty_text_is_not_similar_to_non_empty() {
+        assert!(text_similar("", ""), "两侧都空才是同一条空气泡");
+        assert!(
+            !text_similar("", "@命令"),
+            "空文本不能锚定到非空命令（否则任何空气泡都能吞掉一条新命令）"
+        );
+        assert!(!text_similar("@命令", ""), "非空文本也不能锚定到空气泡");
+        assert!(!text_similar("   ", "闲聊"), "归一化后为空同样不得相似");
+    }
+
+    #[test]
+    fn untrusted_frame_does_not_advance_cold_absent_baseline() {
+        let mut state = SequenceFreshness::default();
+        state.mark_view_absent(ViewAbsence::Long);
+        let untrusted = [bubble(10, "@历史")];
+        let decision = state.observe(&FreshFrame {
+            trusted: false,
+            baseline: None,
+            bubbles: &untrusted,
+        });
+        assert!(
+            decision
+                .freshness
+                .iter()
+                .all(|freshness| *freshness == Freshness::Unknown),
+            "不可信帧必须全 Unknown: {:?}",
+            decision.freshness
+        );
+        assert_eq!(decision.phase, ViewPhase::Discontinuity);
+
+        // 冷基线没有被这次坏帧“兑现”：可信后的第一帧内容仍按“首屏无聊天”判新。
+        let trusted = observe(&mut state, None, &[("@新", 10)]);
+        assert_eq!(trusted.freshness[0], Freshness::New);
+        assert_eq!(trusted.phase, ViewPhase::Streaming);
     }
 }

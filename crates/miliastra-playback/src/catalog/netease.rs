@@ -1039,10 +1039,14 @@ fn classify_status(response: &reqwest::Response) -> Result<(), CatalogError> {
 }
 
 fn classify_request_error(error: reqwest::Error) -> CatalogError {
-    if error.is_timeout() {
-        CatalogError::TimedOut(error.to_string())
+    // 隐私红线：Display 会附上完整请求 URL（查询串含 key / csrf 等），而 CatalogError
+    // 会经 `#[error(transparent)]` 进日志；取文本前必须剥离 URL。
+    let timed_out = error.is_timeout();
+    let detail = error.without_url().to_string();
+    if timed_out {
+        CatalogError::TimedOut(detail)
     } else {
-        CatalogError::Transient(error.to_string())
+        CatalogError::Transient(detail)
     }
 }
 
@@ -1327,5 +1331,17 @@ mod tests {
         let error = adapter.resolve(&key, None).await.unwrap_err();
 
         assert!(matches!(error, CatalogError::Transient(_)));
+    }
+}
+
+/// B18-P1-1 回归：请求失败文本不得携带 URL / 查询参数。
+#[cfg(test)]
+mod request_error_redaction_tests {
+    use super::classify_request_error;
+    use crate::catalog::request_error_probe::assert_classified_error_is_redacted;
+
+    #[test]
+    fn classified_request_errors_never_carry_the_request_url() {
+        assert_classified_error_is_redacted(classify_request_error);
     }
 }

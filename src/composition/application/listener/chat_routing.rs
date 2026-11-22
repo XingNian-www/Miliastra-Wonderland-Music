@@ -1020,7 +1020,8 @@ impl AppServices {
             }
 
             if sample_as_question && routed.is_none() {
-                if let Some(mut question) = turtle_soup::parse_question_message(&message.text, None)
+                if let Some(mut question) =
+                    sampled_turtle_question(&message.text, message.sender.as_deref())
                 {
                     // 与二级大厅同一条展示链：正文里读到的是屏幕名（备注串或真实昵称），
                     // 直接渲染会把随机备注念到大厅。player_key 保留原文，匹配不受影响。
@@ -1074,9 +1075,21 @@ impl AppServices {
             };
             let parsed_command = self.map_command_actor(parsed_command);
             if let ModuleCommand::Playlist(command) = &parsed_command.command {
-                let owner = self.canonical_actor_name(&parsed_command.username);
+                // 歌单上下文必须用**归属键**（`id:<uuid>`）查，与打开窗口/执行命令的
+                // 其他路径同源。`canonical_actor_name` 返回的是裸 UUID，拿它当键
+                // 永远查不到：已登记玩家在一级模式下的 `@确认导入` / `@取消导入` /
+                // `@确认清空` / `@取消清空` 会 100% 被拒（architecture-map.md:557）。
                 let application = &self.business.playlist_application;
-                if !application.has_command_context(&owner, command, Instant::now())? {
+                let has_context = match self
+                    .playlist_owner_key(&parsed_command.username, parsed_command.account.as_ref())
+                {
+                    Some(owner) => {
+                        application.has_command_context(&owner, command, Instant::now())?
+                    }
+                    // 未登记身份没有歌单，也就不可能有窗口上下文。
+                    None => false,
+                };
+                if !has_context {
                     log::info!(
                         "命令未执行：歌单命令没有对应的当前窗口上下文，先打开歌单窗口再操作「{}」",
                         compact_for_log(&message.text)
@@ -1220,10 +1233,11 @@ impl AppServices {
                     // role=None 有两种成因：身份没登记，或这条消息根本没带账号
                     // （于是只按昵称查，随机 nickname 查不到）。日志必须能区分这两者，
                     // 但**不能打印 UID 本身**——那是真实玩家标识（MUST_READ §9）。
+                    // 外部源缺昵称时 `sender` 已回退成 `account.uid`，所以日志整体
+                    // 不带发送者标识，只保留排查所需的成因（是否带账号）与角色。
                     log::info!(
-                        "AI 聊天未触发：需要{}权限才能触发，发送者「{}」当前身份为{}，本条消息{}",
+                        "AI 聊天未触发：需要{}权限才能触发，发送者身份为{}，本条消息{}",
                         config.min_access.label(),
-                        sender,
                         role.map(actor_role_label).unwrap_or("未登记"),
                         if account.is_some() {
                             "带账号（按账号查身份）"
@@ -1233,6 +1247,13 @@ impl AppServices {
                     );
                     return Ok(());
                 }
+                // 不打印 `sender`：外部源缺昵称时它是 `account.uid`（见上方回退说明），
+                // 属真实玩家标识；提问者身份已由角色表达，足够排查。
+                log::info!(
+                    "收到 AI 聊天提问（提问者身份：{}），问题「{}」，开始生成回答",
+                    role.map(actor_role_label).unwrap_or("未登记"),
+                    compact_for_log(&question)
+                );
                 (sender, question)
             }
             crate::features::ai_chat::KeywordTrigger::Skip(skip) => {
@@ -1248,11 +1269,6 @@ impl AppServices {
                 return Ok(());
             }
         };
-        log::info!(
-            "收到 AI 聊天提问，提问者「{}」，问题「{}」，开始生成回答",
-            sender,
-            compact_for_log(&question)
-        );
         let mut routed = RoutedCommand::console(
             &config.keyword,
             &message.text,
@@ -1593,5 +1609,141 @@ impl AppServices {
     ) -> Result<()> {
         let message = format!("{}{}", prefix, text);
         self.reply(&message)
+    }
+}
+
+/// 一级大厅的提问采样：正文已由扫描层切成纯正文，昵称在 `sender` 里。
+///
+/// `parse_question_message` 在正文没有「发送者：」前缀时**只认** `fallback_player`
+/// 参数。扫描层把昵称从气泡里剥走后正文是纯 `#提问`，这里再传 `None`，一级
+/// OCR 的提问就会全部被静默丢弃——不报错、不入队，只表现为「海龟汤收不到
+/// 问题」。二级路径早就传了 `sender`，两条路径必须同一口径。
+fn sampled_turtle_question(
+    text: &str,
+    sender: Option<&str>,
+) -> Option<crate::features::turtle_soup::TurtleSoupQuestion> {
+    turtle_soup::parse_question_message(text, sender)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::features::identity::{
+        IdentityAccess, IdentityConfig, IdentityMapping, IdentityRole,
+    };
+    use crate::features::playlist::{PlaylistApplication, PlaylistCommand, owner_key};
+
+    /// 回归（B02-P1-5）：一级大厅歌单上下文必须用 `playlist_owner_key`（`id:<uuid>`）。
+    ///
+    /// `canonical_actor_name` 返回的是记忆键（已登记玩家为裸 UUID），而
+    /// `PlaylistApplication` 的 windows / pending_imports / pending_clear 全部以
+    /// `id:<uuid>` 为键。用错键形态时，已登记玩家在一级模式下的
+    /// `@确认导入` / `@取消导入` / `@确认清空` / `@取消清空` 查不到上下文，
+    /// 会被 100% 拒绝（architecture-map.md:557）。
+    #[test]
+    fn primary_hall_playlist_confirmation_uses_owner_key() {
+        let uuid = uuid::Uuid::from_u128(0x5eed);
+        let identity = IdentityAccess::new(IdentityConfig {
+            mappings: vec![IdentityMapping {
+                remark: "芦荟".to_string(),
+                id: uuid,
+                role: IdentityRole::Admin,
+                real_nickname: String::new(),
+                display_name: String::new(),
+                remark_from_chatbridge: false,
+                accounts: Vec::new(),
+            }],
+        });
+        // 一级 OCR 路径只有展示名、没有 account：归属键由身份 UUID 构造。
+        let owner = identity
+            .resolve_hint(crate::features::identity::IdentityHint::Nickname("芦荟"))
+            .map(|resolved| owner_key::for_identity(&resolved.id.to_string()))
+            .expect("已登记玩家必须能解析出歌单归属键");
+        assert_eq!(owner, format!("id:{uuid}"));
+
+        // 旧实现用的 `canonical_actor_name` 键是裸 UUID，与歌单键不同形态。
+        let canonical = identity.memory_key("芦荟");
+        assert_eq!(canonical, uuid.to_string());
+        assert_ne!(owner, canonical);
+
+        let application =
+            PlaylistApplication::from_connection(rusqlite::Connection::open_in_memory().unwrap())
+                .unwrap();
+        let track = miliastra_playback::PlayableTrack {
+            track_ref: miliastra_playback::TrackRef {
+                key: miliastra_playback::TrackKey::new(
+                    miliastra_playback::ProviderId::QqMusic,
+                    "a",
+                )
+                .unwrap(),
+                resolver_locator: None,
+            },
+            metadata: miliastra_playback::TrackMetadata {
+                title: "歌".into(),
+                artists: vec![],
+                album: None,
+                duration_ms: None,
+            },
+        };
+        application.add(&owner, &track, 0).unwrap();
+        let now = Instant::now();
+        let mut playback = NoopPlayback;
+        // 清空请求按归属键登记待确认状态。
+        application
+            .execute(&owner, &PlaylistCommand::Clear, &mut playback, now, 1)
+            .unwrap();
+
+        assert!(
+            application
+                .has_command_context(&owner, &PlaylistCommand::ConfirmClear, now)
+                .unwrap(),
+            "用 id:<uuid> 归属键必须能查到确认清空上下文"
+        );
+        assert!(
+            !application
+                .has_command_context(&canonical, &PlaylistCommand::ConfirmClear, now)
+                .unwrap(),
+            "旧实现用的裸 UUID 键查不到上下文——这正是 B02-P1-5"
+        );
+    }
+
+    /// 回归（B01-P1-4）：一级大厅的提问采样必须把扫描层剥出的发送者传下去。
+    ///
+    /// 扫描层 `split_ocr_sender` 已把昵称拆到 `message.sender`，正文是纯 `#提问`。
+    /// `parse_question_message` 在正文没有「发送者：」前缀时只认 `fallback_player`，
+    /// 传 `None` 会让一级 OCR 的提问 100% 静默丢弃——不报错、不入队。
+    #[test]
+    fn primary_hall_turtle_question_keeps_the_scanner_sender() {
+        let question = sampled_turtle_question("#是红色的吗？", Some("玩家甲"))
+            .expect("正文是纯提问、发送者在 sender 里时必须能采集");
+        assert_eq!(question.player, "玩家甲");
+        assert!(
+            question.question.contains("是红色的吗"),
+            "正文必须原样带过来，实际：{}",
+            question.question
+        );
+        // 没有发送者时旧行为就是丢弃：把它钉成文档，避免有人「修」成静默采到空玩家。
+        assert!(
+            sampled_turtle_question("#是红色的吗？", None).is_none(),
+            "没有发送者时无从判定提问者，必须拒绝而不是录成空玩家"
+        );
+    }
+
+    struct NoopPlayback;
+
+    impl crate::features::playlist::PlaylistPlaybackPort for NoopPlayback {
+        fn current_track(&self) -> Option<miliastra_playback::PlayableTrack> {
+            None
+        }
+        fn play(&mut self, _: &miliastra_playback::PlayableTrack) -> Result<()> {
+            Ok(())
+        }
+        fn import_playlist(
+            &mut self,
+            _: &str,
+            _: &str,
+        ) -> Result<miliastra_playback::PlaylistImportOperation> {
+            anyhow::bail!("test port does not import")
+        }
     }
 }

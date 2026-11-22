@@ -644,13 +644,20 @@ impl ModerationExecutionPort for AppServicesPort<'_> {
         // `prepare_vote_hold`），界面就还停在二级。所以**必须在这里**自己建立
         // 一级驻留，这是唯一保证管理界面可用的地方。
         //
-        // `hold` 在函数返回时 Drop，界面随后恢复到执行前的值守模式。
+        // 收尾时显式 `hold.release()`，再按执行前的值守模式切回界面。
         //
         // 失败分类很重要：这里的失败都发生在**业务输入之前**（还没进管理事务，
         // 一个键都没按），目标账号状态确定没变。因此按 `Ok(false)`「确认未执行」
         // 上报，让玩家看到"流程出错、可重试"；不能走 `Err` 通道——那条通道的
         // 文案是「执行结果未知，请勿重复操作」，会把可安全重试的导航失败
         // 升级成禁止重放，管理员只能人工确认。
+        //
+        // 执行前的值守模式必须在建立临时一级保留**之前**采样。
+        // `TemporaryPrimaryHold::new` 一旦把 `temporary_primary` 置真，
+        // `active_ui_residency()` 就只会回答「一级」；此时再采样，「执行完切回
+        // 执行前的模式」就变成再切一次一级，界面会滞留一级直到主循环 5 秒后的
+        // 驻留恢复轮询。
+        let previous = self.active_ui_residency().ok();
         let mut hold = match TemporaryPrimaryHold::new(self.business.business.clone()) {
             Ok(hold) => hold,
             Err(error) => {
@@ -673,10 +680,6 @@ impl ModerationExecutionPort for AppServicesPort<'_> {
             );
             return Ok(false);
         }
-        // 记下执行前的值守模式：管理事务收尾按入口（一级）归位，而逻辑模式
-        // 可能仍是二级值守。若不显式切回，界面会停在一级，等主循环 5 秒一次的
-        // 驻留恢复轮询才发现不一致——玩家会看到自己的二级聊天视图莫名跳回一级。
-        let previous = self.active_ui_residency().ok();
         let outcome = self
             .ui
             .moderation_ui
@@ -684,6 +687,9 @@ impl ModerationExecutionPort for AppServicesPort<'_> {
             .context("提交管理 UI 事务")?
             .wait()
             .context("等待管理 UI 事务")?;
+        // 先释放临时一级保留，再切回执行前的值守模式：hold 还活着时驻留判定
+        // 恒为一级，恢复动作会被它抵消。
+        hold.release();
         if let Some(previous) = previous {
             match self.establish_ui_residency(previous, ResidencyPurpose::ListenerModeSwitch) {
                 Ok(()) => log::debug!("管理操作完成，界面已切回执行前的值守模式"),
@@ -998,6 +1004,70 @@ mod tests {
     use crate::interfaces::chat::{ModerationAction, ModerationCommand};
     use crate::observation::chat::ChatIdentity;
     use crate::runtime::ui::UiRoutineFailure;
+
+    /// 回归：临时一级保留期间的驻留判定恒为「一级」。
+    ///
+    /// 这条是管理动作收尾缺陷的语义前提：`TemporaryPrimaryHold::new` 把
+    /// `temporary_primary` 置真之后，`active_ui_residency()` 只会回答一级，
+    /// 于是「执行后切回执行前的模式」变成再切一次一级——二级值守下界面
+    /// 会滞留一级，直到主循环 5 秒后的驻留恢复轮询。
+    #[test]
+    fn temporary_primary_hold_forces_primary_residency() {
+        use super::super::{UiResidency, listener_residency};
+        use crate::runtime::chat_listener::ChatListenerMode;
+
+        assert_eq!(
+            listener_residency(ChatListenerMode::Secondary, false),
+            UiResidency::SecondaryCurrentHall,
+            "二级值守且无临时保留时就是二级界面"
+        );
+        assert_eq!(
+            listener_residency(ChatListenerMode::Secondary, true),
+            UiResidency::Primary,
+            "临时一级保留生效期间一律按一级回答——所以必须在建立保留之前采样"
+        );
+        assert_eq!(
+            listener_residency(ChatListenerMode::Primary, false),
+            UiResidency::Primary
+        );
+    }
+
+    /// 接线锁定：执行前的值守模式必须在建立临时一级保留**之前**采样，
+    /// 且收尾禁止在 hold 仍生效时切回。
+    ///
+    /// 顺序错误不会编译失败、不会 panic，只会让二级值守的管理动作结束后界面
+    /// 滞留一级，因此只能盯源码。
+    #[test]
+    fn moderation_action_samples_residency_before_taking_the_primary_hold() {
+        const SOURCE: &str = include_str!("moderation.rs");
+        let body = SOURCE
+            .split("fn execute_action(")
+            .nth(1)
+            .expect("必须保留 execute_action");
+        let body = &body[..body
+            .find("fn sync_listener_state(")
+            .expect("execute_action 之后应紧跟 sync_listener_state")];
+        let sample = body
+            .find("let previous = self.active_ui_residency().ok();")
+            .expect("必须采样执行前的值守模式");
+        let hold = body
+            .find("TemporaryPrimaryHold::new(")
+            .expect("必须建立临时一级保留");
+        assert!(
+            sample < hold,
+            "必须在建立临时一级保留之前采样值守模式，否则采样结果恒为一级"
+        );
+        let release = body
+            .rfind("hold.release();")
+            .expect("收尾必须显式释放临时一级保留");
+        let restore = body
+            .find("self.establish_ui_residency(previous")
+            .expect("必须按执行前的值守模式切回界面");
+        assert!(
+            release < restore,
+            "必须先释放临时一级保留再切回界面，否则恢复动作会被 hold 抵消"
+        );
+    }
 
     /// 把投票渲染回「昵称：正文」便于断言。
     ///

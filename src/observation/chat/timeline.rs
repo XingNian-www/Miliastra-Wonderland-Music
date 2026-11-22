@@ -143,7 +143,25 @@ struct BusinessLedger {
     unread_baseline: HashSet<ObservedChatMessageId>,
     claimed: HashSet<ObservedChatMessageId>,
     not_executed_logged: HashSet<ObservedChatMessageId>,
+    /// 冷启动首屏是否已经被真正看见过（进程级一次性标志）。
+    ///
+    /// 只由“携带基线事件的非空帧”或“tracker 刚建立的首个非空帧”置位。
+    /// 空帧与聊天区缺席（`publish_no_chat`）只说明这一帧没有证据，不得消费；
+    /// 否则视图重建后的首帧会同时丢掉 baseline 与 initial（MUST_READ §3
+    /// 「命令锁不因空 OCR、短暂无聊天或滚屏释放」）。
+    ///
+    /// 注意命令锁兜底**不依赖**本标志：tracker 重建后的首帧没有连续对齐，
+    /// 必须无条件用锁核验（见 `publish` 里的 `tracker_first_frame`）。
     cold_baseline_consumed: bool,
+    /// 进程启动至今**从未真正看见过首屏**，且已出现过“聊天区不在画面上”。
+    ///
+    /// 语义是「首屏没有命令可抑制」：之后第一次出现的内容不是历史首屏，
+    /// 粉色命令按新命令处理（见 `pink_command_after_chat_reappears_is_not_first_screen_suppressed`）。
+    ///
+    /// 它只影响“粉色首屏历史提升”这一个分支，**不参与冷基线与命令锁的判定**：
+    /// 把两件事混在一个标志里，正是 `publish_no_chat` 顺手置 `cold_baseline_consumed`
+    /// 从而让重建首帧绕过命令锁的成因。
+    first_screen_had_no_chat: bool,
     active_claims: HashSet<ObservedChatMessageId>,
     ignored_revisions: HashMap<ObservedChatMessageId, CapturedBusinessRevision>,
     latest_business_revisions: HashMap<ObservedChatMessageId, CapturedBusinessRevision>,
@@ -556,6 +574,7 @@ impl ChatTimeline {
                         claimed: HashSet::new(),
                         not_executed_logged: HashSet::new(),
                         cold_baseline_consumed: false,
+                        first_screen_had_no_chat: false,
                         active_claims: HashSet::new(),
                         ignored_revisions: HashMap::new(),
                         latest_business_revisions: HashMap::new(),
@@ -799,35 +818,38 @@ impl ChatTimeline {
                     .is_some_and(|end| captured_at <= end));
         // 空 OCR 帧不消费基线：否则会在真正有内容的第一帧丢失基线语义。
         let frame_empty = messages.is_empty();
-        // 冷基线消费：聊天区不存在（publish_no_chat）或首屏为空，都等价于“首屏没有命令”。
-        // 首屏抑制的目的只是不让 BOT 刚启动就读到旧命令；无命令可抑制时，
-        // 之后出现的命令按新命令处理（蓝色不再被 AppStart 吞、粉色不再走首屏历史提升）。
-        let cold_consumed = state.ledger.cold_baseline_consumed || frame_empty;
-        if state.ledger.cold_baseline_consumed && !frame_empty {
-            // 之前出现过“首屏无聊天/空屏”，现在内容才出现：过期基线事件不得落到这一帧上，
-            // 否则首屏无聊天时，内容再出现会被旧基线判成历史（粉色与蓝色同一规则）。
-            state.pending_baseline = None;
-        }
+        // 冷基线只能由“真正看见过首屏”的事件消费：携带基线事件的非空帧，或 tracker
+        // 刚建立的首个非空帧。空帧与聊天区缺席（publish_no_chat）只记“这一帧没有证据”，
+        // 既不得置 cold_baseline_consumed，也不得清 pending_baseline——否则视图重建后的
+        // 首帧会同时丢掉 baseline 与 initial（MUST_READ §3「命令锁不因空 OCR、
+        // 短暂无聊天或滚屏释放」）。
         let baseline = if frame_empty {
             None
         } else {
             state.pending_baseline.take()
         };
         let mut freshness = state.chat_freshness.remove(&chat).unwrap_or_default();
-        if cold_consumed {
-            // 默认按短暂过渡处理：没有显式记录时保持原有对齐行为。
-            let absence = state
-                .pending_absence
-                .take()
-                .unwrap_or(crate::observation::chat::ViewAbsence::Transient);
+        // 聊天区“缺席”只由 `publish_no_chat` 显式记录；空帧不构成视图消失的证据，
+        // 因此空帧不得在这里伪造 `mark_view_absent`（否则新 chat 的空首帧会把之后
+        // 出现的历史命令洗成新命令）。已初始化的新鲜度状态对 `Transient` 是 no-op。
+        if let Some(absence) = state.pending_absence.take() {
             freshness.mark_view_absent(absence);
         }
+        let cold_baseline_seen = state.ledger.cold_baseline_consumed;
+        // “首屏根本没有聊天区”时没有旧命令可抑制：之后出现的内容（粉色含内）按新命令
+        // 处理，不走粉色首屏历史提升。它**只**影响这一个分支，不参与命令锁判定。
+        let first_screen_had_no_chat = state.ledger.first_screen_had_no_chat && !cold_baseline_seen;
         let tracker = state
             .screen
             .trackers
             .get_mut(&chat)
             .expect("tracker inserted");
-        let initial = !tracker.initialized && !cold_consumed;
+        // 只有“冷启动首屏”才走粉色首屏历史提升。tracker 重建后的首帧不是冷基线
+        // （进程早已消费过首屏），否则重开后的粉色命令会被整批当成历史。
+        let initial = !tracker.initialized && !cold_baseline_seen && !first_screen_had_no_chat;
+        // 命令锁兜底必须覆盖 tracker 刚建立的首帧（含视图重建）：那种帧没有可用的
+        // 连续对齐，锁是唯一能认出“屏上这条已经执行过”的依据。
+        let tracker_first_frame = !tracker.initialized;
         let mut observed = tracker.observe(&chat, messages, &mut freshness, baseline);
         let visual_session = tracker.session;
         if suppress {
@@ -835,8 +857,11 @@ impl ChatTimeline {
                 message.is_new = false;
             }
         }
-        // 只有“可信的非空首帧”才真正消费掉冷基线；空帧或被抑制帧继续保留该标志。
-        state.ledger.cold_baseline_consumed = frame_empty || suppress;
+        // 只有“真正看见过首屏”才消费冷基线：空帧与缺席不置位，
+        // 否则下一次 tracker 重建首帧会重新把它当成冷启动历史。
+        if !frame_empty && (initial || baseline.is_some()) {
+            state.ledger.cold_baseline_consumed = true;
+        }
         state.chat_freshness.insert(chat.clone(), freshness);
         // 命令锁已降级为**冷启动兜底账本**：新老判定由 freshness 的序列对齐负责；
         // 这里只在“携带基线事件的帧”或“tracker 刚建立的首帧”用锁否决已经成功执行过的
@@ -855,7 +880,7 @@ impl ChatTimeline {
                 lock.release_missing(&observed);
                 // 命令锁降级为“仅冷启动兜底”：只在该帧携带基线事件或 tracker 刚建立时，
                 // 用它否决已经成功执行过的命令；常规流式帧由 freshness 判决，锁不再反压。
-                if baseline.is_some() || initial {
+                if baseline.is_some() || tracker_first_frame {
                     for message in &mut observed {
                         if message.is_new && lock.matches(message) {
                             message.is_new = false;
@@ -1059,6 +1084,22 @@ impl ChatTimeline {
                 log::debug!("外部聊天消息重复，已忽略：{dedup}");
                 continue;
             }
+            // 重连补拉：`epoch` 递增会让去重 id 全变，`claimed`/`pending` 都命不中历史消息，
+            // 但命令锁里的序号锚点是跨 reconnect 稳定的。`LockAnchor::Sequence` 语义：
+            // `source_sequence <= 已记录序号` 即旧消息，重连补拉不得重复执行。
+            // 这里只否决“已成功执行过的同一文本 + 不晚于记录的序号”，
+            // 不影响序号锚点“不做缺席释放”的语义（见 `CommandLock::release_missing`）。
+            if state.command_locks.get(&identity).is_some_and(|lock| {
+                lock.matches_text_at(
+                    &message.text,
+                    LockAnchor::Sequence {
+                        after: message.sequence,
+                    },
+                )
+            }) {
+                log::debug!("外部聊天消息命中已执行命令锁，重连补拉时忽略：{dedup}");
+                continue;
+            }
             let sender = message
                 .sender
                 .nickname
@@ -1216,8 +1257,15 @@ impl ChatTimeline {
         state.screen.latest = None;
         // A disappeared view starts new visual sessions on its next appearance.
         state.screen.trackers.clear();
-        // 聊天区不存在：首屏没有命令可抑制，冷基线就此消费（见 mark_view_absent 说明）。
-        state.ledger.cold_baseline_consumed = true;
+        // 聊天区不存在只记“缺席”：不得消费冷基线，也不得清 pending_baseline。
+        // 重开后的 tracker 首帧仍需命令锁兜底，否则屏上已执行的命令会被重跑；
+        // 而基线事件（如 PanelReturn）必须留到真正有内容的首帧再生效。
+        //
+        // 但如果进程至今还没见过任何首屏，这条缺席就说明“首屏没有命令可抑制”：
+        // 之后出现的内容（含粉色）按新命令处理，而不是当成历史首屏。
+        if !state.ledger.cold_baseline_consumed {
+            state.ledger.first_screen_had_no_chat = true;
+        }
         // 记录消失性质：重开第一帧据此决定能否沿用旧的交叠对齐。
         state.pending_absence = Some(absence);
         // 聊天不可见：保留新鲜度状态，但**不再强制下一帧不连续**。
@@ -1417,6 +1465,13 @@ impl ChatTimeline {
             .filter(|s| s.chat.is_none())
         {
             if subscriber.failure.is_some() {
+                continue;
+            }
+            // 与 `deliver_snapshot` 同口径：绑定了业务容器的读者只收本容器的消息。
+            // 好友私聊的未读快照不得推给只订阅大厅的审批/决策读者。
+            if let Some(bound_scope) = subscriber.scope.as_ref()
+                && !bound_scope.same_container(&revision.scope)
+            {
                 continue;
             }
             if subscriber.queue.len() >= RETAINED_CAPACITY {
@@ -3933,6 +3988,216 @@ mod tests {
                 .messages
                 .iter()
                 .all(|message| !shared.is_business_pending(&message.id).unwrap())
+        );
+    }
+
+    /// 空帧/聊天区缺席只能记“没有证据”，不得消费冷基线。
+    ///
+    /// 回归 B12-P1-1：`publish_no_chat` 无条件置 `cold_baseline_consumed` 后，视图重建
+    /// 首帧的 `initial` 恒假，命令锁兜底被整体跳过，屏上已执行的命令会重跑。
+    #[test]
+    fn no_chat_frame_does_not_consume_cold_baseline() {
+        let shared = ChatTimeline::new();
+        // 还没见过任何内容：publish_no_chat 只能记缺席。
+        shared
+            .publish_no_chat(
+                Instant::now(),
+                "no chat yet",
+                crate::observation::chat::ViewAbsence::Long,
+            )
+            .unwrap();
+        assert!(
+            !shared
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .ledger
+                .cold_baseline_consumed,
+            "聊天区缺席不是“首屏没有命令”的证据，不得消费冷基线"
+        );
+
+        // 视图重建后的首帧必须仍走命令锁：已执行过的命令不得重跑。
+        let first = publish(&shared, vec![primary("甲", "@状态", 40)]);
+        execute(&shared, &first, 0);
+        rebuild(&shared);
+        let repeated = publish(&shared, vec![primary("甲", "@状态", 40)]);
+        assert!(
+            !repeated.messages[0].is_new,
+            "重建后仍在屏上的已执行命令必须被命令锁否决，实际被判为新"
+        );
+        assert!(
+            !shared
+                .is_business_pending(&repeated.messages[0].id)
+                .unwrap(),
+            "重建后仍在屏上的已执行命令不得重新入队"
+        );
+    }
+
+    /// 空 OCR 帧同样只能记“没有证据”：不得消费冷基线，也不得清掉待生效的基线事件。
+    ///
+    /// 与 `no_chat_frame_does_not_consume_cold_baseline` 同源（B12-P1-1）：旧实现
+    /// `cold_baseline_consumed = frame_empty || suppress` 会把空帧当成分界线。
+    #[test]
+    fn empty_frame_does_not_consume_cold_baseline() {
+        let shared = ChatTimeline::new();
+        publish(&shared, vec![]);
+        {
+            let state = shared.inner.state.lock().unwrap();
+            assert!(
+                !state.ledger.cold_baseline_consumed,
+                "空帧不是“首屏没有命令”的证据，不得消费冷基线"
+            );
+        }
+
+        // 空帧之后的首个内容帧仍要按冷启动首屏处理（粉色历史不得被派发）。
+        let mut pink = primary("甲", "@点歌 晴", 40);
+        pink.message_type = "pink".into();
+        let first = publish(&shared, vec![pink]);
+        assert!(
+            !first.messages[0].is_new,
+            "空帧之后出现的第一屏仍属冷启动首屏，粉色历史不得判新"
+        );
+        assert!(
+            !shared.is_business_pending(&first.messages[0].id).unwrap(),
+            "冷启动首屏的粉色历史不得入队"
+        );
+        // 这一帧之后冷基线才算被消费：它是“真的看见过首屏”的那一帧。
+        assert!(
+            shared
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .ledger
+                .cold_baseline_consumed,
+            "真正的首屏内容帧才消费冷基线"
+        );
+    }
+
+    /// 聊天区消失前登记的基线事件必须留到内容真正出现的那一帧。
+    ///
+    /// 回归 B12-P1-1：旧实现会在 `publish` 里把 `pending_baseline` 抹掉，
+    /// 使 `PanelReturn` 全旧语义失效，历史命令被当成新命令。
+    #[test]
+    fn panel_return_baseline_survives_no_chat_frame() {
+        let shared = ChatTimeline::new();
+        publish(&shared, vec![input("旧消息", 10)]);
+        shared.note_baseline("目标窗口恢复").unwrap();
+        shared
+            .publish_no_chat(
+                Instant::now(),
+                "view hidden",
+                crate::observation::chat::ViewAbsence::Transient,
+            )
+            .unwrap();
+        let after = publish(&shared, vec![input("旧消息", 10), input("@状态", 40)]);
+        assert!(
+            after.messages.iter().all(|message| !message.is_new),
+            "PanelReturn 基线必须让重开首帧全部判旧，实际: {:?}",
+            after
+                .messages
+                .iter()
+                .map(|message| (&message.text, message.is_new))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            after
+                .messages
+                .iter()
+                .all(|message| !shared.is_business_pending(&message.id).unwrap()),
+            "PanelReturn 基线下的历史命令不得入队"
+        );
+    }
+
+    /// 回归 B12-P1-2：外部源重连后 epoch 递增、去重 id 全变，历史命令仍须被命令锁挡住。
+    #[test]
+    fn external_reconnect_replay_is_blocked_by_command_lock() {
+        let shared = ChatTimeline::new();
+        let business = shared.subscribe_business().unwrap();
+        let message = |sequence: u64| crate::observation::chat::ExternalChatMessage {
+            sequence,
+            sent_at: None,
+            channel: miliastra_kernel::chat_source::ChatChannel::current_hall(),
+            hall_id: None,
+            sender: miliastra_kernel::chat_source::ExternalSender::new(
+                Some("甲".to_string()),
+                Some(miliastra_kernel::chat_source::GameUid::from_u32(1001)),
+            ),
+            to_uid: None,
+            text: "@状态".to_string(),
+        };
+        let first_epoch = VisualSessionId::new(1);
+        let accepted = shared
+            .inject_external(
+                Instant::now(),
+                first_epoch,
+                "bridge",
+                None,
+                vec![message(7)],
+            )
+            .unwrap();
+        assert_eq!(accepted.len(), 1, "首条外部命令必须入账");
+        let first_frame = business
+            .read()
+            .unwrap()
+            .pop()
+            .expect("business subscriber receives the external frame");
+        let delivered = &first_frame.messages[0];
+        claim(&shared, delivered, first_frame.captured_at)
+            .expect("pending external message should be claimable")
+            .complete_as_command()
+            .unwrap();
+
+        // 重连：epoch 变了，id 全变；服务端从环形缓冲补拉同一序号。
+        let replay_epoch = VisualSessionId::new(2);
+        let replay = shared
+            .inject_external(
+                Instant::now(),
+                replay_epoch,
+                "bridge",
+                None,
+                vec![message(7)],
+            )
+            .unwrap();
+        assert!(
+            replay.is_empty(),
+            "重连补拉的已执行命令必须被命令锁挡住，实际仍入账 {} 条",
+            replay.len()
+        );
+        assert!(
+            business.read().unwrap().is_empty(),
+            "重连补拉的已执行命令不得再推给业务读者"
+        );
+
+        // 更大的序号是新命令，不得被锁吞掉。
+        let fresh = shared
+            .inject_external(
+                Instant::now(),
+                replay_epoch,
+                "bridge",
+                None,
+                vec![message(8)],
+            )
+            .unwrap();
+        assert_eq!(fresh.len(), 1, "更大的服务端序号必须当作新命令");
+        assert_eq!(business.read().unwrap().len(), 1);
+    }
+
+    /// 回归 B12-P1-3：好友私聊的未读快照不得推给只订阅大厅的决策/投票读者。
+    #[test]
+    fn unread_baseline_is_not_delivered_to_hall_only_subscribers() {
+        let shared = ChatTimeline::new();
+        let hall_only = shared.subscribe_scoped(ChatScope::hall()).unwrap();
+        let baseline = friend(&shared, vec![input("旧消息", 10), input("@点歌 晴天", 40)]);
+        let id = baseline.messages[1].id.clone();
+        assert!(
+            shared.deliver_unread_baseline(&baseline, &id).unwrap(),
+            "好友未读提升本身必须成功"
+        );
+        assert!(
+            hall_only.read().unwrap().is_empty(),
+            "只订阅大厅的读者不得收到好友私聊的未读快照"
         );
     }
 

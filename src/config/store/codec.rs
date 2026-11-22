@@ -95,7 +95,9 @@ pub(super) fn validate_persisted_shape(
                 }
             };
             // 存储里有、结构体里没有 = 字段被移除或改名。
-            for key in stored.keys().filter(|key| !canonical.contains_key(*key)) {
+            // 取第一个不匹配的键就失败：报错文案与检查顺序都和逐项遍历一致，
+            // 但不必写一个迭代一次就 bail 的循环（clippy::never_loop）。
+            if let Some(key) = stored.keys().find(|key| !canonical.contains_key(*key)) {
                 bail!("配置字段 {} 已不存在（字段被删除或改名）", field_name(key));
             }
             // 结构体里有、存储里没有 = 新增字段，默认值已生效，递归交给下层校验。

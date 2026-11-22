@@ -676,17 +676,19 @@ pub(crate) fn recent_actions(
         if seen.len() >= limit {
             break;
         }
-        let action = serde_json::from_str::<serde_json::Value>(&turn.answer)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("action")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::trim)
-                    .filter(|action| !action.is_empty())
-                    .map(str::to_owned)
-            });
-        push_opening(&mut seen, action.as_deref().unwrap_or(&turn.answer), limit);
+        match parse_answer_action(&turn.answer) {
+            // 成功解析出协议 JSON：只认 action。action 为空是完全合法的
+            // （「不是每次回复都需要动作」），此时**跳过**，绝不能回退原文——
+            // 回退会把 `{"action": "", "text": ...}` 整个 JSON 塞进提示词，
+            // `opening_of` 再按标点切出 `{"action` 当成"最近用过的动作"。
+            AnswerAction::Parsed(action) => {
+                if let Some(action) = action {
+                    push_opening(&mut seen, &action, limit);
+                }
+            }
+            // 非 JSON（旧数据/纯文本回复）：原文就是动作描写，回退。
+            AnswerAction::NotJson => push_opening(&mut seen, &turn.answer, limit),
+        }
     }
     // 其他人的 BOT 回复：hall 已排除当前玩家自己的行。
     for (_, text, role) in hall.lines.iter().rev() {
@@ -699,6 +701,33 @@ pub(crate) fn recent_actions(
     }
     seen.reverse();
     seen
+}
+
+/// 一条历史回答的 action 解析结果。
+enum AnswerAction {
+    /// 协议 JSON，`action` 已 trim；空串/缺字段按 None 处理（表示这一轮没有动作）。
+    Parsed(Option<String>),
+    /// 不是 JSON 对象：旧数据或纯文本回复。
+    NotJson,
+}
+
+fn parse_answer_action(answer: &str) -> AnswerAction {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(answer) else {
+        return AnswerAction::NotJson;
+    };
+    // 能解析成 JSON 但不是对象（例如纯文本恰好是个数字/字符串字面量）：
+    // 仍按旧数据处理，避免把 "123" 当成动作。
+    if !value.is_object() {
+        return AnswerAction::NotJson;
+    }
+    AnswerAction::Parsed(
+        value
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|action| !action.is_empty())
+            .map(str::to_owned),
+    )
 }
 
 fn opening_of(text: &str) -> Option<String> {

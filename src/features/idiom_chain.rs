@@ -433,13 +433,43 @@ impl IdiomChainService {
         Ok(outcome)
     }
 
+    /// 解释成语（`#解释`）。
+    ///
+    /// **这条入口也会让会话过期，所以必须和 [Self::handle_at] 走同一套释放逻辑。**
+    ///
+    /// `IdiomChainGame::handle_at` 对任何非 `Start` 命令都会先 `expire_if_idle(now)`，
+    /// 命中就清掉 session 并返回 `expired`。旧实现直接 `self.game.handle_at(...)`
+    /// 把结果丢回去，没碰 `EntertainmentState`——于是「空闲超时」这条路径只在
+    /// 计时器到期时（`expire_idle_at`）释放互斥位，而玩家恰好在过期时刻发一条
+    /// `#解释xxx` 就把会话清掉、互斥位却永久留着：之后任何玩法都提示「其他玩法进行中」，
+    /// 且没有任何命令能收尾（会话已经不存在，`abort` 也返回 false）。
+    ///
+    /// 与 `handle_at` 的分工没变：这里**不获取**占用（解释不是开局），
+    /// 但会话一结束就必须**就地**释放。不能推迟到「下一个持有互斥位的入口」：
+    /// 会话清掉后 [Self::idle_deadline] 返回 `None`，`sync_idiom` 会取消超时定时器，
+    /// 而全员离场/无命令的场景本来就不会有下一次入口——延迟释放等于把互斥位
+    /// 占到进程退出，其他玩法一直提示「其他玩法进行中」。
     pub(crate) fn explain_at(
         &mut self,
+        entertainment: &mut EntertainmentState,
         player: &str,
         command: &IdiomChainCommand,
         now: Instant,
     ) -> Result<IdiomChainOutcome> {
-        Ok(self.game.handle_at(player, command, now))
+        let outcome = self.game.handle_at(player, command, now);
+        // `#解释` 走的是 `IdiomChainGame::handle_at`，它对非 `Start` 命令会先
+        // `expire_if_idle(now)`：命中就清掉 session 并返回 `expired`。
+        if matches!(outcome.action, "completed" | "stopped" | "expired") {
+            // 先判所有权再释放：只清本玩法自己的占用，不误清别人（海龟汤等）。
+            if entertainment.active() == Some(EntertainmentKind::IdiomChain) {
+                entertainment.release(EntertainmentKind::IdiomChain);
+            }
+            log::debug!(
+                "成语接龙会话因「{}」结束，娱乐互斥位已就地释放",
+                outcome.action
+            );
+        }
+        Ok(outcome)
     }
 
     pub(crate) fn abort(&mut self, entertainment: &mut EntertainmentState) -> Result<bool> {
@@ -1548,5 +1578,144 @@ mod tests {
         assert!(!game.expire_idle_at(clock.now()));
         clock.advance(Duration::from_secs(1)).unwrap();
         assert!(game.expire_idle_at(clock.now()));
+    }
+
+    /// B06-P1-02：`#解释` 撞上空闲过期时，娱乐互斥位必须**当场**释放。
+    ///
+    /// 会话一旦被清掉，[IdiomChainService::idle_deadline] 就返回 `None`，`sync_idiom`
+    /// 随之取消超时定时器——不会再有下一次 tick 或玩法入口来兑现「延迟释放」。
+    /// 所以释放只能发生在 `#解释` 这次调用里。这条测试钉住两个后果：
+    /// 1. `#解释` 返回时槽位已经为空（不依赖任何后续操作）；
+    /// 2. 下一次玩法操作（这里是再次开局）能正常成功，而不是被自己的残留锁
+    ///    判成「其他玩法进行中」——那正是线上表现：锁泄漏到进程退出。
+    #[test]
+    fn explanation_that_expires_the_session_releases_the_entertainment_slot() {
+        let clock = ManualClock::new(Instant::now());
+        let mut entertainment = EntertainmentState::new();
+        let mut service = IdiomChainService::from_game(game(&["画蛇添足", "足智多谋"]));
+
+        service
+            .handle_at(
+                &mut entertainment,
+                "Alice",
+                &start_exact("画蛇添足"),
+                clock.now(),
+            )
+            .unwrap();
+        assert_eq!(entertainment.active(), Some(EntertainmentKind::IdiomChain));
+
+        // 越过空闲阈值后再发 #解释：会话被清掉，返回 expired。
+        clock.advance(Duration::from_secs(301)).unwrap();
+        let expired = service
+            .explain_at(
+                &mut entertainment,
+                "Alice",
+                &IdiomChainCommand::Explain(None),
+                clock.now(),
+            )
+            .unwrap();
+        assert_eq!(expired.action, "expired");
+        assert_eq!(
+            entertainment.active(),
+            None,
+            "会话结束的那一刻互斥位就必须释放，不能留待下一次玩法入口"
+        );
+
+        // 后续玩家要能正常开局（不再被自己的残留锁判成 occupied）。
+        let restarted = service
+            .handle_at(
+                &mut entertainment,
+                "Bob",
+                &start_exact("画蛇添足"),
+                clock.now(),
+            )
+            .unwrap();
+        assert_eq!(
+            restarted.action, "started",
+            "空闲过期后互斥位必须已经释放，下一个玩家要能正常开局"
+        );
+        assert_eq!(entertainment.active(), Some(EntertainmentKind::IdiomChain));
+    }
+
+    /// 变异验证锚点：`#解释` 结束会话后，槽位必须在**同一次调用返回前**清空。
+    ///
+    /// 故意不调用任何其它入口（不 handle、不 expire、不 abort），这样把释放改回
+    /// 「只置闩、等下一次入口」时本测试必然变红。
+    #[test]
+    fn explaining_an_expired_session_clears_the_slot_before_returning() {
+        let clock = ManualClock::new(Instant::now());
+        let mut entertainment = EntertainmentState::new();
+        let mut service = IdiomChainService::from_game(game(&["画蛇添足", "足智多谋"]));
+
+        service
+            .handle_at(
+                &mut entertainment,
+                "Alice",
+                &start_exact("画蛇添足"),
+                clock.now(),
+            )
+            .unwrap();
+        assert_eq!(entertainment.active(), Some(EntertainmentKind::IdiomChain));
+
+        clock.advance(Duration::from_secs(301)).unwrap();
+        let outcome = service
+            .explain_at(
+                &mut entertainment,
+                "Alice",
+                &IdiomChainCommand::Explain(None),
+                clock.now(),
+            )
+            .unwrap();
+        assert_eq!(outcome.action, "expired");
+        // 只看这一行：调用方还没做任何事，槽位就必须已经空了。
+        assert_eq!(
+            entertainment.active(),
+            None,
+            "#解释 结束会话后必须就地释放，不能留待下一次入口兑现"
+        );
+        assert!(
+            service.idle_deadline().is_none(),
+            "会话清掉后不该再有任何超时定时器来「救场」"
+        );
+    }
+
+    /// 就地释放也必须按 kind 匹配：别人（例如海龟汤）持有的占用不能被顺手放掉。
+    #[test]
+    fn expiring_a_session_never_steals_another_games_lock() {
+        let clock = ManualClock::new(Instant::now());
+        let mut entertainment = EntertainmentState::new();
+        let mut service = IdiomChainService::from_game(game(&["画蛇添足", "足智多谋"]));
+
+        service
+            .handle_at(
+                &mut entertainment,
+                "Alice",
+                &start_exact("画蛇添足"),
+                clock.now(),
+            )
+            .unwrap();
+        clock.advance(Duration::from_secs(301)).unwrap();
+
+        // 模拟「锁已经被别的玩法接管」：先手动放掉接龙锁，再让海龟汤占用。
+        // 接龙会话仍然存在，接下来的 #解释 会把它清掉并尝试释放。
+        entertainment.release(EntertainmentKind::IdiomChain);
+        entertainment
+            .try_acquire(EntertainmentKind::TurtleSoup)
+            .unwrap();
+
+        let expired = service
+            .explain_at(
+                &mut entertainment,
+                "Alice",
+                &IdiomChainCommand::Explain(None),
+                clock.now(),
+            )
+            .unwrap();
+        assert_eq!(expired.action, "expired");
+        assert_eq!(
+            entertainment.active(),
+            Some(EntertainmentKind::TurtleSoup),
+            "释放必须按 kind 匹配，不能误清别人的占用"
+        );
     }
 }

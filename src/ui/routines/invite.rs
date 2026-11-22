@@ -1,23 +1,24 @@
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use enigo::Key;
 
 use super::friend_delivery::{
     FriendDeliveryRoutineConfig, UiResidencyOutcome, UiResidencyTarget, after_input_failure,
-    capture_normalized, current_ui_is_primary, open_friend_conversation, send_current_chat_message,
-    wait_ms,
+    capture_normalized, open_friend_conversation, send_current_chat_message, wait_ms,
 };
 use super::residency::{ResidencyTarget, SettleEnvironment};
+use super::state_observation::observe_ui_state_once;
 use super::transaction::{EntryPolicy, FinishPolicy, UiTask, UiTaskOutcome, UiTaskSpec};
 #[cfg(test)]
 use crate::config::AppConfig;
 use crate::geometry::Rect;
 use crate::observation::chat::secondary_hall_bubbles;
 use crate::runtime::ocr::OcrRuntimeHandle;
+use crate::runtime::recovery::GameRecoveryCoordinator;
 use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure, UiRuntimeHandle,
-    UiSubmitError, sealed,
+    UiStateKind, UiSubmitError, sealed,
 };
 use crate::ui::template::best_template_hit;
 
@@ -104,6 +105,8 @@ pub(crate) struct InviteUi {
     runtime: UiRuntimeHandle,
     ocr: OcrRuntimeHandle,
     config: InviteRoutineConfig,
+    /// 进程级共享的恢复协调器（见 [`SettleEnvironment::with_recovery`]）。
+    recovery: GameRecoveryCoordinator,
 }
 
 impl InviteUi {
@@ -116,7 +119,14 @@ impl InviteUi {
             runtime,
             ocr,
             config,
+            recovery: GameRecoveryCoordinator::default(),
         }
+    }
+
+    /// 用进程级共享的恢复协调器替换默认实例（装配层只 `default()` 一次）。
+    pub(crate) fn with_recovery(mut self, recovery: GameRecoveryCoordinator) -> Self {
+        self.recovery = recovery;
+        self
     }
 
     pub(crate) fn submit(
@@ -127,6 +137,7 @@ impl InviteUi {
             request,
             ocr: self.ocr.clone(),
             config: self.config.clone(),
+            recovery: self.recovery.clone(),
         })
     }
 }
@@ -228,6 +239,15 @@ struct ExecuteInviteRoutine {
     request: ExecuteInvite,
     ocr: OcrRuntimeHandle,
     config: InviteRoutineConfig,
+    recovery: GameRecoveryCoordinator,
+}
+
+impl ExecuteInviteRoutine {
+    /// 收尾环境必须挂着进程级共享的协调器，否则本次恢复记账只活在本例程里。
+    fn environment(&self) -> SettleEnvironment {
+        SettleEnvironment::new(self.ocr.clone(), self.config.friend.clone())
+            .with_recovery(self.recovery.clone())
+    }
 }
 
 impl sealed::UiRoutineSealed for ExecuteInviteRoutine {}
@@ -238,7 +258,7 @@ impl UiRoutine for ExecuteInviteRoutine {
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
         // 邀请进的是**新大厅**：入口不再存在，收尾固定 Primary，不回旧界面。
         // 入口不做观测/导航（`Passthrough`），避免与内部“打开好友会话”叠加导航。
-        let environment = SettleEnvironment::new(self.ocr.clone(), self.config.friend.clone());
+        let environment = self.environment();
         let spec = invite_task_spec(&self.config, environment);
         let inner = InviteInner {
             request: self.request,
@@ -575,23 +595,32 @@ fn click_invite_button(
     ))
 }
 
+/// 等待「进入大厅」后稳定落到一级大厅。
+///
+/// 只允许**一个**总期限：点完「进入大厅」后的过场画面出现 `Unknown`/`Loading`
+/// 是正常现象，不能因为单帧不认识就按更短的 `friend.timeout_ms` 提前失败；
+/// 也不能每轮再套一层会自己阻塞的等待，否则总耗时会被内层超时成倍放大，
+/// `completion_timeout_ms` 形同虚设（B15-P1-4）。
+///
+/// 这里每轮只采一帧分类：累计 `stable_count` 次「分类稳定且为一级大厅」才算到达；
+/// 其它界面（含 `Unknown`）只清零连击并继续等到总期限。
 fn confirm_entered_hall(
     context: &mut UiRoutineContext<'_>,
     config: &InviteRoutineConfig,
 ) -> std::result::Result<(), UiRoutineFailure> {
-    let attempts = attempts(
-        config.completion_timeout_ms,
-        config.poll_ms,
-        config.stable_count,
-    );
+    let deadline = Instant::now() + Duration::from_millis(config.completion_timeout_ms);
     let mut streak = 0_u32;
-    for attempt in 0..attempts {
-        if current_ui_is_primary(
+    loop {
+        let observed = observe_ui_state_once(
             context,
-            &config.friend,
+            config.friend.state_observation(),
             "confirm_entered_hall",
             InputCertainty::AfterInputUnknown,
-        )? {
+        )?;
+        let primary_ready = observed.kind == UiStateKind::Primary
+            && observed.runtime_stable
+            && observed.candidate_count >= observed.required_count;
+        if primary_ready {
             streak = streak.saturating_add(1);
             if streak >= config.stable_count {
                 return Ok(());
@@ -599,20 +628,20 @@ fn confirm_entered_hall(
         } else {
             streak = 0;
         }
-        if attempt + 1 < attempts {
-            wait_ms(
-                context,
-                config.poll_ms,
-                "confirm_entered_hall",
+        if Instant::now() >= deadline {
+            return Err(UiRoutineFailure::new(
                 InputCertainty::AfterInputUnknown,
-            )?;
+                "confirm_entered_hall",
+                "the hall entry result did not become a stable primary UI before timeout",
+            ));
         }
+        wait_ms(
+            context,
+            config.friend.poll_ms,
+            "confirm_entered_hall",
+            InputCertainty::AfterInputUnknown,
+        )?;
     }
-    Err(UiRoutineFailure::new(
-        InputCertainty::AfterInputUnknown,
-        "confirm_entered_hall",
-        "the hall entry result did not become a stable primary UI before timeout",
-    ))
 }
 
 fn attempts(timeout_ms: u64, poll_ms: u64, minimum: u32) -> u32 {
@@ -636,7 +665,10 @@ mod tests {
     use crate::geometry::Rect;
     use crate::observation::chat::SECONDARY_TITLE_RECT;
     use crate::runtime::ocr::{OcrDevice, OcrLine, OcrRuntime};
-    use crate::runtime::ui::{UiDevice, UiRuntime};
+    use crate::runtime::ui::sealed::UiRoutineSealed;
+    use crate::runtime::ui::{
+        UiDevice, UiRuntime, UiStateClassification, UiStateClassifier, execute_routine_for_test,
+    };
     use crate::ui::state::{TemplateUiStateClassifier, UiTemplateArgs};
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -746,9 +778,72 @@ mod tests {
         }
     }
 
+    struct EmptyInviteOcr;
+
+    impl OcrDevice for EmptyInviteOcr {
+        fn recognize_lines(&mut self, _image: &DynamicImage) -> Result<Vec<OcrLine>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// B15-P2-4 回归：邀请例程的收尾环境必须共享进程级协调器。
+    #[test]
+    fn invite_routine_shares_the_injected_recovery_coordinator() {
+        let config = crate::config::bundled_config();
+        let ocr_runtime = OcrRuntime::start(EmptyInviteOcr, 1).unwrap();
+        let shared = GameRecoveryCoordinator::default();
+        shared.record_restart_completed(
+            std::time::Instant::now(),
+            crate::runtime::recovery::RecoveryTrigger::ExternalChatDisconnect,
+        );
+        let request = ExecuteInvite::new(
+            vec!["甲".to_string()],
+            None,
+            "邀请",
+            UiResidencyTarget::Primary,
+        );
+        let invite = ExecuteInviteRoutine {
+            request,
+            ocr: ocr_runtime.handle(),
+            config: InviteRoutineConfig::from_app(&config),
+            recovery: shared.clone(),
+        };
+        assert_eq!(
+            invite
+                .environment()
+                .recovery()
+                .health_snapshot_now()
+                .total_restarts,
+            1,
+            "邀请例程的收尾环境必须共享注入的协调器"
+        );
+
+        let unwired = ExecuteInviteRoutine {
+            request: ExecuteInvite::new(Vec::new(), None, "", UiResidencyTarget::Primary),
+            ocr: ocr_runtime.handle(),
+            config: InviteRoutineConfig::from_app(&config),
+            recovery: GameRecoveryCoordinator::default(),
+        };
+        assert_eq!(
+            unwired
+                .environment()
+                .recovery()
+                .health_snapshot_now()
+                .total_restarts,
+            0,
+            "默认构造的协调器不得看到共享实例的重启记录"
+        );
+        ocr_runtime.shutdown().unwrap();
+    }
+
     #[test]
     fn invite_notification_and_navigation_run_in_one_ui_operation() {
-        let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        if crate::test_support::corpus::skip_without_corpus(
+            "invite_notification_and_navigation_run_in_one_ui_operation",
+        ) {
+            return;
+        }
+        let mut config = crate::config::bundled_config();
         config.timing.input.after_activate_ms = 0;
         config.timing.input.open_chat_ms = 0;
         config.timing.input.click_ms = 0;
@@ -853,7 +948,12 @@ mod tests {
 
     #[test]
     fn failed_notification_reopens_the_friend_conversation_at_most_once() {
-        let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        if crate::test_support::corpus::skip_without_corpus(
+            "failed_notification_reopens_the_friend_conversation_at_most_once",
+        ) {
+            return;
+        }
+        let mut config = crate::config::bundled_config();
         config.timing.input.after_activate_ms = 0;
         config.timing.input.open_chat_ms = 0;
         config.timing.input.click_ms = 0;
@@ -1101,5 +1201,96 @@ mod tests {
 
     fn near(left: (i32, i32), right: (i32, i32)) -> bool {
         left.0.abs_diff(right.0) <= 10 && left.1.abs_diff(right.1) <= 10
+    }
+
+    // ---- B15-P1-4：进入大厅的过场等待只有一个总期限 ----
+
+    struct BlankInviteDevice {
+        /// 直接用画布尺寸：小于画布时每帧都要做一次放大，debug 构建下会把
+        /// “轮询 10ms”放大成“每轮数百毫秒”，测不出超时语义。
+        frame: DynamicImage,
+        /// 逐帧变化的最小像素：同帧缓存会给分类器喂回旧结论，测不到“持续 Unknown”。
+        tick: u32,
+    }
+
+    impl BlankInviteDevice {
+        fn new(width: u32, height: u32) -> Self {
+            Self {
+                frame: DynamicImage::new_rgba8(width, height),
+                tick: 0,
+            }
+        }
+    }
+
+    impl UiDevice for BlankInviteDevice {
+        fn capture(&mut self) -> Result<DynamicImage> {
+            // 分类结果完全由分类器给出，画面尺寸只需与画布一致。
+            self.tick = self.tick.wrapping_add(1);
+            self.frame
+                .put_pixel(0, 0, Rgba([self.tick as u8, 0, 0, 255]));
+            Ok(self.frame.clone())
+        }
+    }
+
+    struct UnknownThenPrimaryClassifier {
+        unknown_left: usize,
+    }
+
+    impl UiStateClassifier for UnknownThenPrimaryClassifier {
+        fn classify(&mut self, _image: &DynamicImage) -> Result<UiStateClassification> {
+            if self.unknown_left > 0 {
+                self.unknown_left -= 1;
+                return Ok(UiStateClassification::new(
+                    UiStateKind::Unknown,
+                    "transition",
+                ));
+            }
+            Ok(UiStateClassification::new(
+                UiStateKind::Primary,
+                "primary:hall",
+            ))
+        }
+    }
+
+    struct ConfirmHallOnly {
+        config: InviteRoutineConfig,
+    }
+
+    impl UiRoutineSealed for ConfirmHallOnly {}
+
+    impl UiRoutine for ConfirmHallOnly {
+        type Output = std::result::Result<(), UiRoutineFailure>;
+
+        fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+            confirm_entered_hall(context, &self.config)
+        }
+    }
+
+    /// 过场 `Unknown` 持续得比 `friend.timeout_ms` 更久时，不能提前判失败：
+    /// 只要没到 `completion_timeout_ms` 就继续等一级大厅。
+    ///
+    /// 旧实现每轮都套一层 `current_ui_is_primary`（自带 `friend.timeout_ms` 期限），
+    /// 第一轮就因过场 `Unknown` 超时返回 `Err` 并终止，总超时形同虚设。
+    #[test]
+    fn confirm_entered_hall_waits_out_a_long_unknown_transition() {
+        let mut config = crate::config::bundled_config();
+        // 短的内层期限 + 长的总期限：正是旧实现会提前失败的组合。
+        config.timing.workflow.default_timeout_ms = 100;
+        config.timing.workflow.default_poll_ms = 10;
+        config.timing.command.ui_timeout_ms = 5_000;
+        let execution = execute_routine_for_test(
+            BlankInviteDevice::new(config.screen.expected_width, config.screen.expected_height),
+            Some(Box::new(UnknownThenPrimaryClassifier { unknown_left: 40 })),
+            2,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ConfirmHallOnly {
+                config: InviteRoutineConfig::from_app(&config),
+            },
+        );
+        assert!(
+            execution.output.is_ok(),
+            "过场 Unknown 超过 friend.timeout_ms 后仍必须等到 completion_timeout_ms：{:?}",
+            execution.output
+        );
     }
 }

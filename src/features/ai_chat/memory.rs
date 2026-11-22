@@ -39,6 +39,18 @@ fn render_records(lines: &[String]) -> String {
         .join("\n")
 }
 
+/// 记忆压缩范围的日志名：只暴露「个人/大厅」。
+///
+/// `scope` 原文是 `actor:<身份 UUID>` 或 `hall`；前者用于日志会把 UUID 落盘，
+/// 违反「UUID 不得进入日志」的红线。排查只需要知道压缩的是哪一层记忆。
+fn compression_scope_label(scope: &str) -> &'static str {
+    if scope == AiChatMemory::hall_scope() {
+        "大厅记忆"
+    } else {
+        "个人记忆"
+    }
+}
+
 /// 一轮问答。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StoredTurn {
@@ -327,39 +339,55 @@ impl AiChatMemory {
                  WHERE actor_key <> ?1 OR actor_key = '' ORDER BY id DESC",
             )?;
             let mut rows = stmt.query([actor_key])?;
+            // 两个角色各有一个"读满"标记：满了就**立刻停止**遍历。
+            //
+            // 原来的写法只把超预算的行 `keep=false`，循环继续扫到表最旧一行：
+            // 缝隙里塞得下的极短旧消息会被回捞并拼到最新对话前面，注入模型的
+            // "最近大厅对话"因此跨时段断层；同时每轮 AI 闲聊都对大厅表做一次
+            // 全表扫描（32K/48K token 时反序列化开销显著）。两者都不能接受。
+            let mut players_full = false;
+            let mut bots_full = false;
             while let Some(row) = rows.next()? {
+                if players_full && bots_full {
+                    break;
+                }
                 let tokens: usize = row.get::<_, i64>(3)?.max(0) as usize;
-                let speaker: String = row.get(0)?;
-                let text: String = row.get(1)?;
-                let role: String = row.get(2)?;
-                let role = HallSpeakerRole::from_str(&role);
+                let role = HallSpeakerRole::from_str(&row.get::<_, String>(2)?);
                 let keep = match role {
                     // 玩家行仍走整个 HALL_READ_BUDGET；至少保留最新一条，
                     // 否则极小预算会把大厅上下文清空。
                     HallSpeakerRole::Player => {
-                        if player_lines == 0 || used_player + tokens <= HALL_READ_BUDGET {
+                        if players_full {
+                            false
+                        } else if player_lines == 0 || used_player + tokens <= HALL_READ_BUDGET {
                             player_lines += 1;
                             used_player += tokens;
                             true
                         } else {
+                            players_full = true;
                             false
                         }
                     }
                     // Bot 行独立限流：条数与 token 取先到者，避免 130 条自述
                     // 把大厅读窗口占满、或每轮多付数千 token。
                     HallSpeakerRole::Bot => {
-                        if bot_lines < HALL_BOT_READ_MAX_LINES
+                        if bots_full {
+                            false
+                        } else if bot_lines < HALL_BOT_READ_MAX_LINES
                             && bot_used + tokens <= HALL_BOT_READ_TOKEN_BUDGET
                         {
                             bot_lines += 1;
                             bot_used += tokens;
                             true
                         } else {
+                            bots_full = true;
                             false
                         }
                     }
                 };
                 if keep {
+                    let speaker: String = row.get(0)?;
+                    let text: String = row.get(1)?;
                     lines.push((speaker, text, role));
                 }
             }
@@ -631,11 +659,18 @@ impl AiChatMemory {
 
         let removed = removed_before_summary + hall_summary;
         if removed > 0 {
-            // trace 是进程内完整报文环形缓冲，无 actor 关联，只能保守全清。
-            crate::ai_trace::clear();
+            // trace 是进程内完整报文环形缓冲，条目没有结构化 actor 字段，
+            // 只能按正文匹配；但**不能**整环清空——那会连别人的上下文一起丢。
+            // 逐个别名精确下线：别名的口径与本函数删表用的 aliases 完全一致，
+            // 所以「库里删掉的」与「面板里清掉的」不会错位。
+            // 归一化与身份比较共用 `text::player_match_key`，传原始昵称即可命中。
+            let mut purged_trace = 0usize;
+            for alias in &aliases {
+                purged_trace += crate::ai_trace::purge_player(alias);
+            }
             // 审计只记数量，不记昵称/正文/key。
             log::info!(
-                "AI 记忆遗忘级联：facts {facts}、turns {turns}、个人摘要 {actor_summaries}、大厅行 {hall}+{legacy_hall}、legacy BOT hall 行 {legacy_bot_hall}、曾用名 {actor_names}、legacy bot 表 {bot_lines}、大厅摘要 {hall_summary}；trace 已清空"
+                "AI 记忆遗忘级联：facts {facts}、turns {turns}、个人摘要 {actor_summaries}、大厅行 {hall}+{legacy_hall}、legacy BOT hall 行 {legacy_bot_hall}、曾用名 {actor_names}、legacy bot 表 {bot_lines}、大厅摘要 {hall_summary}；trace 清除 {purged_trace} 条"
             );
         }
         Ok(removed > 0)
@@ -889,9 +924,11 @@ impl AiChatMemory {
         let summary = summary.trim();
         if summary.is_empty() {
             // 原文一条都没删，下轮会重新规划。
+            // 范围只写「个人/大厅」：`plan.scope` 是 `actor:<身份 UUID>`，
+            // UUID 属于不得进日志的标识，不能再原样拼进告警。
             log::warn!(
                 "记忆压缩返回空摘要，本次保留旧摘要与原文（范围：{}）",
-                plan.scope
+                compression_scope_label(&plan.scope)
             );
             return Ok(());
         }
@@ -1248,4 +1285,90 @@ pub(crate) fn parse_fact_update(reply: &str) -> (Vec<String>, Vec<String>) {
         .filter(|fact| fact.chars().count() <= MAX_FACT_CHARS)
         .collect();
     (facts, collect("remove"))
+}
+
+#[cfg(test)]
+mod hall_read_budget_tests {
+    use super::*;
+
+    /// 回归（B05-P1-08）：预算一旦读满就停止遍历，不再回捞缝隙里的旧行。
+    ///
+    /// 修复前超预算只 `keep=false`、循环继续扫到表最旧一行：被拒绝的大消息
+    /// 留下的"缝隙"会被后面那些 token 小到塞得下的旧消息回捞，拼到最新对话
+    /// 前面 → 注入模型的"最近大厅对话"跨时段断层；同时每轮都对大厅表做一次
+    /// 全表扫描。构造顺序（由旧到新）：
+    ///
+    /// - 旧的短消息（5 token，缝隙里塞得下，旧实现会回捞）；
+    /// - 一条超大消息（撑破预算，把遍历推进"满"状态）；
+    /// - 两条各 1_994 token 的最近发言（合计 3_988，仍在 4K 预算内）。
+    #[test]
+    fn hall_read_stops_at_the_budget_instead_of_stitching_older_gaps() {
+        let memory = AiChatMemory::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        memory
+            .record_hall_line(
+                "甲",
+                "很久以前的闲聊",
+                HallSpeakerRole::Player,
+                "",
+                1_000_000,
+                100,
+            )
+            .unwrap();
+        memory
+            .record_hall_line(
+                "甲",
+                &"啊".repeat(5_000),
+                HallSpeakerRole::Player,
+                "",
+                1_000_000,
+                101,
+            )
+            .unwrap();
+        for index in 0..2 {
+            memory
+                .record_hall_line(
+                    "甲",
+                    &format!("最近{index}：{}", "中".repeat(1_990)),
+                    HallSpeakerRole::Player,
+                    "",
+                    1_000_000,
+                    102 + index,
+                )
+                .unwrap();
+        }
+        let context = memory.hall_context("").unwrap();
+        assert_eq!(
+            context.lines.len(),
+            2,
+            "预算耗尽后必须停止遍历，不能回捞更早的短消息"
+        );
+        assert!(
+            context
+                .lines
+                .iter()
+                .all(|(_, text, _)| !text.contains("很久以前")),
+            "更早的短消息不能出现在上下文里"
+        );
+    }
+}
+
+#[cfg(test)]
+mod log_privacy_tests {
+    use super::*;
+
+    /// B01-P0-5(v2)：压缩范围的告警曾把 `actor:<身份 UUID>` 原样打进日志。
+    /// 日志只需要知道压的是哪一层记忆，UUID 本身属于红线项。
+    #[test]
+    fn compression_scope_label_never_exposes_the_actor_key() {
+        let actor_key = "0b0e0d9c-1a2b-4c3d-8e9f-0123456789ab";
+        let scope = format!("actor:{actor_key}");
+
+        let label = compression_scope_label(&scope);
+        assert_eq!(label, "个人记忆");
+        assert!(!label.contains("0b0e0d9c"), "UUID 不得进日志：{label}");
+        assert_eq!(
+            compression_scope_label(AiChatMemory::hall_scope()),
+            "大厅记忆"
+        );
+    }
 }

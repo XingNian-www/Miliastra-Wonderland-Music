@@ -113,7 +113,16 @@ INJECT = """
 (() => {
   const target = '__BASE__';
   const token = '__TOKEN__';
-  try { localStorage.setItem('miliastraAccessToken', token); } catch (e) {}
+  // 令牌注入必须写 cookie：面板自决策 5-c 起只从 cookie / 内存读令牌（localStorage 只剩
+  // 一条一次性迁移路径）。继续依赖 localStorage 的结果是「现在还能跑，将来清理迁移函数时
+  // 静默 401」。这里与 web/src/api.js 的写入格式保持一致（path=/、SameSite=Strict），
+  // 值要 encodeURIComponent —— 令牌里可能有 +/=/; 等字符。
+  // 注意：本脚本是把 dist 起在 http 静态服务上再用浏览器打开，cookie 不是 Secure 也没关系。
+  if (token) {
+    document.cookie = 'miliastraAccessToken=' + encodeURIComponent(token) + '; path=/; SameSite=Strict';
+    // 顺手清掉旧版本可能留下的副本，避免它被迁移路径读出来盖掉本次注入的值。
+    try { localStorage.removeItem('miliastraAccessToken'); } catch (e) {}
+  }
   const original = window.fetch.bind(window);
   window.fetch = (input, init) => {
     let url = input;

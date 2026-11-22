@@ -43,3 +43,13 @@ pub(crate) fn bundled_config_yaml() -> &'static str {
     // 仓库与发布包的 config.yaml 已精简为最小启动配置（仅 bootstrap 字段）。
     include_str!("test.full.yaml")
 }
+
+/// 内置完整配置解析结果（测试专用）。
+///
+/// 单元测试**不得**再依赖 `tests/fixtures/config.full.yaml`：`tests/` 不入库，
+/// 干净检出时该文件不存在，`cargo test --lib` 会直接 panic。需要完整配置的测试
+/// 统一改用本函数（内容与发布包用的 `config.yaml` 同源，见 [`bundled_config_yaml`]）。
+#[cfg(test)]
+pub(crate) fn bundled_config() -> AppConfig {
+    serde_norway::from_str(bundled_config_yaml()).expect("内置完整配置必须能解析")
+}

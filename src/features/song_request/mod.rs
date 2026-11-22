@@ -196,7 +196,12 @@ fn joined_command(matched: &str, argument: &str) -> String {
 
 pub(crate) fn parse_hall_syntax(command: &str) -> Option<CommandSyntax<'_, SongCommand>> {
     let entry = commands::match_entry(command, CommandAuthority::HallMember)?;
-    let song = parse_with_source(command, entry.matched, entry.source, entry.ai_assisted)?;
+    let song = parse_with_source(
+        entry.argument,
+        entry.matched,
+        entry.source,
+        entry.ai_assisted,
+    )?;
     Some(CommandSyntax {
         matched: entry.matched,
         argument: entry.argument,
@@ -206,11 +211,29 @@ pub(crate) fn parse_hall_syntax(command: &str) -> Option<CommandSyntax<'_, SongC
 
 pub(crate) fn parse_friend_command(command: &str, username: &str) -> Option<SongCommand> {
     let entry = commands::match_entry(command, CommandAuthority::Friend)?;
-    let mut song = parse_with_source(command, entry.matched, entry.source, entry.ai_assisted)?;
+    let mut song = parse_with_source(
+        entry.argument,
+        entry.matched,
+        entry.source,
+        entry.ai_assisted,
+    )?;
     // Only the default friend alias recognizes a direct BV number; explicit QQ
     // and hall requests retain their selected source.
     if entry.matched == "点歌" && entry.source == SongSource::QqMusic {
-        if let Some(bvid) = miliastra_playback::bilibili_normalize_bvid(&song.keyword) {
+        // 优先用规范化后的参数；再退到**原文尾部**。
+        //
+        // 为什么需要第二步：OCR 常把 BV 号末位的 `J` 读成 `]`/`】`，而
+        // `parse_prefixed_command` 会把这类尾部括号当成命令尾巴剥掉。只拿
+        // `entry.argument` 去修复，`BV1GJ411x7h]` 会先变成 `BV1GJ411x7h`
+        // （11 位，不足 12 位），修复机会就丢了。原文尾部保留着那个括号，
+        // 正好是 `bilibili_normalize_bvid` 需要的输入。
+        let raw_tail = command
+            .get(entry.matched.len()..)
+            .map(str::trim)
+            .unwrap_or_default();
+        let repaired = miliastra_playback::bilibili_normalize_bvid(&song.keyword)
+            .or_else(|| miliastra_playback::bilibili_normalize_bvid(raw_tail));
+        if let Some(bvid) = repaired {
             song.source = SongSource::Bilibili;
             song.keyword = bvid;
         }
@@ -219,13 +242,22 @@ pub(crate) fn parse_friend_command(command: &str, username: &str) -> Option<Song
     Some(song)
 }
 
+/// 用 `entry.argument` 构造点歌命令。
+///
+/// **必须**用注册表已经规范化过的参数，不能自己再 `command[prefix.len()..]` 切一遍：
+/// `commands::match_entry` 走的是 `chat_text::parse_prefixed_command`，它会去掉
+/// 前导 `：`/`:`/空白与尾部 `]`/`】`。重复切片等于绕过那层归一化，线上后果是
+/// `@点歌：晴天` 的 keyword 变成「：晴天」（搜索必然失配）、`@点歌 晴天】`
+/// 带着尾括号、`@点歌：BV…` 让 `bilibili_normalize_bvid` 直接失败。
+///
+/// 参数为空视为无效命令：`@点歌` 单独发出来不该进搜索。
 fn parse_with_source(
-    command: &str,
+    argument: &str,
     prefix: &str,
     source: SongSource,
     ai_assisted: bool,
 ) -> Option<SongCommand> {
-    let raw_keyword = command[prefix.len()..].trim();
+    let raw_keyword = argument.trim();
     let prefer_accompaniment = raw_keyword.contains("伴奏");
     let keyword = raw_keyword
         .replace("伴奏", "")
@@ -340,6 +372,40 @@ mod tests {
                 .unwrap()
                 .prefer_accompaniment
         );
+    }
+
+    /// 回归（B09-P1-5）：解析必须复用 `entry.argument`，不能再自己切片。
+    ///
+    /// 修复前 `parse_with_source` 用 `command[prefix.len()..]` 重新切，绕过了
+    /// `parse_prefixed_command` 的「去掉前导冒号/空白与尾部括号」归一化：
+    /// `@点歌：晴天` 的 keyword 变成「：晴天」，`@点歌 晴天】` 带着尾括号，
+    /// `@点歌：` 还会被当成合法命令进搜索。
+    #[test]
+    fn parser_uses_the_registry_normalized_argument() {
+        let command = parse_hall_syntax("点歌：晴天").expect("hall 命令应能解析");
+        assert_eq!(command.command.keyword, "晴天", "前导全角冒号必须被去掉");
+
+        let command = parse_hall_syntax("点歌 晴天】").expect("hall 命令应能解析");
+        assert_eq!(command.command.keyword, "晴天", "尾部方括号必须被去掉");
+
+        let command = parse_hall_syntax("点歌:晴天 周杰伦").expect("hall 命令应能解析");
+        assert_eq!(command.command.keyword, "晴天 周杰伦", "半角冒号同理");
+
+        // 只有命令本身、没有参数：不是合法点歌，不能进搜索。
+        assert!(parse_hall_syntax("点歌").is_none(), "空参数不是合法点歌");
+        assert!(
+            parse_hall_syntax("点歌：").is_none(),
+            "只有冒号也不是合法点歌"
+        );
+        assert!(
+            parse_hall_syntax("点歌 】").is_none(),
+            "只有括号也不是合法点歌"
+        );
+
+        // 好友侧走同一条归一化路径，BV 号才能被识别成 B 站来源。
+        let friend = parse_friend_command("点歌：BV1xx411c7mD", "friend").expect("好友命令");
+        assert_eq!(friend.source, SongSource::Bilibili);
+        assert_eq!(friend.keyword, "BV1xx411c7mD");
     }
 
     #[test]

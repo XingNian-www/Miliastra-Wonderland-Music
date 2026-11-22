@@ -134,6 +134,10 @@ fn build_entry(id: u64, exchange: WireExchange) -> AiTraceEntry {
     if let Some(response) = response.as_mut() {
         redact_value(response);
     }
+    // `error` 也要过同一套脱敏：内核只保证自家分类错误不含正文，但
+    // provider 的失败文本、网关回显、结构不符的响应摘要都可能把 `sk-…` /
+    // `Bearer …` 带进来；面板展示与 `purge_player` 都读这个字段。
+    let error = error.map(|error| redact_text(&error));
 
     let model = request
         .get("model")
@@ -441,19 +445,27 @@ pub(crate) fn redact_value(value: &mut Value) {
     }
 }
 
+/// 文本型字段的脱敏入口：命中敏感串就返回替换后的文本，否则原样返回。
+fn redact_text(text: &str) -> String {
+    redact_string(text).unwrap_or_else(|| text.to_string())
+}
+
 fn redact_string(text: &str) -> Option<String> {
+    let mut changed = false;
+    let mut working = text.to_string();
     // 兼容整串就是 data URL，以及 data URL 夹在普通文本里的情况。
     if let Some((meta, _payload)) = text.split_once(";base64,")
         && let Some(start) = meta.find("data:")
     {
         let before = &meta[..start];
         let head = &meta[start..];
-        return Some(format!(
+        working = format!(
             "{before}{head};base64,[已省略图片数据 {} 字节]",
             text.len().saturating_sub(meta.len() + 8)
-        ));
+        );
+        changed = true;
     }
-    let trimmed = text.trim();
+    let trimmed = working.trim();
     let token = trimmed.strip_prefix("Bearer ").unwrap_or(trimmed);
     if (trimmed.starts_with("sk-") || trimmed.starts_with("Bearer "))
         && token.len() > 16
@@ -461,7 +473,92 @@ fn redact_string(text: &str) -> Option<String> {
     {
         return Some("[redacted]".to_string());
     }
-    None
+    // 整串匹配只覆盖「值就是这个密钥」；provider 常见的是把密钥嵌进一句话
+    // （`Incorrect API key provided: sk-…`），所以还要按 token 扫描整段文本。
+    match redact_embedded_tokens(&working) {
+        Some(redacted) => Some(redacted),
+        None => changed.then_some(working),
+    }
+}
+
+/// 密钥 token 允许的字符集：`sk-` 后面的 key 体。
+fn is_key_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
+}
+
+/// `Bearer` 后面 token 允许的字符集：JWT/网关 token 常见 `+ / = . ~`。
+fn is_bearer_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'+' | b'/' | b'=')
+}
+
+/// 把文本里任意位置的 `Bearer <token>` 与 `sk-<token>` 换成占位串。
+///
+/// 要求 token 至少 8 个字符，避免把 `bearer` 后面的普通词（`bearer token`
+/// 这句文档话本身）或 `sk-learn`（5 字符）这类正常文本误伤；密钥不会这么短。
+/// 前后要求非字母数字边界，防止 `task-key` 里的 `sk-` 被当成密钥。
+fn redact_embedded_tokens(text: &str) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut changed = false;
+    let mut index = 0;
+    while index < text.len() {
+        let rest = &text[index..];
+        if rest
+            .get(..6)
+            .is_some_and(|head| head.eq_ignore_ascii_case("bearer"))
+            && is_word_boundary(text.as_bytes(), index)
+        {
+            let mut cursor = index + 6;
+            if text.as_bytes().get(cursor) == Some(&b' ') {
+                while text.as_bytes().get(cursor) == Some(&b' ') {
+                    cursor += 1;
+                }
+                let start = cursor;
+                while text
+                    .as_bytes()
+                    .get(cursor)
+                    .is_some_and(|byte| is_bearer_token_byte(*byte))
+                {
+                    cursor += 1;
+                }
+                if cursor - start >= 8 {
+                    out.push_str(&text[index..start]);
+                    out.push_str("[redacted]");
+                    changed = true;
+                    index = cursor;
+                    continue;
+                }
+            }
+        }
+        if rest
+            .get(..3)
+            .is_some_and(|head| head.eq_ignore_ascii_case("sk-"))
+            && is_word_boundary(text.as_bytes(), index)
+        {
+            let mut cursor = index + 3;
+            while text
+                .as_bytes()
+                .get(cursor)
+                .is_some_and(|byte| is_key_token_byte(*byte))
+            {
+                cursor += 1;
+            }
+            if cursor - (index + 3) >= 8 {
+                out.push_str("sk-[redacted]");
+                changed = true;
+                index = cursor;
+                continue;
+            }
+        }
+        let ch = rest.chars().next().expect("index is a char boundary");
+        out.push(ch);
+        index += ch.len_utf8();
+    }
+    changed.then_some(out)
+}
+
+/// 指定位置前面不是 ASCII 字母数字（多字节字符按边界处理）。
+fn is_word_boundary(bytes: &[u8], index: usize) -> bool {
+    index == 0 || !bytes[index - 1].is_ascii_alphanumeric()
 }
 
 /// 面板列表：只给摘要，正文按条读取，避免一次传输整个历史。
@@ -537,14 +634,97 @@ pub(crate) fn entry_json(id: u64) -> Option<String> {
     serde_json::to_string(&entry).ok()
 }
 
-/// 清空完整请求报文（内存环形缓冲）。
+/// 整环清空完整请求报文（内存环形缓冲）。
 ///
-/// 由 `@忘记我` 的遗忘级联调用：trace 里含 system/messages/tools 原文，
-/// 无法按 actor 过滤，只能保守全清；这是一个低频隐私操作。
+/// **不在 `@忘记我` 的路径上**：遗忘级联按别名逐条调 [`purge_player`]，
+/// 不会因为一个人被遗忘就把别人的上下文一起丢掉。本函数只剩两个用途：
+///
+/// - 测试夹具的起点复位（[`clear_for_tests`] 就是它）；
+/// - 面板/运维需要「整块清掉」时的出口——那是有意的全局丢弃，不是隐私级联。
+///
+/// 新的隐私删除请用 [`purge_player`]；不要为了省事在这里全清。
 pub(crate) fn clear() {
     if let Ok(mut store) = store().lock() {
         store.entries.clear();
         store.next_id = 1;
+    }
+}
+
+/// 按玩家键清除：丢弃所有提到该玩家的报文，返回被清除的条数。
+///
+/// trace 条目没有结构化的 actor 字段（请求体是自由拼接的提示词），只能按
+/// **归一化后的正文**比较；宁可多删，也不留下被遗忘者的原文。
+/// 键的归一化与身份比较共用 `crate::text::player_match_key`（折全角、
+/// 折叠空白、转小写），所以调用方传原始昵称或比较键都能命中。
+///
+/// 空键直接返回 0：绝不能把「没拿到昵称」当成「清空全部」。
+/// 短键（归一化后不足 2 个字符）降级为词段整段相等，见 [`entry_mentions`]。
+/// 调用点：`@忘记我` 成功后应立即调用本函数（遗忘级联在
+/// `features/ai_chat/memory.rs`，不在本文件）。
+pub(crate) fn purge_player(player_key: &str) -> usize {
+    let key = crate::text::player_match_key(player_key);
+    if key.is_empty() {
+        return 0;
+    }
+    // 归一化后的长度按字符算：单个汉字是 3 字节，按字节判断会漏掉守卫。
+    let exact_only = key.chars().count() < 2;
+    if exact_only {
+        // 不打印 `key`：它是归一化后的玩家昵称/备注串（也可能是身份 UUID），
+        // 属于「不得进入日志」的标识。长度已经足够说明走的是哪条匹配分支。
+        log::debug!(
+            "AI trace 按玩家键清除：键归一化后不足 2 个字符，降级为词段整段相等匹配（不做子串），避免命中 ChatCompletions/id 等固定文本"
+        );
+    }
+    let Ok(mut store) = store().lock() else {
+        return 0;
+    };
+    let before = store.entries.len();
+    store
+        .entries
+        .retain(|entry| !entry_mentions(entry, &key, exact_only));
+    before - store.entries.len()
+}
+
+/// 条目正文里是否提到该玩家键（`key` 已归一化）。
+///
+/// **结构化逐字符串比较**，而不是「整条序列化后做子串」：
+/// - 整条序列化会把昵称里的 `"` / `\` 转义成 `\"` / `\\`，原样的键不再出现，
+///   于是漏删（隐私红线）；逐字段取值拿到的是原文，转义已被还原。
+/// - 同时覆盖 system/messages/tools/parameters/error 等所有可能含玩家文本的
+///   字符串字段，序列化失败（理论上不会发生）按「命中」处理，宁可多删。
+///
+/// `exact_only`（短键守卫）为真时只做**词段整段相等**：先按非字母数字边界
+/// 切段，任一段与键完全相同才算命中，绝不做子串。这样 1 个字符的昵称不会
+/// 命中 `ChatCompletions`、`id` 这类固定文本，避免一次遗忘清空整环；同时
+/// `[甲]:…` 这类以标点分隔的正文仍能命中 `甲`。
+fn entry_mentions(entry: &AiTraceEntry, key: &str, exact_only: bool) -> bool {
+    match serde_json::to_value(entry) {
+        Ok(value) => collect_mentions(&value, key, exact_only),
+        Err(_) => true,
+    }
+}
+
+/// 递归遍历条目 JSON，只比较字符串值；命中即短路。
+fn collect_mentions(value: &Value, key: &str, exact_only: bool) -> bool {
+    match value {
+        Value::String(text) => {
+            let normalized = crate::text::player_match_key(text);
+            if exact_only {
+                normalized == key
+                    || normalized
+                        .split(|ch: char| !ch.is_alphanumeric())
+                        .any(|segment| segment == key)
+            } else {
+                normalized.contains(key)
+            }
+        }
+        Value::Array(items) => items
+            .iter()
+            .any(|item| collect_mentions(item, key, exact_only)),
+        Value::Object(object) => object
+            .values()
+            .any(|value| collect_mentions(value, key, exact_only)),
+        _ => false,
     }
 }
 
@@ -554,16 +734,21 @@ pub(crate) fn clear_for_tests() {
     clear();
 }
 
+/// 全局环形缓冲是进程级单例；并行测试必须串行访问它。
+///
+/// 放在测试模块**外**、crate 内可见，是因为遗忘级联的回归用例住在
+/// `features/ai_chat/tests/memory.rs`：它要一边写报文一边跑 `forget()`。
+/// 两边不共用同一把锁时，会互相清掉对方的条目，表现为随机红。
+#[cfg(test)]
+pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
-
-    /// 全局环形缓冲是进程级单例；并行测试必须串行访问它。
-    fn trace_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
 
     fn exchange(request: Value, response: Option<Value>) -> WireExchange {
         WireExchange {
@@ -574,6 +759,54 @@ mod tests {
             started_at_ms: 1_793_026_800_000,
             elapsed: Duration::from_millis(123),
         }
+    }
+
+    /// B01-P0-5(v2)：provider 把密钥嵌进一句话时，旧实现（只认整串 sk-/Bearer）
+    /// 会整条放行；面板与 `purge_player` 都会读到这段文本。
+    #[test]
+    fn redacts_keys_embedded_in_free_text() {
+        let cases = [
+            (
+                "Incorrect API key provided: sk-abcdef1234567890",
+                "sk-abcdef1234567890",
+            ),
+            (
+                "401 Unauthorized: Authorization: Bearer abcdefghijklmnopqrstuvwxyz",
+                "abcdefghijklmnopqrstuvwxyz",
+            ),
+            (
+                "upstream rejected {\"key\":\"sk-proj-ABCDEFGH12345678\"}",
+                "sk-proj-ABCDEFGH12345678",
+            ),
+        ];
+        for (text, secret) in cases {
+            let redacted = redact_text(text);
+            assert!(!redacted.contains(secret), "密钥不得留在文本里：{redacted}");
+            assert!(
+                redacted.contains("[redacted]"),
+                "必须留下脱敏占位：{redacted}"
+            );
+        }
+        // 普通错误文案不能被误伤（否则面板失去可诊断性）。
+        for text in [
+            "请求超时",
+            "OpenAI HTTP 请求失败 category=timeout status=none",
+        ] {
+            assert_eq!(redact_text(text), text);
+        }
+    }
+
+    /// 面板条目的 `error` 与 request/response 走同一套脱敏。
+    #[test]
+    fn trace_entry_redacts_the_error_field() {
+        let mut exchange = exchange(json!({"model": "m"}), None);
+        exchange.error = Some("Incorrect API key provided: sk-abcdef1234567890".to_string());
+
+        let entry = build_entry(1, exchange);
+
+        let error = entry.error.expect("error");
+        assert!(!error.contains("sk-abcdef1234567890"), "实际：{error}");
+        assert!(error.contains("[redacted]"), "实际：{error}");
     }
 
     #[test]
@@ -713,7 +946,7 @@ mod tests {
 
     #[test]
     fn ring_keeps_newest_entries_and_details_are_fetchable() {
-        let _guard = trace_test_lock();
+        let _guard = test_lock();
         clear_for_tests();
         for index in 0..(CAPACITY + 3) {
             record(exchange(
@@ -740,11 +973,121 @@ mod tests {
         clear_for_tests();
     }
 
+    /// 决策 5-b：`@忘记我` 之后不能只靠整环清空，还要能按玩家键精确下线。
+    #[test]
+    fn purge_player_drops_only_entries_mentioning_that_player() {
+        let _guard = test_lock();
+        clear_for_tests();
+        for name in ["玩家甲", "玩家乙", "玩家甲"] {
+            record(exchange(
+                json!({
+                    "model": "m",
+                    "messages": [
+                        {"role": "system", "content": "稳定人设"},
+                        {"role": "user", "content": format!("[{name}]:今天点什么歌")}
+                    ],
+                    "tools": []
+                }),
+                Some(json!({"usage": {"prompt_tokens": 10}})),
+            ));
+        }
+        assert_eq!(purge_player("玩家甲"), 2, "提到该玩家的两条都要清掉");
+        let list: Value = serde_json::from_str(&list_json()).expect("list JSON");
+        assert_eq!(list["count"], 1);
+        let id = list["entries"][0]["id"].as_u64().expect("id");
+        let detail = entry_json(id).expect("detail");
+        assert!(detail.contains("玩家乙"), "别人的报文必须保留");
+        assert!(!detail.contains("玩家甲"), "被遗忘者的原文不得残留");
+        // 传原始昵称或比较键都能命中（全角/大小写/空白归一化与身份比较共用一份）。
+        assert_eq!(purge_player("玩家丙"), 0);
+        // 空键不能当成「清空全部」，否则一次误传就会丢掉整个面板历史。
+        assert_eq!(purge_player("  "), 0);
+        assert_eq!(
+            serde_json::from_str::<Value>(&list_json()).expect("list JSON")["count"],
+            1
+        );
+        clear_for_tests();
+    }
+
+    /// 昵称里的 `"` / `\` 会被 JSON 序列化转义，按整条序列化文本做子串匹配
+    /// 会漏删（隐私红线）。结构化逐字段比较必须仍然命中。
+    #[test]
+    fn purge_player_matches_names_with_quotes_and_backslashes() {
+        let _guard = test_lock();
+        clear_for_tests();
+        let awkward = "引\"号\\玩家";
+        for text in [
+            format!("[{awkward}]:今天点什么歌"),
+            "[路人]:今天点什么歌".to_string(),
+        ] {
+            record(exchange(
+                json!({
+                    "model": "m",
+                    "messages": [{"role": "user", "content": text}],
+                    "tools": []
+                }),
+                None,
+            ));
+        }
+        assert_eq!(
+            purge_player(awkward),
+            1,
+            "昵称里的引号/反斜杠被 JSON 转义后仍要能命中"
+        );
+        let list: Value = serde_json::from_str(&list_json()).expect("list JSON");
+        assert_eq!(list["count"], 1);
+        let id = list["entries"][0]["id"].as_u64().expect("id");
+        let detail = entry_json(id).expect("detail");
+        assert!(detail.contains("路人"), "无关条目必须保留");
+        assert!(!detail.contains("引"), "被遗忘者的原文不得残留：{detail}");
+        clear_for_tests();
+    }
+
+    /// 单字符昵称不能按子串匹配：否则会命中 `ChatCompletions`、`id` 等
+    /// 固定文本，一次遗忘就把整环清空。短键必须降级为词段整段相等。
+    #[test]
+    fn purge_player_single_char_key_keeps_unrelated_entries() {
+        let _guard = test_lock();
+        clear_for_tests();
+        for content in ["ChatCompletions", "id", "stable prefix"] {
+            record(exchange(
+                json!({
+                    "model": content,
+                    "messages": [{"role": "user", "content": content}],
+                    "tools": []
+                }),
+                None,
+            ));
+        }
+        assert_eq!(
+            purge_player("C"),
+            0,
+            "单字符键不能按子串命中 ChatCompletions，否则会误删全部条目"
+        );
+        let list: Value = serde_json::from_str(&list_json()).expect("list JSON");
+        assert_eq!(list["count"], 3, "无关条目必须全部保留");
+        // 整段相等仍然生效：正文恰好是单字符的条目应被清掉。
+        record(exchange(
+            json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "C"}],
+                "tools": []
+            }),
+            None,
+        ));
+        assert_eq!(purge_player("C"), 1, "整段完全相等时单字符键仍然命中");
+        assert_eq!(
+            serde_json::from_str::<Value>(&list_json()).expect("list JSON")["count"],
+            3
+        );
+        clear_for_tests();
+    }
+
     /// 端到端形状：真实 Chat Completions 请求 + DeepSeek 风格 usage，
     /// 面板要能一次拿到 system、messages（含工具消息）、tools 与缓存字段。
     #[test]
     fn detail_exposes_the_exact_wire_request_and_cache_fields() {
-        let _guard = trace_test_lock();
+        let _guard = test_lock();
         clear_for_tests();
         record(exchange(
             json!({
@@ -837,7 +1180,7 @@ mod tests {
 
     #[test]
     fn record_is_failure_safe_and_marks_errors() {
-        let _guard = trace_test_lock();
+        let _guard = test_lock();
         clear_for_tests();
         record(WireExchange {
             wire_api: "Responses",

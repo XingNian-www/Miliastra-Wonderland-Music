@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -17,7 +17,7 @@ use super::{
     BackgroundLyricsScope, PersonalPlaylistStart, PlaybackCommand, PlaybackNavigation,
     PlaybackOutcome, PlaybackRequest, PlaybackSnapshot, PlaybackVerification, PlayerStatus,
     QueueAdvanceContext, QueueAdvanceDecision, QueueItem, QueueRemoval, estimated_player_status,
-    format_lyrics, format_status_with_mode,
+    format_lyrics_with, format_status_with_mode_and_renderer,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -516,6 +516,8 @@ pub(crate) struct PlaybackApplication {
     personal_playlist: Arc<Mutex<Option<PersonalPlaylistQueue>>>,
     /// 当前正在播放的曲目是否来自个人歌单自动队列；@状态 据此决定是否标注归属。
     current_playlist_auto: Arc<AtomicBool>,
+    /// 个人歌单模式的写入代际：启动失败回滚时用它确认「还是我写的那份模式」。
+    personal_playlist_generation: Arc<AtomicU64>,
     /// 队首 QueueBlockingFailure 的连续失败计数（item id -> (次数, 首次失败时刻)）。
     /// 超限后按项目级失败丢弃，避免队首永久毒化整条队列。
     queue_block_failures: Arc<Mutex<HashMap<u64, (u32, Instant)>>>,
@@ -598,6 +600,7 @@ impl PlaybackApplication {
             last_played: Arc::new(Mutex::new(None)),
             personal_playlist: Arc::new(Mutex::new(None)),
             current_playlist_auto: Arc::new(AtomicBool::new(false)),
+            personal_playlist_generation: Arc::new(AtomicU64::new(0)),
             queue_block_failures: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -638,7 +641,6 @@ impl PlaybackApplication {
         if tracks.is_empty() {
             return Ok(PersonalPlaylistStart::Started(0));
         }
-        port.remove_playlist_auto_items()?;
         let shuffle_state = tracks
             .iter()
             .fold(0x9E37_79B9_7F4A_7C15u64, |state, track| {
@@ -649,18 +651,57 @@ impl PlaybackApplication {
                     .bytes()
                     .fold(state, |hash, byte| hash.rotate_left(5) ^ u64::from(byte))
             });
-        *self
+        // 一次加锁完成「判定 + 写入」。
+        //
+        // 原来是 check-then-act：先读 active 并放锁，再做外部 I/O
+        // `remove_playlist_auto_items()`，最后重新加锁无条件覆盖。并发启动时
+        // 后到者会覆盖先到者，并清掉对方刚补进队列的自动项。
+        let generation = {
+            let mut guard = self
+                .personal_playlist
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(current) = guard.as_ref().map(|queue| queue.owner.clone()) {
+                return Ok(PersonalPlaylistStart::AlreadyActive { owner: current });
+            }
+            let generation = self
+                .personal_playlist_generation
+                .fetch_add(1, Ordering::SeqCst)
+                .saturating_add(1);
+            *guard = Some(PersonalPlaylistQueue {
+                owner: owner.to_owned(),
+                tracks,
+                cursor: 0,
+                shuffle_state,
+                last_played_key: None,
+            });
+            generation
+        };
+        // 外部 I/O 留在锁外；失败必须回滚刚写入的模式，否则歌单模式
+        // 会停在「已激活但没有队列」的损坏态并屏蔽默认播放池。
+        if let Err(error) = port.remove_playlist_auto_items() {
+            self.rollback_personal_playlist_start(generation);
+            return Err(error);
+        }
+        match self.refill_personal_playlist_queue(port) {
+            Ok(queued) => Ok(PersonalPlaylistStart::Started(queued)),
+            Err(error) => {
+                self.rollback_personal_playlist_start(generation);
+                Err(error)
+            }
+        }
+    }
+
+    /// 只回滚本次启动写入的模式：期间若已被 `stop`/新的 `start` 替换，
+    /// 代际号会变化，不能把别人的模式清掉。
+    fn rollback_personal_playlist_start(&self, generation: u64) {
+        let mut guard = self
             .personal_playlist
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PersonalPlaylistQueue {
-            owner: owner.to_owned(),
-            tracks,
-            cursor: 0,
-            shuffle_state,
-            last_played_key: None,
-        });
-        let queued = self.refill_personal_playlist_queue(port)?;
-        Ok(PersonalPlaylistStart::Started(queued))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.personal_playlist_generation.load(Ordering::SeqCst) == generation {
+            *guard = None;
+        }
     }
 
     pub(crate) fn stop_personal_playlist<P: PlaybackExecutionPort + ?Sized>(
@@ -681,12 +722,29 @@ impl PlaybackApplication {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
             .is_some();
+        if was_active {
+            self.personal_playlist_generation
+                .fetch_add(1, Ordering::SeqCst);
+        }
         port.remove_playlist_auto_items()?;
         Ok(was_active)
     }
 
     fn personal_playlist_active(&self) -> bool {
         self.personal_playlist_owner().is_some()
+    }
+
+    /// 队列空时是否仍有合法续播来源：单曲循环重播上一首，或个人歌单自动补队。
+    fn auto_continuation_available(&self) -> bool {
+        self.personal_playlist_active()
+            || (self.play_mode() == PLAY_MODE_REPEAT_ONE && self.has_last_played())
+    }
+
+    fn has_last_played(&self) -> bool {
+        self.last_played
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
     }
 
     /// 当前歌单模式的归属昵称；未激活时为 None。
@@ -701,11 +759,16 @@ impl PlaybackApplication {
     /// 场景切换（换大厅/进千星/进入游戏）结束个人歌单模式；返回被结束的归属昵称。
     /// 只清内存模式，残留自动项由调用方清理。
     pub(crate) fn take_personal_playlist_mode(&self) -> Option<String> {
-        self.personal_playlist
+        let taken = self
+            .personal_playlist
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-            .map(|queue| queue.owner)
+            .take();
+        if taken.is_some() {
+            self.personal_playlist_generation
+                .fetch_add(1, Ordering::SeqCst);
+        }
+        taken.map(|queue| queue.owner)
     }
 
     /// 当前歌单模式的归属；未激活为 None（端口用）。
@@ -747,12 +810,22 @@ impl PlaybackApplication {
         self.current_playlist_auto.load(Ordering::Relaxed)
     }
 
-    /// 记录本次起播来源，供 @状态 判断是否标注歌单归属。
-    fn note_playback_purpose(&self, purpose: PlaybackPurpose) {
-        self.current_playlist_auto.store(
-            matches!(purpose, PlaybackPurpose::Playlist { .. }),
-            Ordering::Relaxed,
-        );
+    /// 记录**已确认起播成功**的本次来源，供 `@状态` 判断是否标注歌单归属。
+    ///
+    /// 必须在成功之后调用：旧实现是在进入播放流程前无条件写入，被去重、无音源、
+    /// 用户暂停或搜索失败拦下时，正在播放的歌没变，归属前缀却被改掉。
+    /// `SourceRetry` / `Repeat` 保持原值：换源与单曲循环重播救的是同一首歌，
+    /// 不能把歌单标记抹成「点歌」。
+    fn note_playback_success(&self, purpose: PlaybackPurpose) {
+        match purpose {
+            PlaybackPurpose::Playlist { .. } => {
+                self.current_playlist_auto.store(true, Ordering::Relaxed);
+            }
+            PlaybackPurpose::SourceRetry { .. } | PlaybackPurpose::Repeat => {}
+            _ => {
+                self.current_playlist_auto.store(false, Ordering::Relaxed);
+            }
+        }
     }
 
     fn refill_personal_playlist_queue<P: PlaybackExecutionPort + ?Sized>(
@@ -931,13 +1004,31 @@ impl PlaybackApplication {
                 } else {
                     None
                 };
-                let text = format_status_with_mode(&status, playlist_owner.as_deref());
-                port.reply(&text)?;
+                let text = {
+                    let mut render =
+                        |spec: &ReplyTemplate, vars: &ReplyVars| port.render_reply(spec, vars);
+                    format_status_with_mode_and_renderer(
+                        &status,
+                        playlist_owner.as_deref(),
+                        &mut render,
+                    )
+                };
+                // 静音（覆盖为空）时整条回复消失，与其它模板出口一致。
+                if !text.is_empty() {
+                    port.reply(&text)?;
+                }
             }
             PlaybackCommand::Lyrics => {
                 let status = port.player_status()?;
                 port.log_executed(context, "lyrics")?;
-                port.reply(&format_lyrics(&status))?;
+                let text = {
+                    let mut render =
+                        |spec: &ReplyTemplate, vars: &ReplyVars| port.render_reply(spec, vars);
+                    format_lyrics_with(&status, &mut render)
+                };
+                if !text.is_empty() {
+                    port.reply(&text)?;
+                }
             }
             PlaybackCommand::ToggleLyrics => {
                 let mode = port.toggle_lyrics()?;
@@ -1086,7 +1177,15 @@ impl PlaybackApplication {
             match port.player_status() {
                 Ok(status) => {
                     if lyric_tracker.observe(&status) {
-                        port.reply(&format_lyrics(&status))?;
+                        let text = {
+                            let mut render = |spec: &ReplyTemplate, vars: &ReplyVars| {
+                                port.render_reply(spec, vars)
+                            };
+                            format_lyrics_with(&status, &mut render)
+                        };
+                        if !text.is_empty() {
+                            port.reply(&text)?;
+                        }
                     }
                 }
                 Err(error) => {
@@ -1171,8 +1270,12 @@ impl PlaybackApplication {
         port: &mut P,
     ) -> Result<bool> {
         let workload = port.workload()?;
+        // 控制器只看 `queue_empty` + 播放池，不知道单曲循环与个人歌单：
+        // 队列空但仍有合法续播时若照实传 `true`，池关闭/池空就永远不发
+        // `AdvanceQueue`（单曲循环播完即停、清空队列后歌单不再补队）。
+        let queue_empty = port.playback_queue()?.is_empty() && !self.auto_continuation_available();
         let context = QueueAdvanceContext {
-            queue_empty: port.playback_queue()?.is_empty(),
+            queue_empty,
             has_pending_playback_task: workload.has_pending_playback_task,
             command_executing: workload.command_executing,
         };
@@ -1495,7 +1598,6 @@ impl PlaybackApplication {
         purpose: PlaybackPurpose,
         port: &mut P,
     ) -> Result<PlaybackCompletion> {
-        self.note_playback_purpose(purpose);
         let requested = selection.request();
         if purpose.stop_when_user_paused() && port.user_pause_active()? {
             log::debug!("暂不播放：进入播放流程前用户已暂停播放器");
@@ -1566,6 +1668,22 @@ impl PlaybackApplication {
             resolved.source = source.to_string();
             resolved.track = Some(picked.playable_track());
             resolved.candidate_snapshot = picked.snapshot().to_vec();
+            // 补做同歌去重。
+            //
+            // 第一次检查发生在解析之前，`track` 还是 None，去重候选函数会直接
+            // 返回「不拦截」；HTTP 入队等 `track: None` 的条目因此能绕过同歌去重。
+            // 解析出真实音源后必须按最终曲目再查一次。
+            if purpose.checks_dedup() && self.selection_dedup_limited(&resolved, port)? {
+                log::info!(
+                    "点歌「{}」未播放：解析出的音源「{}」短时间内已播过，同歌去重规则拦截",
+                    selection.keyword,
+                    resolved.keyword
+                );
+                let mut completion =
+                    PlaybackCompletion::new(PlaybackResult::dedup_limited(&requested), None, false);
+                completion.reply_template = purpose.dedup_reply(&resolved);
+                return Ok(completion);
+            }
             return self.run_request(&requested, &resolved.request(), purpose, port);
         }
         self.run_request(&requested, &requested, purpose, port)
@@ -1589,7 +1707,6 @@ impl PlaybackApplication {
         purpose: PlaybackPurpose,
         port: &mut P,
     ) -> Result<PlaybackCompletion> {
-        self.note_playback_purpose(purpose);
         if purpose.stop_when_user_paused() && port.user_pause_active()? {
             log::debug!("暂不播放：发送播放请求前用户已暂停播放器");
             return Ok(PlaybackCompletion::new(
@@ -1619,59 +1736,21 @@ impl PlaybackApplication {
                         || "平台无对应歌曲音源".to_string(),
                         |message| format!("{}: {message}", request_source(request)),
                     );
-                    if purpose.allows_source_switch() {
-                        return self
-                            .switch_source_and_play(requested, request, purpose, &reason, port);
-                    }
-                    let mut completion = PlaybackCompletion::new(
-                        PlaybackResult::no_source(requested, request, None, reason),
-                        None,
-                        false,
+                    return self.unavailable_source_completion(
+                        requested,
+                        request,
+                        reason,
+                        item_message,
+                        purpose,
+                        port,
                     );
-                    if purpose.replies_with_play_message() {
-                        completion.reply_template = Some(match item_message {
-                            Some(message) => ReplyMessage::new(
-                                &playback_templates::ITEM_FAILURE,
-                                ReplyVars::new()
-                                    .with("来源", request_source(request))
-                                    .with("原因", message),
-                            ),
-                            None => {
-                                ReplyMessage::new(&playback_templates::NO_SOURCE, ReplyVars::new())
-                            }
-                        });
-                    }
-                    return Ok(completion);
                 }
                 let message = error.to_string();
-                let reply = if message.trim().is_empty() {
-                    "平台无对应歌曲音源".to_string()
-                } else {
-                    message.trim().to_string()
-                };
                 log::error!(
-                    "播放「{}」失败（步骤：播放后端报错且不属于可换源的音源问题）；本次点歌未生效：{reply}",
+                    "播放「{}」失败（步骤：播放后端报错且不属于可换源的音源问题）；本次点歌未生效：{message}",
                     request.keyword
                 );
-                let mut completion = PlaybackCompletion::new(
-                    PlaybackResult::error(requested, request, None, reply.clone()),
-                    None,
-                    false,
-                );
-                if purpose.replies_with_play_message()
-                    || matches!(purpose, PlaybackPurpose::SourceRetry { .. })
-                {
-                    if message.trim().is_empty() {
-                        completion.reply_template = Some(ReplyMessage::new(
-                            &playback_templates::NO_SOURCE,
-                            ReplyVars::new(),
-                        ));
-                    } else {
-                        // 播放器返回的原始错误文本：文案源头不在本模块，原样透传。
-                        completion.reply = Some(reply);
-                    }
-                }
-                return Ok(completion);
+                return Ok(self.blocking_failure_completion(requested, request, &message, purpose));
             }
         };
         self.complete_verification(requested, request, verification, purpose, port)
@@ -1683,9 +1762,42 @@ impl PlaybackApplication {
         request: &PlaybackRequest,
         verification: PlaybackVerification,
         purpose: PlaybackPurpose,
-        _port: &mut P,
+        port: &mut P,
     ) -> Result<PlaybackCompletion> {
-        let PlaybackVerification::Success { status, message } = verification;
+        let (status, message) = match verification {
+            PlaybackVerification::Success { status, message } => (status, message),
+            PlaybackVerification::Failed { reason, retryable } => {
+                // 起播即时失败（B07-P0-2 后半段）。
+                //
+                // 分类结论由 controller 随返回值带上来，**不再依赖错误下转**：
+                // 之前这里只能靠 `is_track_unavailable_error` 猜 `anyhow::Error` 里的类型，
+                // 猜不中就把「该音源不可用」误判成队列阻塞（保留队首、不换源）。
+                //
+                // - `retryable = true`：换源救不了（限流/超时/设备丢失/引擎内部错误），
+                //   必须保留队首等重试 —— 仍判 `QueueBlockingFailure`，语义与前一致；
+                // - `retryable = false`：音源级失败（404/解码失败/源站拒绝），
+                //   与 `is_track_unavailable_error` 命中时走**同一条**换源/无音源路径。
+                log::warn!(
+                    "播放「{}」起播即时失败（{}）：{reason}",
+                    request.keyword,
+                    if retryable {
+                        "可重试或换源无意义，保留队首"
+                    } else {
+                        "音源不可用，按换源处理"
+                    }
+                );
+                if retryable {
+                    return Ok(
+                        self.blocking_failure_completion(requested, request, &reason, purpose)
+                    );
+                }
+                return self.unavailable_source_completion(
+                    requested, request, reason, None, purpose, port,
+                );
+            }
+        };
+        // 只有真正起播成功才改来源标记。
+        self.note_playback_success(purpose);
         Ok(PlaybackCompletion::new(
             PlaybackResult::success(
                 requested,
@@ -1696,6 +1808,75 @@ impl PlaybackApplication {
             purpose.replies_with_play_message().then_some(message),
             true,
         ))
+    }
+
+    /// 音源不可用：能换源就换，不能换就回报「无音源」并丢弃该条。
+    ///
+    /// `item_message` 是消息级失败的固定展示文案（登录失效/无版权等）；为 None
+    /// 时退化为通用的「平台无对应歌曲音源」。
+    fn unavailable_source_completion<P: PlaybackExecutionPort + ?Sized>(
+        &self,
+        requested: &PlaybackRequest,
+        request: &PlaybackRequest,
+        reason: String,
+        item_message: Option<&'static str>,
+        purpose: PlaybackPurpose,
+        port: &mut P,
+    ) -> Result<PlaybackCompletion> {
+        if purpose.allows_source_switch() {
+            return self.switch_source_and_play(requested, request, purpose, &reason, port);
+        }
+        let mut completion = PlaybackCompletion::new(
+            PlaybackResult::no_source(requested, request, None, reason),
+            None,
+            false,
+        );
+        if purpose.replies_with_play_message() {
+            completion.reply_template = Some(match item_message {
+                Some(message) => ReplyMessage::new(
+                    &playback_templates::ITEM_FAILURE,
+                    ReplyVars::new()
+                        .with("来源", request_source(request))
+                        .with("原因", message),
+                ),
+                None => ReplyMessage::new(&playback_templates::NO_SOURCE, ReplyVars::new()),
+            });
+        }
+        Ok(completion)
+    }
+
+    /// 非音源级失败（可重试，或换源救不了）：保留队首，原样回报失败原因。
+    fn blocking_failure_completion(
+        &self,
+        requested: &PlaybackRequest,
+        request: &PlaybackRequest,
+        message: &str,
+        purpose: PlaybackPurpose,
+    ) -> PlaybackCompletion {
+        let reply = if message.trim().is_empty() {
+            "平台无对应歌曲音源".to_string()
+        } else {
+            message.trim().to_string()
+        };
+        let mut completion = PlaybackCompletion::new(
+            PlaybackResult::error(requested, request, None, reply.clone()),
+            None,
+            false,
+        );
+        if purpose.replies_with_play_message()
+            || matches!(purpose, PlaybackPurpose::SourceRetry { .. })
+        {
+            if message.trim().is_empty() {
+                completion.reply_template = Some(ReplyMessage::new(
+                    &playback_templates::NO_SOURCE,
+                    ReplyVars::new(),
+                ));
+            } else {
+                // 播放器返回的原始错误文本：文案源头不在本模块，原样透传。
+                completion.reply = Some(reply);
+            }
+        }
+        completion
     }
 
     fn switch_source_and_play<P: PlaybackExecutionPort + ?Sized>(
@@ -2595,12 +2776,12 @@ mod tests {
             shuffle_state: 1,
             last_played_key: None,
         });
-        application.note_playback_purpose(PlaybackPurpose::Playlist {
+        application.note_playback_success(PlaybackPurpose::Playlist {
             stop_when_user_paused: true,
         });
         assert!(application.current_is_playlist_auto());
         assert_eq!(application.personal_playlist_owner().as_deref(), Some("甲"));
-        application.note_playback_purpose(PlaybackPurpose::Requested);
+        application.note_playback_success(PlaybackPurpose::Requested);
         assert!(!application.current_is_playlist_auto());
     }
 
@@ -2744,6 +2925,116 @@ mod tests {
             .expect("matching structured candidate");
 
         assert_eq!(selected.track_ref.key.id, "right");
+    }
+
+    /// 回归（B07-P0-2 后半段）：起播**即时失败**且属音源级 → 上层必须换源。
+    ///
+    /// 这是 controller 的 `PlaybackVerification::Failed { retryable: false }` 在
+    /// 上层的消费者。修复前 controller `bail!` 一个裸 `anyhow!`，上层的
+    /// `is_track_unavailable_error` 下转落空 → 判 `QueueBlockingFailure`，
+    /// 队首永远留在原地、**不换源**（线上表现为「一首坏的源把整条队列堵死」）。
+    #[test]
+    fn immediate_unavailable_start_failure_switches_to_the_alternate_source() {
+        let original = test_track("miliastra://track/qqmusic/29", "即时失败候选 - 测试歌手");
+        let alternate = test_candidate("即时失败候选 - 测试歌手", "miliastra://track/netease/29");
+        let alternate_track = alternate.playable_track();
+        let mut port = SourceFailurePort {
+            inner: NavigationCommandPort {
+                queue: vec![QueueItem {
+                    id: 29,
+                    keyword: "即时失败候选".to_string(),
+                    track: Some(original),
+                    candidate_snapshot: vec![alternate],
+                    ..QueueItem::default()
+                }],
+                verifications: [repeat_verification(&alternate_track)].into(),
+                ..NavigationCommandPort::default()
+            },
+            // 首个音源：起播即时失败（音源级，不可重试 → 换源）。
+            immediate_failures: [(
+                "播放器报告失败: decode_failure: FFmpeg could not decode the stream".to_string(),
+                false,
+            )]
+            .into(),
+            ..SourceFailurePort::default()
+        };
+        let application = PlaybackApplication::new(PlaybackApplicationConfig {
+            console_bypass_dedup: true,
+            queue_max_size: 20,
+            monitor_tick_ms: Arc::new(RwLock::new(50)),
+            monitor_status_ms: Arc::new(RwLock::new(50)),
+            help_batch_ms: 0,
+        });
+
+        let result = application
+            .consume_queue("immediate-unavailable", &mut port)
+            .expect("an immediately failed source must fall back to the alternate source");
+
+        // 换源成功：最终生效的是备用平台，且队首被消费（不是阻塞保留）。
+        assert_eq!(
+            result,
+            Some(ConsumedSelection::Queue {
+                keyword: "即时失败候选".to_string()
+            })
+        );
+        assert_eq!(
+            port.requests.iter().map(request_source).collect::<Vec<_>>(),
+            ["qqmusic", "netease"],
+            "必须先试原音源，再换到备用音源"
+        );
+        assert!(port.inner.queue.is_empty(), "换源成功后队首应被出队");
+        assert_eq!(port.inner.replies, ["已自动换源:即时失败候选-测试歌手"]);
+    }
+
+    /// 回归：起播即时失败但**可重试**（换源无意义）→ 仍判 `QueueBlockingFailure`。
+    ///
+    /// 这条守住「不能因为新加了失败变体就把临时故障也拿去换源、连续跳歌」。
+    #[test]
+    fn immediate_retryable_start_failure_keeps_the_queue_head() {
+        let mut port = SourceFailurePort {
+            inner: NavigationCommandPort {
+                queue: vec![QueueItem {
+                    id: 30,
+                    keyword: "可重试失败候选".to_string(),
+                    track: Some(test_track(
+                        "miliastra://track/qqmusic/30",
+                        "可重试失败候选 - 测试歌手",
+                    )),
+                    candidate_snapshot: vec![test_candidate(
+                        "可重试失败候选 - 测试歌手",
+                        "miliastra://track/netease/30",
+                    )],
+                    ..QueueItem::default()
+                }],
+                ..NavigationCommandPort::default()
+            },
+            immediate_failures: [(
+                "播放器报告失败: provider_timeout: 源站超时".to_string(),
+                true,
+            )]
+            .into(),
+            ..SourceFailurePort::default()
+        };
+        let application = PlaybackApplication::new(PlaybackApplicationConfig {
+            console_bypass_dedup: true,
+            queue_max_size: 20,
+            monitor_tick_ms: Arc::new(RwLock::new(50)),
+            monitor_status_ms: Arc::new(RwLock::new(50)),
+            help_batch_ms: 0,
+        });
+
+        let result = application
+            .consume_queue("immediate-retryable", &mut port)
+            .expect("a retryable failure must be reported as a blocked queue head");
+
+        assert_eq!(result, None, "可重试失败必须保留队首等待重试");
+        assert_eq!(port.requests.len(), 1, "可重试失败不得尝试换源");
+        assert_eq!(port.inner.queue.len(), 1, "队首不得被丢弃");
+        assert_eq!(
+            port.inner.replies,
+            ["播放器报告失败: provider_timeout: 源站超时"],
+            "失败原因要原样透给玩家"
+        );
     }
 
     #[test]
@@ -3458,6 +3749,11 @@ mod tests {
         requests: Vec<PlaybackRequest>,
         pause_after_failure: bool,
         paused: bool,
+        /// 起播**即时失败**序列（`PlaybackVerification::Failed`）：`(原因, retryable)`。
+        ///
+        /// 与 `errors` 分开：`errors` 模拟后端派发就返回 `Err`（连回执都没有），
+        /// 这里模拟"派发已回执、但 controller 在同一轮状态读取里就看到 failure_code"。
+        immediate_failures: VecDeque<(String, bool)>,
     }
 
     impl PlaybackExecutionPort for SourceFailurePort {
@@ -3481,6 +3777,9 @@ mod tests {
             if let Some(error) = self.errors.pop_front() {
                 self.paused = self.pause_after_failure;
                 bail!("{error}");
+            }
+            if let Some((reason, retryable)) = self.immediate_failures.pop_front() {
+                return Ok(PlaybackVerification::Failed { reason, retryable });
             }
             self.inner.play_and_verify(request)
         }
@@ -3690,6 +3989,7 @@ mod tests {
     struct OverridingPort {
         replies: Vec<String>,
         overrides: Vec<(&'static str, &'static str)>,
+        status: PlayerStatus,
     }
 
     impl PlaybackExecutionPort for OverridingPort {
@@ -3739,7 +4039,7 @@ mod tests {
             unreachable!("this port is only used for reply assertions")
         }
         fn player_status(&mut self) -> Result<PlayerStatus> {
-            Ok(PlayerStatus::default())
+            Ok(self.status.clone())
         }
         fn playback_queue(&mut self) -> Result<Vec<QueueItem>> {
             Ok(Vec::new())
@@ -3747,6 +4047,54 @@ mod tests {
         fn remove_playback_queue(&mut self, _removal: QueueRemoval) -> Result<()> {
             Ok(())
         }
+    }
+
+    impl PlaybackCommandPort for OverridingPort {
+        fn reply_batch(&mut self, messages: &[String], _delay_ms: u64) -> Result<()> {
+            self.replies.extend(messages.iter().cloned());
+            Ok(())
+        }
+
+        fn log_executed(
+            &mut self,
+            _context: &PlaybackCommandContext,
+            _final_command: &str,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn pause_by_user(&mut self) -> Result<String> {
+            Ok("ok".to_string())
+        }
+
+        fn resume_by_user(&mut self) -> Result<String> {
+            Ok("ok".to_string())
+        }
+
+        fn set_volume(&mut self, _volume: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn remove_playback_pool_track(&mut self, _key: &TrackKey) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn toggle_lyrics(&mut self) -> Result<String> {
+            Ok("original".to_string())
+        }
+
+        fn remove_playback_queue_indexes(
+            &mut self,
+            _indexes: Vec<usize>,
+        ) -> Result<Vec<(usize, QueueItem)>> {
+            Ok(Vec::new())
+        }
+
+        fn clear_playback_queue(&mut self) -> Result<usize> {
+            Ok(0)
+        }
+
+        fn wait(&mut self, _duration: Duration) {}
     }
 
     #[test]
@@ -3757,6 +4105,7 @@ mod tests {
                 ("playback.volume.set", "音量调到 {音量} 啦"),
                 ("playback.queue.empty", "队列空空的"),
             ],
+            status: PlayerStatus::default(),
         };
 
         // 默认实现（无覆盖）与覆盖后的实现都必须经由 render_reply。
@@ -4317,5 +4666,368 @@ mod tests {
 
         assert_eq!(port.played_uris, Vec::<String>::new());
         assert_eq!(port.replies, ["没有上一曲记录"]);
+    }
+
+    fn playback_request_for_test(keyword: &str) -> PlaybackRequest {
+        PlaybackRequest {
+            keyword: keyword.to_string(),
+            source: "qqmusic".to_string(),
+            prefer_accompaniment: false,
+            track: Some(test_track(
+                &format!("miliastra://track/qqmusic/{keyword}"),
+                &format!("{keyword} - 歌手"),
+            )),
+            requester: String::new(),
+            navigation: PlaybackNavigation::Normal,
+            candidate_snapshot: Vec::new(),
+            queue_item_id: None,
+        }
+    }
+
+    struct MonitorContextProbe {
+        queue: Vec<QueueItem>,
+        recorded_queue_empty: Option<bool>,
+    }
+
+    impl PlaybackMonitorPort for MonitorContextProbe {
+        fn now(&self) -> Instant {
+            Instant::now()
+        }
+        fn is_running(&self) -> bool {
+            true
+        }
+        fn is_paused(&self) -> bool {
+            false
+        }
+        fn wait(&mut self, _duration: Duration) {}
+        fn player_status(&mut self) -> Result<PlayerStatus> {
+            Ok(PlayerStatus::default())
+        }
+        fn playback_queue(&mut self) -> Result<Vec<QueueItem>> {
+            Ok(self.queue.clone())
+        }
+        fn workload(&mut self) -> Result<PlaybackWorkload> {
+            Ok(PlaybackWorkload {
+                has_pending_playback_task: false,
+                command_executing: false,
+            })
+        }
+        fn maybe_advance_queue(
+            &mut self,
+            _status: PlayerStatus,
+            context: QueueAdvanceContext,
+        ) -> Result<QueueAdvanceDecision> {
+            self.recorded_queue_empty = Some(context.queue_empty);
+            Ok(QueueAdvanceDecision::PlaybackStateChanged)
+        }
+        fn enqueue_advance_queue(&mut self, _reason: &'static str) -> Result<()> {
+            Ok(())
+        }
+        fn update_monitor(&mut self) {}
+    }
+
+    fn empty_application() -> PlaybackApplication {
+        PlaybackApplication::new(PlaybackApplicationConfig {
+            console_bypass_dedup: true,
+            queue_max_size: 20,
+            monitor_tick_ms: Arc::new(RwLock::new(50)),
+            monitor_status_ms: Arc::new(RwLock::new(50)),
+            help_batch_ms: 0,
+        })
+    }
+
+    /// B07-P1-4：队列空 + 播放池不可用时，单曲循环/个人歌单仍要能触发自动续播。
+    ///
+    /// 控制器只认 `queue_empty` + 播放池；监控层必须把这两种「还有下一首」折算进去，
+    /// 否则池关闭或池空时永远不发 `AdvanceQueue`，播完/清空队列即停摆。
+    #[test]
+    fn monitor_folds_auto_continuation_into_the_advance_context() {
+        let application = empty_application();
+        let snapshot = PlaybackSnapshot {
+            status: PlayerStatus::default(),
+            captured_at: Instant::now(),
+        };
+
+        let mut probe = MonitorContextProbe {
+            queue: Vec::new(),
+            recorded_queue_empty: None,
+        };
+        application
+            .handle_monitor_snapshot(&snapshot, &mut probe)
+            .unwrap();
+        assert_eq!(
+            probe.recorded_queue_empty,
+            Some(true),
+            "无歌单、无单曲循环记忆时应按真实空队列上报"
+        );
+
+        // 个人歌单激活：队列空也会自动补队。
+        *application.personal_playlist.lock().unwrap() = Some(PersonalPlaylistQueue {
+            owner: "甲".to_string(),
+            tracks: vec![test_track(
+                "miliastra://track/qqmusic/playlist",
+                "歌单歌曲 - 歌手",
+            )],
+            cursor: 0,
+            shuffle_state: 1,
+            last_played_key: None,
+        });
+        let mut probe = MonitorContextProbe {
+            queue: Vec::new(),
+            recorded_queue_empty: None,
+        };
+        application
+            .handle_monitor_snapshot(&snapshot, &mut probe)
+            .unwrap();
+        assert_eq!(
+            probe.recorded_queue_empty,
+            Some(false),
+            "个人歌单模式不能被视为「没有下一首」"
+        );
+        application.personal_playlist.lock().unwrap().take();
+
+        // 单曲循环 + 有上一首：重播上一首。
+        application
+            .play_mode
+            .store(PLAY_MODE_REPEAT_ONE, Ordering::Relaxed);
+        *application.last_played.lock().unwrap() = Some(playback_request_for_test("上一首"));
+        let mut probe = MonitorContextProbe {
+            queue: Vec::new(),
+            recorded_queue_empty: None,
+        };
+        application
+            .handle_monitor_snapshot(&snapshot, &mut probe)
+            .unwrap();
+        assert_eq!(
+            probe.recorded_queue_empty,
+            Some(false),
+            "单曲循环有上一首时不能被视为「没有下一首」"
+        );
+
+        // 单曲循环但没有上一首：确实无内容可续播。
+        *application.last_played.lock().unwrap() = None;
+        let mut probe = MonitorContextProbe {
+            queue: Vec::new(),
+            recorded_queue_empty: None,
+        };
+        application
+            .handle_monitor_snapshot(&snapshot, &mut probe)
+            .unwrap();
+        assert_eq!(probe.recorded_queue_empty, Some(true));
+    }
+
+    /// B07-P1-5：来源标记只在起播成功后更新，失败/被拦的请求不能污染正在播放的歌。
+    #[test]
+    fn failed_playback_keeps_the_current_playlist_marker() {
+        let application = empty_application();
+        application.note_playback_success(PlaybackPurpose::Playlist {
+            stop_when_user_paused: true,
+        });
+        assert!(application.current_is_playlist_auto());
+
+        let mut port = FailingPlaybackPort {
+            queue: vec![QueueItem {
+                id: 1,
+                keyword: "大厅点歌".to_string(),
+                track: Some(test_track(
+                    "miliastra://track/qqmusic/requested",
+                    "大厅点歌 - 歌手",
+                )),
+                ..QueueItem::default()
+            }],
+            removed: Vec::new(),
+            replies: Vec::new(),
+            track_unavailable: false,
+            always_unavailable: false,
+            item_scoped_error: false,
+            play_attempts: 0,
+            pool: Vec::new(),
+        };
+        let _ = application.consume_queue("test", &mut port);
+
+        assert!(
+            application.current_is_playlist_auto(),
+            "起播失败的点歌不能把正在播放的歌单归属清掉"
+        );
+
+        // 换源重试救的是同一首歌，必须保留原来源标记。
+        application.note_playback_success(PlaybackPurpose::SourceRetry {
+            stop_when_user_paused: true,
+        });
+        assert!(application.current_is_playlist_auto());
+    }
+
+    /// B07-P1-6：`@状态` / `@歌词` 必须走 `render_reply`，面板覆盖/静音才生效。
+    #[test]
+    fn status_and_lyrics_commands_use_player_configured_overrides() {
+        let mut port = OverridingPort {
+            replies: Vec::new(),
+            overrides: vec![
+                (playback_templates::STATUS_WITH_SONG.key, "状态覆盖:{曲名}"),
+                (playback_templates::LYRICS_LINE.key, "歌词覆盖:{歌词}"),
+            ],
+            status: PlayerStatus {
+                status: "playing".to_string(),
+                name: "歌".to_string(),
+                singer: "手".to_string(),
+                duration: 100.0,
+                progress: 1.0,
+                volume: 80,
+                lyric_line_text: "第一行".to_string(),
+                requester: "甲".to_string(),
+                ..PlayerStatus::default()
+            },
+        };
+        let application = empty_application();
+        let context = PlaybackCommandContext {
+            message_type: "blue".to_string(),
+            username: "tester".to_string(),
+            user_command: "@状态".to_string(),
+        };
+
+        application
+            .execute_command(&context, &PlaybackCommand::Status, &mut port)
+            .expect("status command");
+        application
+            .execute_command(&context, &PlaybackCommand::Lyrics, &mut port)
+            .expect("lyrics command");
+
+        assert_eq!(
+            port.replies,
+            ["状态覆盖:歌 - 手", "歌词覆盖:第一行"],
+            "两条命令都必须经过覆盖渲染入口"
+        );
+    }
+
+    /// B07-P0-3：`track: None` 的条目（HTTP 入队等）在解析出音源后必须补做同歌去重。
+    struct DelayedResolutionPort {
+        dedup_calls: Vec<bool>,
+    }
+
+    impl PlaybackExecutionPort for DelayedResolutionPort {
+        fn reply(&mut self, _message: &str) -> Result<()> {
+            Ok(())
+        }
+        fn update_monitor(&mut self) {}
+        fn search_and_pick(
+            &mut self,
+            keyword: &str,
+            _source: &str,
+            _prefer_accompaniment: bool,
+        ) -> std::result::Result<Option<PickedCandidate>, PlaybackSearchFailure> {
+            Ok(Some(PickedCandidate::new(
+                test_candidate(
+                    &format!("{keyword} - 歌手"),
+                    "miliastra://track/qqmusic/resolved",
+                ),
+                format!("{keyword} - 歌手"),
+            )))
+        }
+        fn song_dedup_limited(&mut self, request: &PlaybackRequest) -> Result<bool> {
+            let has_track = request.track.is_some();
+            self.dedup_calls.push(has_track);
+            Ok(has_track)
+        }
+        fn play_and_verify(&mut self, _request: &PlaybackRequest) -> Result<PlaybackVerification> {
+            panic!("解析后命中同歌去重时不得起播")
+        }
+        fn player_status(&mut self) -> Result<PlayerStatus> {
+            Ok(PlayerStatus::default())
+        }
+        fn playback_queue(&mut self) -> Result<Vec<QueueItem>> {
+            Ok(Vec::new())
+        }
+        fn remove_playback_queue(&mut self, _removal: QueueRemoval) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn delayed_track_resolution_rechecks_song_dedup() {
+        let application = empty_application();
+        let selection = PlaybackSelection {
+            keyword: "晴天".to_string(),
+            source: "qqmusic".to_string(),
+            prefer_accompaniment: false,
+            ai_original_text: String::new(),
+            track: None,
+            friend_username: String::new(),
+            requester: "甲".to_string(),
+            console_bypass_dedup: false,
+            candidate_snapshot: Vec::new(),
+            queue_item_id: None,
+        };
+        let mut port = DelayedResolutionPort {
+            dedup_calls: Vec::new(),
+        };
+
+        let completion = application
+            .run_selection(&selection, PlaybackPurpose::Requested, &mut port)
+            .expect("delayed resolution");
+
+        assert_eq!(completion.result.outcome(), PlaybackOutcome::DedupLimited);
+        assert_eq!(
+            port.dedup_calls,
+            [false, true],
+            "解析前无 track 不拦截；解析出音源后必须带 track 再查一次"
+        );
+    }
+
+    /// B07-P1-8：补队失败必须回滚刚写入的歌单模式，不能留下「已激活但没有队列」。
+    struct FailingRefillPort;
+
+    impl PlaybackExecutionPort for FailingRefillPort {
+        fn reply(&mut self, _message: &str) -> Result<()> {
+            Ok(())
+        }
+        fn update_monitor(&mut self) {}
+        fn search_and_pick(
+            &mut self,
+            _keyword: &str,
+            _source: &str,
+            _prefer_accompaniment: bool,
+        ) -> std::result::Result<Option<PickedCandidate>, PlaybackSearchFailure> {
+            Ok(None)
+        }
+        fn song_dedup_limited(&mut self, _request: &PlaybackRequest) -> Result<bool> {
+            Ok(false)
+        }
+        fn play_and_verify(&mut self, _request: &PlaybackRequest) -> Result<PlaybackVerification> {
+            unreachable!("starting a playlist never starts playback")
+        }
+        fn player_status(&mut self) -> Result<PlayerStatus> {
+            Ok(PlayerStatus::default())
+        }
+        fn playback_queue(&mut self) -> Result<Vec<QueueItem>> {
+            Ok(Vec::new())
+        }
+        fn enqueue_playlist_item(&mut self, _item: QueueItem) -> Result<bool> {
+            bail!("队列写入失败")
+        }
+        fn remove_playback_queue(&mut self, _removal: QueueRemoval) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn personal_playlist_start_rolls_back_when_refill_fails() {
+        let application = empty_application();
+        let mut port = FailingRefillPort;
+
+        let result = application.start_personal_playlist(
+            "甲",
+            vec![test_track(
+                "miliastra://track/qqmusic/playlist",
+                "歌单歌曲 - 歌手",
+            )],
+            &mut port,
+        );
+
+        assert!(result.is_err(), "补队失败必须向上报错");
+        assert_eq!(
+            application.personal_playlist_owner(),
+            None,
+            "补队失败后不能残留半激活的歌单模式"
+        );
     }
 }

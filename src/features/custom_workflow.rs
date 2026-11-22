@@ -548,6 +548,11 @@ impl CustomWorkflowService {
 
     fn prepare(&self, invocation: &CustomWorkflowInvocation) -> Result<WorkflowPlan> {
         let config = self.config();
+        // 命令入队后、执行前可能通过热重载关掉总开关：执行入口必须复检，
+        // 否则 `custom_workflows.enabled = false` 会在在途任务上被绕过。
+        if !config.enabled {
+            bail!("自定义工作流未启用");
+        }
         let workflow = find_workflow(&config, &invocation.command.workflow)
             .ok_or_else(|| anyhow!("custom workflow not found: {}", invocation.command.workflow))?;
         if workflow.steps.is_empty() {
@@ -942,6 +947,8 @@ impl WorkflowContext {
     ///
     /// 命令主语在外部聊天源的私聊里是 UID，OCR 私聊里是备注串，
     /// 直接渲染会把内部键或随机备注念到大厅。
+    ///
+    /// **只用于渲染文案，绝不当好友搜索目标**（见 [Self::searchable_name]）。
     fn display_name(&self) -> &str {
         let display = self.display.trim();
         if display.is_empty() {
@@ -949,6 +956,38 @@ impl WorkflowContext {
         } else {
             display
         }
+    }
+
+    /// 缺省好友搜索目标：**可搜索候选名**（备注串优先 → 真实昵称）。
+    ///
+    /// `identity-name-display-and-permission.md:116` 写死「软件显示名（display_name）
+    /// **不会出现在游戏里**，因此永远不参与搜索」、`:130`「绝不当搜索候选」。
+    /// 好友列表上能出现的只有两个名字：我给对方设的**备注串**（= 屏幕显示名），
+    /// 以及没有备注时显示的**真实昵称**。
+    ///
+    /// 这两个名字在本模块能拿到的只有两处：
+    /// - `username`（命令主语）：OCR 路径就是**备注串**，最优先；
+    /// - `actor_display`：组合层填的是「软件显示名 → 真实昵称」，所以它只在
+    ///   软件显示名为空（自动注册身份的常见形态）时才等于真实昵称。
+    ///
+    /// 因此顺序是：主语可搜索 → 主语；主语是内部键（UID/UUID）→ 退回 `actor_display`
+    /// （此时可能是真实昵称，也可能是用户手填的软件显示名，属已知残余，见报告）。
+    /// 两者都不可用时返回空串，由调用方报错，**绝不拿内部键去搜索**——
+    /// 旧实现无条件返回 `display_name()`，软件显示名被当成搜索目标，屏幕上根本不存在。
+    fn searchable_name(&self) -> &str {
+        let username = self.username.trim();
+        if !username.is_empty()
+            && !crate::features::identity::IdentityAccess::looks_like_internal_key(username)
+        {
+            return username;
+        }
+        let display = self.display.trim();
+        if !display.is_empty()
+            && !crate::features::identity::IdentityAccess::looks_like_internal_key(display)
+        {
+            return display;
+        }
+        ""
     }
 
     fn new(invocation: &CustomWorkflowInvocation) -> Self {
@@ -1076,40 +1115,85 @@ fn find_workflow<'a>(
         .find(|workflow| workflow.enabled && workflow_matches_name(workflow, &target))
 }
 
+/// 解析模板引用：优先查命名模板表，查不到才当**裸文件名**回退。
+///
+/// # 为什么必须校验裸回退
+///
+/// `template` 是用户可写的字段，而且**会先过模板变量渲染**
+/// （`context.render(step.template)`）。于是 `template: "{参数}"` 加上
+/// `@流程../../secret.png` 就能把路径拼出来——变量值来自大厅聊天，
+/// 任何人都能控制。渲染结果会一路进 `WorkflowOperation::ClickTemplate`
+/// 去读文件，等于「任意路径读」+「UNC 外发」（`\\host\share\x.png` 会让
+/// Windows 用当前凭据去访问网络共享）。
+///
+/// `docs/user-guide.md:248` 只承诺「可按需要配置模板匹配」，从没承诺裸路径；
+/// 所以这里直接把裸回退收窄成**纯文件名**：
+///
+/// - 拒绝任何路径分隔符（`/`、`\`，含 Windows 的全角同形）；
+/// - 拒绝 `..` 与盘符（`C:`）、UNC 前缀；
+/// - 拒绝控制字符与前后空白。
+///
+/// 越界一律**报错**（不是静默忽略）：静默会让用户以为流程跑过了。
 fn template_path(config: &CustomWorkflowConfig, template: &str) -> Result<PathBuf> {
     let template = template.trim();
     if template.is_empty() {
         bail!("custom workflow template is empty");
     }
-    Ok(config
-        .templates
-        .get(template)
-        .cloned()
-        .unwrap_or_else(|| PathBuf::from(template)))
+    if let Some(configured) = config.templates.get(template) {
+        return Ok(configured.clone());
+    }
+    // 命名模板已经查过，剩下的是「裸文件名」回退：这种情况才需要安全校验。
+    if template.contains(['/', '\\', '\u{ff0f}', '\u{ff3c}']) {
+        bail!("自定义流程模板名不能包含路径分隔符：{template}");
+    }
+    if template.contains("..") {
+        bail!("自定义流程模板名不能包含「..」：{template}");
+    }
+    // 盘符（`C:`）与 UNC（`\\\\host\\share`）在上面两步已分别被「冒号前的单字母」
+    // 与反斜杠挡住；这里再挡一次「裸冒号」，避免 `C:x.png` 这类相对盘符写法。
+    if template.contains(':') {
+        bail!("自定义流程模板名不能包含盘符或冒号：{template}");
+    }
+    if template.chars().any(char::is_control) {
+        bail!("自定义流程模板名不能包含控制字符");
+    }
+    Ok(PathBuf::from(template))
 }
 
+/// 解析确认窗口里的「@确认 / @跳过」。
+///
+/// 不能按「首个 `:`/`]`」切正文：昵称本身可能带 `[战队]`、`A:B`，截出来的正文
+/// 就不以命令词开头，确认永远失败。确认命令是**消息中的独立命令词**，因此直接
+/// 扫描 `@`，要求它前面是消息开头或分隔符，取第一个能完整匹配的。
 fn parse_confirmation(text: &str) -> Option<WorkflowConfirmationDecision> {
     let raw = text.trim();
-    let command_text = if let Some(index) = raw.find(['：', ':', ']', '】']) {
-        let separator_len = raw[index..].chars().next()?.len_utf8();
-        &raw[index + separator_len..]
-    } else {
-        raw
+    for (index, _) in raw.match_indices('@') {
+        let preceded_by_separator = match raw[..index].chars().next_back() {
+            None => true,
+            Some(ch) => matches!(ch, ':' | '：' | ']' | '】' | ' ' | '\t'),
+        };
+        if !preceded_by_separator {
+            continue;
+        }
+        if let Some(decision) = confirmation_decision_at(&raw[index..]) {
+            return Some(decision);
+        }
     }
-    .trim_start_matches(['：', ':', ' ', '\t', ']', '】']);
-    if command_text
-        .strip_prefix("@确认")
-        .is_some_and(|rest| decision_boundary(rest.chars().next()))
+    None
+}
+
+fn confirmation_decision_at(rest: &str) -> Option<WorkflowConfirmationDecision> {
+    if let Some(tail) = rest.strip_prefix("@确认")
+        && decision_boundary(tail.chars().next())
     {
-        Some(WorkflowConfirmationDecision::Confirm)
-    } else if command_text
-        .strip_prefix("@跳过")
-        .is_some_and(|rest| decision_boundary(rest.chars().next()))
-    {
-        Some(WorkflowConfirmationDecision::Skip)
-    } else {
-        None
+        return Some(WorkflowConfirmationDecision::Confirm);
     }
+    if let Some(tail) = rest.strip_prefix("@跳过")
+        && decision_boundary(tail.chars().next())
+    {
+        return Some(WorkflowConfirmationDecision::Skip);
+    }
+    None
 }
 
 fn render_workflow_text(text: &str, context: &WorkflowContext) -> String {
@@ -1169,7 +1253,10 @@ fn custom_step_message(step: &CustomWorkflowStep, context: &WorkflowContext) -> 
 fn custom_step_target(step: &CustomWorkflowStep, context: &WorkflowContext) -> String {
     let target = step.target.as_deref().unwrap_or("").trim();
     if target.is_empty() {
-        context.display_name().to_string()
+        // 缺省目标 = **可搜索候选名**，不是软件显示名。
+        // 见 `WorkflowContext::searchable_name`：显示名永远不会出现在游戏好友列表里，
+        // 拿它搜索必然落空（`identity-name-display-and-permission.md:116/130`）。
+        context.searchable_name().to_string()
     } else {
         context.render(target)
     }
@@ -1241,6 +1328,9 @@ fn find_command_workflow<'a>(
     command_text: &str,
     message_type: &str,
 ) -> Option<(&'a CustomWorkflowDefinition, &'a str, String)> {
+    // 先收集再按「命令最长」选：`@测试流程` 不能被排在前面的短命令 `测试`
+    // （`allow_args: true`）当成「测试 + 参数 流程」静默劫持。同长保持声明顺序。
+    let mut best: Option<(&'a CustomWorkflowDefinition, &'a str, String, usize)> = None;
     for workflow in config.workflows.iter().filter(|workflow| workflow.enabled) {
         if !accepts_message_type(workflow, message_type) {
             continue;
@@ -1260,10 +1350,16 @@ fn find_command_workflow<'a>(
             if !workflow.allow_args && !args.is_empty() {
                 continue;
             }
-            return Some((workflow, command, args.to_string()));
+            let length = command.chars().count();
+            let longer = best
+                .as_ref()
+                .is_none_or(|(_, _, _, best_length)| length > *best_length);
+            if longer {
+                best = Some((workflow, command, args.to_string(), length));
+            }
         }
     }
-    None
+    best.map(|(workflow, command, args, _)| (workflow, command, args))
 }
 
 fn command_args(rest: &str) -> &str {
@@ -1339,10 +1435,9 @@ fn joined_command(command: &str, args: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::path::Path;
 
     use super::*;
-    use crate::config::AppConfig;
+    use crate::config::bundled_config;
     use crate::features::command::CommandObservation;
 
     fn envelope(username: &str, message_type: &str, command: &str) -> CommandEnvelope {
@@ -1838,8 +1933,8 @@ mod tests {
 
     #[test]
     fn default_control_commands_resolve_shared_prefixes_and_duration_arguments() {
-        let app =
-            AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).expect("default config");
+        // 配置来自编译进二进制的 `src/config/test.full.yaml`；`tests/` 不入库。
+        let app = bundled_config();
         let service = CustomWorkflowService::new(app.custom_workflows, defaults());
 
         for (text, workflow, args) in [
@@ -2184,6 +2279,121 @@ mod tests {
         )));
     }
 
+    /// B06-P1-07：`send_friend_message` / `invite_user` 的缺省目标必须是
+    /// **可搜索候选名**（备注串 → 真实昵称），绝不能是软件显示名。
+    ///
+    /// `identity-name-display-and-permission.md:116` 写死「软件显示名不会出现在游戏里，
+    /// 因此永远不参与搜索」、`:130`「绝不当搜索候选」。旧实现无条件返回
+    /// `context.display_name()`，而组合层填的 `actor_display` 正是
+    /// `identity.player_name()`（显示名优先）——于是在面板里填了显示名的玩家，
+    /// 缺省好友消息/邀请全部搜不到人（屏幕上根本没有这个名字）。
+    #[test]
+    fn default_workflow_targets_use_a_searchable_name_not_the_display_name() {
+        let mut value = workflow();
+        let mut friend = step("send_friend_message");
+        friend.message = Some("你好".to_string());
+        let invite = step("invite_user");
+        value.steps = vec![friend, invite];
+        let service = CustomWorkflowService::new(config(value), defaults());
+
+        let targets = |invocation: &CustomWorkflowInvocation| {
+            let plan = service.prepare(invocation).unwrap();
+            plan.steps
+                .iter()
+                .filter_map(|step| match step {
+                    WorkflowPlanStep::Capability(WorkflowCapability::InviteUser { target }) => {
+                        Some(target.clone())
+                    }
+                    WorkflowPlanStep::Capability(WorkflowCapability::SendFriendMessage {
+                        target,
+                        ..
+                    }) => Some(target.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // OCR 路径：主语就是**备注串**（屏幕上显示的名字），显示名只是软件内标签。
+        let mut ocr = invocation("");
+        ocr.username = "备注串甲".to_owned();
+        ocr.actor_display = "软件显示名乙".to_owned();
+        assert_eq!(
+            targets(&ocr),
+            vec!["备注串甲".to_string(), "备注串甲".to_string()],
+            "缺省目标必须用备注串，不能用软件显示名"
+        );
+
+        // 外部聊天源路径：主语是纯数字 UID，不能拿去搜索；
+        // 显示名为空时组合层填的就是真实昵称，应作为候选。
+        let mut external = invocation("");
+        external.username = "900000001".to_owned();
+        external.actor_display = "真名丙".to_owned();
+        assert_eq!(
+            targets(&external),
+            vec!["真名丙".to_string(), "真名丙".to_string()],
+            "主语是内部键时必须退回真实昵称，且绝不把 UID 当搜索名"
+        );
+
+        // 两者都是内部键时宁可报错，也不能把 UID/UUID 交给好友搜索。
+        let mut hopeless = invocation("");
+        hopeless.username = "900000001".to_owned();
+        hopeless.actor_display = "00000000-0000-4000-8000-000000000001".to_owned();
+        assert!(
+            service.prepare(&hopeless).is_err(),
+            "解析不出可搜索名时必须在进 UI 前失败"
+        );
+    }
+
+    /// B06-P1-05：模板变量可以拼进 `template` 路径，必须挡在文件访问之前。
+    ///
+    /// `template` 会先过 `context.render(...)`，而变量来自大厅聊天：`{参数}` 加
+    /// `@流程../../x.png` 就能构造任意路径；`\\host\share` 还是 UNC（Windows 会带当前
+    /// 凭据去访问）。`docs/user-guide.md:248` 只承诺「命名模板」，没承诺裸路径。
+    #[test]
+    fn rendered_template_names_cannot_escape_into_paths() {
+        let service = CustomWorkflowService::new(config(workflow()), defaults());
+        let prepare_with = |template: &str| {
+            let mut value = workflow();
+            let mut click = step("click_template");
+            click.template = Some(template.to_string());
+            // 模板步骤一律要求 region；本测试只关心路径校验，给一个合法区域。
+            click.region = Some(RectConfig {
+                x: 1,
+                y: 2,
+                width: 3,
+                height: 4,
+            });
+            value.steps = vec![click];
+            CustomWorkflowService::new(config(value), defaults()).prepare(&invocation(""))
+        };
+        let _ = &service;
+
+        for hostile in [
+            "../../secret.png",
+            "..\\..\\secret.png",
+            "/etc/passwd.png",
+            "C:\\Windows\\win.ini",
+            "C:x.png",
+            "\\\\host\\share\\x.png",
+            "sub/button.png",
+            "sub\\button.png",
+            "全角／分隔.png",
+        ] {
+            let error = prepare_with(hostile)
+                .err()
+                .unwrap_or_else(|| panic!("{hostile} 必须被拒绝"));
+            assert!(
+                error.to_string().contains("模板名"),
+                "{hostile} 的报错应说明是模板名不合法，实际：{error}"
+            );
+        }
+
+        // 命名模板照旧可用。
+        assert!(prepare_with("button").is_ok(), "命名模板不能被误伤");
+        // 裸文件名（无分隔符、无父目录）仍然允许：那是既有的回退行为。
+        assert!(prepare_with("plain_name.png").is_ok());
+    }
+
     #[test]
     fn confirmation_parser_requires_a_complete_command_boundary() {
         assert_eq!(
@@ -2195,5 +2405,75 @@ mod tests {
             Some(WorkflowConfirmationDecision::Skip)
         );
         assert_eq!(parse_confirmation("用户：@确认其他"), None);
+    }
+
+    /// 回归：昵称/消息头自带 `:`、`]`、`】` 时，按「首个分隔符」切正文会把
+    /// `@确认` 截成 `玩家：@确认` 之类的残片，确认永远失败。
+    #[test]
+    fn confirmation_parser_survives_nicknames_with_delimiters() {
+        for text in [
+            "[战队]玩家：@确认",
+            "A:B：@确认",
+            "[公会】甲]：@跳过",
+            "玩家]：@确认",
+            "玩家：@确认]",
+            "玩家：@跳过！",
+        ] {
+            let expected = if text.contains("@跳过") {
+                WorkflowConfirmationDecision::Skip
+            } else {
+                WorkflowConfirmationDecision::Confirm
+            };
+            assert_eq!(
+                parse_confirmation(text),
+                Some(expected),
+                "含分隔符的昵称不应吞掉确认命令：{text}"
+            );
+        }
+        // 昵称里出现 `@确认` 字面量时不能被当成命令。
+        assert_eq!(parse_confirmation("玩家@确认：你好"), None);
+    }
+
+    /// 回归：短命令 + `allow_args` 排在前面时，不能把更长的命令当成自己的参数吞掉。
+    #[test]
+    fn longer_workflow_command_wins_over_an_earlier_short_prefix() {
+        let mut short = workflow();
+        short.name = "短命令".to_string();
+        short.commands = vec!["测试".to_string()];
+        short.allow_args = true;
+        let mut long = workflow();
+        long.name = "长命令".to_string();
+        long.commands = vec!["测试流程".to_string()];
+        long.allow_args = false;
+        let mut config = config(short);
+        config.workflows.push(long);
+        let service = CustomWorkflowService::new(config, defaults());
+
+        let parsed = service
+            .parse_chat(&envelope("用户", "blue", "@测试流程"))
+            .expect("longer command should be claimed");
+        assert_eq!(parsed.command.workflow, "长命令", "长命令不能被短前缀劫持");
+
+        let parsed = service
+            .parse_chat(&envelope("用户", "blue", "@测试 5"))
+            .expect("short command with its own args should still work");
+        assert_eq!(parsed.command.workflow, "短命令");
+        assert_eq!(parsed.command.args, "5");
+    }
+
+    /// 回归：命令入队后热重载关闭总开关，执行入口必须复检 `enabled`。
+    #[test]
+    fn prepare_rechecks_the_global_switch_after_hot_reload() {
+        let shared = Arc::new(RwLock::new(config(workflow())));
+        let service = CustomWorkflowService::with_live_config(shared.clone(), defaults());
+        assert!(service.prepare(&invocation("3")).is_ok());
+
+        shared.write().unwrap().enabled = false;
+
+        let error = service
+            .prepare(&invocation("3"))
+            .err()
+            .expect("disabled workflow must not be prepared");
+        assert!(error.to_string().contains("未启用"), "实际：{error}");
     }
 }

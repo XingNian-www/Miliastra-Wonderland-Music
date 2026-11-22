@@ -9,8 +9,14 @@ nickname 与账号 UID，命中后统一替换成稳定代号（玩家A、玩家
   # 扫描文件，打印到 stdout
   MILIASTRA_PANEL_TOKEN=xxx python3 scripts/privacy-filter.py prompts.txt
 
-  # 原地替换（会保留 .bak 备份）
+  # 原地替换（还原点默认写到 .local/privacy-backups/，该目录已被 .gitignore 忽略）
   python3 scripts/privacy-filter.py --write logs/*.log
+
+  # 换还原点位置（不允许落在会被 git 跟踪的目录；那样会被拒绝并回退到默认目录）
+  python3 scripts/privacy-filter.py --write --backup-dir /tmp/privacy-backup logs/*.log
+
+  # 完全不留还原点
+  python3 scripts/privacy-filter.py --write --no-backup logs/*.log
 
   # 自定义映射文件 / 远端
   python3 scripts/privacy-filter.py --mappings identity.json input.txt
@@ -24,12 +30,31 @@ nickname 与账号 UID，命中后统一替换成稳定代号（玩家A、玩家
   --repo                                     不给 paths 时扫描仓库代码（src、web/src、scripts、technical-docs）
   --mode code|text                            code 用「示例玩家A」这类中性代号；text 用「玩家A」
   --keep-uid                                 保留 UID 原样（不参与替换）
+  --backup-dir DIR                           --write 的还原点目录（默认 .local/privacy-backups/）
+  --no-backup                                --write 时完全不保留还原点
+
+备份去哪儿了（2026-11-22 修，审阅 B21-P1-9）：
+  旧实现把 `<file>.bak` 写在**源码旁边**，内容是替换前的**未脱敏原文**。而
+  .gitignore 没有 `*.bak` 规则（`!/src/`、`!/scripts/` 是整目录放行），发布脚本
+  release-pipeline.sh:258 又用 `git add -A -- .` 暂存 —— 一次 `--write` 后随手提交，
+  真实昵称/UID 就随 `.bak` 进了仓库，脱敏等于白做。
+  现在：
+    - 还原点只写到 `.local/privacy-backups/`（`.gitignore` 的 `/.local/` 已忽略），
+      或 `--backup-dir` 指定的、经 `git check-ignore` 确认忽略的目录；
+    - 指定的目录若会被 git 跟踪，**拒绝写入**并回退到默认目录（宁可不符合调用方
+      期望，也不重犯泄漏）；
+    - 关掉备份用 `--no-backup`。
+  这样与 release-pipeline.sh 的 `git add -A` 不冲突，也不需要改 `.gitignore`
+  或那个脚本。注意：还原点里的原文仍在本地磁盘上，用完请自行删除。
 """
 import argparse
+import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import urllib.request
 from pathlib import Path
 
@@ -38,6 +63,86 @@ DEFAULT_TOKEN = os.environ.get("MILIASTRA_PANEL_TOKEN", "")
 REPO_CODE_ROOTS = ["src", "web/src", "scripts", "technical-docs"]
 CODE_SUFFIXES = {".rs", ".vue", ".js", ".ts", ".mjs", ".py", ".md", ".toml", ".json", ".html", ".css", ".yml", ".yaml", ".sh"}
 SKIP_PARTS = {"node_modules", "target", "dist", ".git", ".cargo", "__pycache__"}
+ROOT = Path(__file__).resolve().parent.parent
+# 备份默认落在仓库根下的 `.local/privacy-backups/`：`.gitignore` 里的 `/.local/`
+# 把整个目录忽略掉，`git add -A` 收不到它的内容。
+#
+# 为什么必须换地方（审阅 B21-P1-9）：旧实现把 `<原文件>.bak` 写在源码旁边，
+# 内容是**替换前的未脱敏原文**；而 `.gitignore` 里没有 `*.bak` 规则
+# （`!/src/`、`!/scripts/` 是整目录放行），`scripts/release-pipeline.sh` 又用
+# `git add -A -- .` 暂存 —— 一次 `--write` 之后随手提交，真实昵称/UID 就随
+# `.bak` 进了仓库，脱敏等于白做。
+DEFAULT_BACKUP_DIR = ROOT / ".local" / "privacy-backups"
+
+
+def is_git_ignored(path: Path) -> bool:
+    """确认 path 会被 git 忽略（`git check-ignore`）。
+
+    判断“备份放这儿安不安全”必须问 git 本身，而不是在脚本里再抄一份 `.gitignore`
+    规则：规则会变，抄的那份一定先过期。git 不可用 / 不是仓库时返回 False
+    （保守：当作没忽略）。
+    """
+    try:
+        result = subprocess.run(
+            ["git", "check-ignore", "-q", "--", str(path)],
+            cwd=str(ROOT),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except OSError:
+        return False
+    return result.returncode == 0
+
+
+def resolve_backup_dir(requested: str | None) -> Path:
+    """决定备份目录；返回一个**确认不会被 git 收走**的位置。
+
+    - 没给 `--backup-dir` 的值 → 用默认的 `.local/privacy-backups/`；
+    - 给了值但它落在仓库内且没被忽略 → 拒绝在那里写未脱敏原文，
+      改写到默认目录并告警（宁可不按用户指定的路径写，也不重犯泄漏）。
+    """
+    target = Path(requested).expanduser() if requested else DEFAULT_BACKUP_DIR
+    try:
+        target = target.resolve()
+    except OSError:
+        target = DEFAULT_BACKUP_DIR
+    target.mkdir(parents=True, exist_ok=True)
+    if not is_git_ignored(target / ".keep"):
+        if target == DEFAULT_BACKUP_DIR.resolve():
+            # 默认目录居然没被忽略：说明 .gitignore 改坏了。退到系统临时目录。
+            target = Path(tempfile.gettempdir()) / "miliastra-privacy-backups"
+            target.mkdir(parents=True, exist_ok=True)
+            print(
+                f"warning: {DEFAULT_BACKUP_DIR} 未被 .gitignore 忽略（规则可能被改动），"
+                f"备份改写到 {target}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"WARNING: 指定的备份目录 {target} 会被 git 跟踪；备份含未脱敏原文，"
+                f"拒绝写入，改用 {DEFAULT_BACKUP_DIR}",
+                file=sys.stderr,
+            )
+            target = DEFAULT_BACKUP_DIR
+            target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def write_backup(backup_dir: Path, path: Path, text: str) -> Path:
+    """把**替换前**的原文备份到 backup_dir，返回备份路径。
+
+    文件名用「仓库内相对路径扁平化 + 绝对路径哈希」：既避免不同目录同名文件
+    互相覆盖，也能一眼看出备份来自哪个文件。
+    """
+    digest = hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()[:12]
+    try:
+        flat = str(path.resolve().relative_to(ROOT)).replace(os.sep, "__")
+    except ValueError:
+        flat = path.name
+    backup = backup_dir / f"{flat}.{digest}.bak"
+    backup.write_text(text, encoding="utf-8")
+    return backup
 
 
 def fetch_mappings(source, token, timeout=15):
@@ -187,7 +292,17 @@ def main():
     parser.add_argument("--prefix", default=None, help="代号前缀；默认 code 模式「示例玩家」，text 模式「玩家」")
     parser.add_argument("--repo", action="store_true", help="不给 paths 时扫描仓库代码目录")
     parser.add_argument("--mode", choices=["code", "text"], default="code", help="code=中性示例代号；text=玩家A")
-    parser.add_argument("--write", action="store_true", help="原地写回（.bak 备份）")
+    parser.add_argument("--write", action="store_true", help="原地写回（默认写到 .local/privacy-backups/ 留还原点）")
+    parser.add_argument(
+        "--backup-dir",
+        default=None,
+        help="--write 的还原点目录（默认 .local/privacy-backups/；落在仓库内且未被忽略时会被拒绝并回退）",
+    )
+    parser.add_argument(
+        "--no-backup",
+        action="store_true",
+        help="--write 时完全不保留还原点（替换幂等，重跑无害）",
+    )
     parser.add_argument("--check", action="store_true", help="仅检查；有命中时退出码 1")
     args = parser.parse_args()
 
@@ -209,6 +324,17 @@ def main():
 
     total = 0
     changed_files = 0
+    # --write 默认留还原点，但只写到**确认被 git 忽略**的目录（见 resolve_backup_dir）。
+    # `--no-backup` 可以完全关掉；`--backup-dir` 可覆盖位置，但落在仓库内且未被忽略时
+    # 会被拒绝并回退到安全目录 —— 未脱敏原文绝不写进会被 `git add -A` 收走的地方。
+    backup_dir = None
+    if args.write and not args.no_backup:
+        try:
+            backup_dir = resolve_backup_dir(args.backup_dir)
+        except OSError as error:
+            raise SystemExit(f"无法准备备份目录：{error}")
+    written_backups: list[Path] = []
+
     for path in iter_targets(args.paths, repo=args.repo):
         try:
             if str(path) == "<stdin>":
@@ -225,13 +351,26 @@ def main():
             print(f"{path}: 替换 {count} 处", file=sys.stderr)
         if args.write and count:
             if str(path) != "<stdin>":
-                backup = path.with_suffix(path.suffix + ".bak")
-                backup.write_text(text, encoding="utf-8")
+                # 备份必须在写入**之前**落盘（存的是替换前原文）；写备份失败就不改动源文件，
+                # 避免“改了却无法还原”。
+                if backup_dir is not None:
+                    written_backups.append(write_backup(backup_dir, path, text))
                 path.write_text(sanitized, encoding="utf-8")
         elif not args.check and count:
             if str(path) != "<stdin>":
                 print(sanitized)
     print(f"共替换 {total} 处，涉及 {changed_files} 个文件；映射 {len(mappings)} 位玩家、{len(alias_to_label)} 个别名", file=sys.stderr)
+    if written_backups:
+        print(
+            f"已把 {len(written_backups)} 份**含未脱敏原文**的还原点写到 {backup_dir}"
+            "（该目录已被 .gitignore 忽略，不会被 git add -A 收走）：",
+            file=sys.stderr,
+        )
+        for backup in written_backups:
+            print(f"  {backup}", file=sys.stderr)
+        print("确认无误后请自行删除这些还原点。", file=sys.stderr)
+    elif args.write and changed_files:
+        print("未保留还原点（--no-backup）。", file=sys.stderr)
     if args.check and total:
         return 1
     return 0

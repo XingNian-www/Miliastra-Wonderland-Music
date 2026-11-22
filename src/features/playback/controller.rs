@@ -296,6 +296,17 @@ pub(crate) enum PlaybackVerification {
         status: PlayerStatus,
         message: String,
     },
+    /// 派发已回执、但**起播即时失败**（引擎在同一轮状态读取里就报了 `failure_code`）。
+    ///
+    /// 必须是枚举变体而不是 `Err`：`Err` 在 `anyhow::Error` 里丢掉类型，上层只能靠
+    /// `downcast_ref::<PlayerControlFailure>()` 猜；猜不中就把「该音源不可用」误判成
+    /// 「队列阻塞」（保留队首、不换源）。这里把分类结论显式带上来：
+    ///
+    /// - `retryable = false`：音源级失败（404 / 解码失败 / 源站拒绝）。换平台可能救回来，
+    ///   上层应按「音源不可用」处理（换源，换不动才判项目级失败）；
+    /// - `retryable = true`：可重试或换源无意义（限流、超时、音频输出设备丢失、
+    ///   引擎级 generic 失败）。上层必须保留队首等待重试，**不得**换源。
+    Failed { reason: String, retryable: bool },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -310,6 +321,11 @@ pub(crate) enum PlaybackOutcome {
 
 #[derive(Clone, Debug)]
 pub(crate) struct QueueAdvanceContext {
+    /// 队列是否确实没有可推进的内容。
+    ///
+    /// 监控层传入时已把「单曲循环可重播 / 个人歌单可自动补队」折算进来：
+    /// 这两种情况下即使队列为空也仍有下一首，不能置为 `true`，否则池关闭或
+    /// 池空时控制器永远不发 `AdvanceQueue`，续播就此停摆。配置重载路径按字面传入。
     pub(crate) queue_empty: bool,
     pub(crate) has_pending_playback_task: bool,
     pub(crate) command_executing: bool,
@@ -676,7 +692,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
     fn verify_playback_started(
         &self,
         request: &PlaybackRequest,
-        _attempt: &mut PlaybackAttempt,
+        attempt: &mut PlaybackAttempt,
         initial_progress: Option<f64>,
     ) -> Result<PlaybackVerification> {
         let mut status = status_from_request(request);
@@ -692,6 +708,19 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
         // 之后才到的失败由监听循环的失败处理路径额外报错（见 workers 的播放失败回报）。
         if let Ok(current) = self.backend.status() {
             status.volume = current.volume;
+            // **运行时身份必须补上**（B07-P0-4）。
+            //
+            // `status_from_request` 只能从请求元数据拼状态，而 `runtime_identity`
+            // 是"哪个播放器运行时"的属性、请求里没有；旧实现忘了在这里补，
+            // 于是确认状态恒为空身份。下游 `inspect_player_session`
+            // （`controller.rs`「runtime_identity.is_empty() → Unknown」）与
+            // `player_session_binding`（空身份 → None）会把这次成功起播判成
+            // 「会话未确认」，恢复播放后的会话绑定因此**恒为空操作**：
+            // 续播点无法落库、下次观测把同一运行时当成换了会话。
+            //
+            // 身份属于运行时而不是曲目，所以**不受 `matches_request` 约束**：
+            // 刚起播的瞬间播放器可能还在报上一首，此时它的身份依然是对的。
+            status.runtime_identity = current.runtime_identity.clone();
             let matches_request = current
                 .current_track
                 .as_ref()
@@ -700,11 +729,39 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
                     current_track.track_ref.key == requested.track_ref.key
                 });
             if matches_request && !current.failure_code.trim().is_empty() {
-                anyhow::bail!(
+                // **失败必须回滚 attempt**（B07-P0-2）。
+                //
+                // play 的同步回包是"已派发"，真正的即时失败要到这次状态读取才可见；
+                // 旧实现直接 `bail!`，把状态永久留在 `Starting`：
+                // - 状态机卡死：`play_restored` 把 `Starting` 当崩溃残留清掉，
+                //   monitor 的自动出队也拿不到可判定的状态；
+                // - 阻断换源：裸 `anyhow!` 让上层
+                //   `downcast_ref::<PlayerControlFailure>()` 必然落空，
+                //   于是判成 `QueueBlockingFailure`（保留队首、不换源），
+                //   而本函数自己的注释承诺"交给上层换源"。
+                //
+                // 这里做两件**本次范围内**能做的事：
+                //
+                // 1. 恢复派发前的播放状态，让状态机不再停在 `Starting`；
+                // 2. 把这次派发记成失败，崩溃恢复不会误以为它"从未派发"。
+                //
+                // 3. 把**分类结论**随返回值一起交给上层（`PlaybackVerification::Failed`）。
+                //
+                // 这是 B07-P0-2 的后半段。之前这里 `bail!` 一个裸 `anyhow!`，
+                // 上层 `downcast_ref::<PlayerControlFailure>()` 必然落空，于是把
+                // 「该音源不可用」判成 `QueueBlockingFailure`（保留队首、不换源）——
+                // 而本函数的注释一直承诺"交给上层换源"。现在不用猜错误类型了：
+                // 变体里直接带 `retryable`，上层据此决定换源还是阻塞。
+                self.record_attempt_outcome(request, attempt.started_at_ms, false);
+                self.restore_failed_attempt(attempt, "dispatch_failed")?;
+                let reason = format!(
                     "播放器报告失败: {}: {}",
-                    current.failure_code,
-                    current.failure_message
+                    current.failure_code, current.failure_message
                 );
+                return Ok(PlaybackVerification::Failed {
+                    retryable: !immediate_failure_is_source_scoped(&current),
+                    reason,
+                });
             }
             if matches_request {
                 status.session_id = current.session_id.clone();
@@ -821,6 +878,15 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             return Err(error);
         }
         let verification = self.verify_playback_started(&request, &mut attempt, seek_seconds)?;
+        // 起播即时失败（恢复也救不回来）：这次恢复没有发生，按失败上报给调用方。
+        // 分类结论（`retryable`）在这里没有消费者——恢复播放没有换源路径，上层
+        // 只会记一条 warn；但错误文本必须把引擎失败原因透出来，便于排查。
+        let status = match verification {
+            PlaybackVerification::Success { status, .. } => status,
+            PlaybackVerification::Failed { reason, .. } => {
+                return Err(anyhow!("恢复上次播放时起播即时失败：{reason}"));
+            }
+        };
         // 应用持久化歌词模式：引擎起播默认使用翻译，恢复时必须按上次会话的设置。
         // 明确设置（非 toggle），引擎加载中的歌词任务完成后按该模式显示。
         if let Err(error) = self.backend.set_lyrics_translation(runtime.use_translation) {
@@ -845,8 +911,7 @@ impl<B: MusicPlayerBackend, S: PlaybackStatePort> PlayerController<B, S> {
             }
         }
         // 恢复会话是新引擎会话：立即绑定，避免监控把新会话误判为 runtime 重启。
-        let PlaybackVerification::Success { status, .. } = &verification;
-        let _ = self.reconcile_player_session(&self.playback_state.snapshot()?, status)?;
+        let _ = self.reconcile_player_session(&self.playback_state.snapshot()?, &status)?;
         // 只在真正发生恢复时输出：进度是可读的秒数，不是调试结构。
         let seek_note = match seek_seconds {
             Some(seconds) => format!("从 {seconds:.0} 秒处继续"),
@@ -1905,6 +1970,10 @@ fn status_from_request(request: &PlaybackRequest) -> PlayerStatus {
         playback_rate: 1.0,
         volume: 0,
         requester: request.requester.clone(),
+        // `runtime_identity` **刻意留空在这里**：它描述的是"哪个播放器运行时"，
+        // 只有播放器自己知道。由 `verify_playback_started` 从一次状态读取里补上
+        // （见那里的注释与 B07-P0-4）；`PlaybackRequest` 没有这个字段，
+        // 在这里凭空造一个值反而会伪造会话身份。
         ..PlayerStatus::default()
     }
 }
@@ -2083,6 +2152,33 @@ fn split_title_artist(value: &str) -> (String, String) {
         return (title.trim().to_string(), artist.trim().to_string());
     }
     (text.to_string(), String::new())
+}
+
+/// 起播即时失败是否属于**音源级**（换个平台可能就能播）。
+///
+/// 只有这一类的失败才允许上层换源/拉黑；其余（限流、超时、设备丢失、引擎内部错误）
+/// 换源无意义，必须保留队首等重试，否则会把一次临时故障变成连续跳歌。
+///
+/// 判定口径与 `MusicPlayerBackend::is_track_unavailable_error` 保持一致（同一个
+/// 源站不可用概念），只是这里拿到的是 `PlayerStatus` 的 `failure_code`，没有
+/// `anyhow::Error` 可下转，所以按错误码判定：
+///
+/// - 目录/版权：`track_unavailable` / `track_vip_required` / `track_no_copyright`
+/// - 引擎流类失败（`crates/miliastra-playback` 的 ffmpeg 引擎产出）：
+///   `stream_rejected`（404/源站拒绝打开）/ `decode_failure`（解码失败）
+fn immediate_failure_is_source_scoped(status: &PlayerStatus) -> bool {
+    // 引擎自己标了「可重试」就是临时的：哪怕错误码看起来像音源问题也不换源。
+    if status.failure_retryable {
+        return false;
+    }
+    matches!(
+        status.failure_code.trim(),
+        "track_unavailable"
+            | "track_vip_required"
+            | "track_no_copyright"
+            | "stream_rejected"
+            | "decode_failure"
+    )
 }
 
 fn classify_observation(status: &PlayerStatus) -> ObservationReliability {
@@ -2639,7 +2735,9 @@ mod tests {
             .verify_playback_started(&request, &mut attempt, None)
             .unwrap();
 
-        let PlaybackVerification::Success { status, message } = result;
+        let PlaybackVerification::Success { status, message } = result else {
+            panic!("成功的起播验证必须是 Success 变体");
+        };
         assert_eq!(status.volume, 70);
         assert!(message.contains("音量70"), "message: {message}");
         assert!(!message.contains("音量0"), "message: {message}");
@@ -3195,6 +3293,183 @@ mod tests {
         assert_eq!(lyrics_mode_from_message("original"), Some(false));
         assert_eq!(lyrics_mode_from_message("ok"), None);
         assert_eq!(lyrics_mode_from_message(""), None);
+    }
+
+    /// B07-P0-2：`verify_playback_started` 命中即时失败时必须回滚 attempt。
+    ///
+    /// 旧实现直接 `bail!`，状态永久停在 `Starting`：状态机卡死（`play_restored`
+    /// 把它当崩溃残留清掉），而且裸 `anyhow!` 让上层的
+    /// `downcast_ref::<PlayerControlFailure>()` 必然落空，于是判成
+    /// `QueueBlockingFailure`——保留队首、**不换源**，与本函数注释
+    /// 「交给上层换源」正相反。
+    ///
+    /// 现在同时验证后半段：返回值是 `PlaybackVerification::Failed`，且音源级失败
+    /// 被标成**不可重试**（= 上层应换源），不再是丢类型的 `Err`。
+    #[test]
+    fn immediate_playback_failure_rolls_back_the_starting_state() {
+        let failure = PlayerStatus {
+            status: "playing".to_string(),
+            current_track: Some(test_track("miliastra://track/qqmusic/1", "目标 - 歌手")),
+            runtime_identity: "runtime-live".to_string(),
+            session_id: "session-1".to_string(),
+            generation: 3,
+            failure_code: "track_unavailable".to_string(),
+            failure_message: "音源不可用".to_string(),
+            ..PlayerStatus::default()
+        };
+        let controller = controller(FakeBackend::new(vec![failure]));
+        let request = request();
+
+        // 先建立一个"已确认播放"的前态，回滚就该回到这里。
+        controller
+            .confirm_playback_success(&request, &status("目标", &request.uri(), 1.0, 180.0))
+            .unwrap();
+        let settled = controller.playback_state.snapshot().unwrap();
+
+        let verification = controller.play_and_verify(&request).unwrap();
+        let PlaybackVerification::Failed { reason, retryable } = verification else {
+            panic!("起播即时失败必须返回 Failed 变体，而不是 Err 或 Success");
+        };
+        assert!(
+            reason.contains("播放器报告失败") && reason.contains("track_unavailable"),
+            "必须把播放器的失败原因与错误码透出来：{reason}"
+        );
+        assert!(
+            !retryable,
+            "track_unavailable 是音源级失败：必须标成不可重试，上层才会换源"
+        );
+
+        let after = controller.playback_state.snapshot().unwrap();
+        assert_ne!(
+            after.state,
+            ConfirmedPlaybackState::Starting,
+            "起播即时失败后状态不能停在 Starting，否则状态机会卡死"
+        );
+        assert_eq!(
+            after.state, settled.state,
+            "失败后应回滚到派发前确认过的状态"
+        );
+    }
+
+    /// B07-P0-2 后半段的另一半：**可重试的**起播失败不能被标成"可换源"。
+    ///
+    /// 限流/超时/设备丢失换源救不了；标成可换源会让上层连续跳歌。
+    #[test]
+    fn immediate_retryable_playback_failure_is_not_treated_as_an_unavailable_source() {
+        for (code, retryable) in [
+            ("provider_timeout", true),
+            ("provider_rate_limited", true),
+            ("engine_unavailable", true),
+            ("engine_exited", true),
+            ("playback_failed", true),
+            ("stream_rejected", false),
+            ("decode_failure", false),
+            ("track_no_copyright", false),
+        ] {
+            // 引擎自己标可重试时，即使错误码看起来像音源问题也不得换源。
+            let failure = PlayerStatus {
+                status: "playing".to_string(),
+                current_track: Some(test_track("miliastra://track/qqmusic/1", "目标 - 歌手")),
+                failure_code: code.to_string(),
+                failure_message: "失败".to_string(),
+                failure_retryable: true,
+                ..PlayerStatus::default()
+            };
+            let marked_retryable = controller(FakeBackend::new(vec![failure]));
+            let verification = marked_retryable.play_and_verify(&request()).unwrap();
+            let PlaybackVerification::Failed {
+                retryable: actual, ..
+            } = verification
+            else {
+                panic!("{code}: 起播即时失败必须返回 Failed 变体");
+            };
+            assert!(
+                actual,
+                "{code}: 引擎标记可重试的失败不得被当作音源不可用（否则会连续换源跳歌）"
+            );
+            // 引擎没标可重试时按错误码分类。
+            let failure = PlayerStatus {
+                status: "playing".to_string(),
+                current_track: Some(test_track("miliastra://track/qqmusic/1", "目标 - 歌手")),
+                failure_code: code.to_string(),
+                failure_message: "失败".to_string(),
+                ..PlayerStatus::default()
+            };
+            let unmarked = controller(FakeBackend::new(vec![failure]));
+            let verification = unmarked.play_and_verify(&request()).unwrap();
+            let PlaybackVerification::Failed {
+                retryable: actual, ..
+            } = verification
+            else {
+                panic!("{code}: 起播即时失败必须返回 Failed 变体");
+            };
+            assert_eq!(
+                actual, retryable,
+                "{code}: 分类错误（expected retryable={retryable}）"
+            );
+        }
+    }
+
+    /// B07-P0-4：验证后构造的状态必须带上 `runtime_identity`。
+    ///
+    /// 旧实现用 `..PlayerStatus::default()` 收尾，身份恒为空串；下游
+    /// `inspect_player_session` 对空身份一律返回 `Unknown`，
+    /// `player_session_binding` 也返回 None —— 恢复播放后的会话绑定成了空操作。
+    #[test]
+    fn verified_playback_status_carries_the_runtime_identity() {
+        let live = PlayerStatus {
+            status: "playing".to_string(),
+            current_track: Some(test_track("miliastra://track/qqmusic/1", "目标 - 歌手")),
+            runtime_identity: "runtime-native-A".to_string(),
+            session_id: "session-7".to_string(),
+            generation: 5,
+            volume: 42,
+            ..PlayerStatus::default()
+        };
+        let controller = controller(FakeBackend::new(vec![live]));
+        let request = request();
+        let mut attempt = controller.play_request(&request).unwrap();
+
+        let verification = controller
+            .verify_playback_started(&request, &mut attempt, None)
+            .unwrap();
+        let PlaybackVerification::Success { status, .. } = verification else {
+            panic!("成功起播必须返回 Success 变体");
+        };
+        assert_eq!(
+            status.runtime_identity, "runtime-native-A",
+            "确认状态必须带上播放器运行时身份，否则会话绑定恒为空操作"
+        );
+        assert_eq!(status.session_id, "session-7");
+        assert_eq!(status.generation, 5);
+        assert_eq!(status.volume, 42, "音量仍应取播放器实际值");
+        // 确认状态要能被**下游会话对账**直接接受：这正是空身份会打断的那一步。
+        // （绑定本身发生在观测循环的 `reconcile_player_session`，
+        //  `confirm_playback_success` 不负责绑定会话。）
+        assert!(
+            controller.player_session_binding(&status).is_some(),
+            "确认状态必须能生成会话绑定；空身份会在这里返回 None，绑定成为空操作"
+        );
+        let runtime = controller.playback_state.snapshot().unwrap();
+        assert_eq!(
+            controller
+                .inspect_player_session(&runtime, &status)
+                .unwrap(),
+            SessionReconciliation::Bound,
+            "有身份的确认状态应被接受为新会话（空身份会返回 Unknown）"
+        );
+        controller
+            .reconcile_player_session(&runtime, &status)
+            .unwrap();
+        assert!(
+            controller
+                .playback_state
+                .session_binding
+                .lock()
+                .unwrap()
+                .is_some(),
+            "对账之后必须真的把引擎会话绑上"
+        );
     }
 
     #[test]

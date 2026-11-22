@@ -127,33 +127,68 @@ pub(super) struct AiModelsOverrides {
 }
 
 /// 把面板当前值合并到已保存配置上；字段缺失表示沿用已保存值。
+///
+/// 返回 `true` 表示"换了地址且没给新 key"，已把已保存的明文 `api_key` 清空，
+/// 调用方应提示用户重新填写（与 [`tts_catalog_overrides`] 同一条不变量：
+/// 换 endpoint 时不能把已保存的 key 发到新地址）。
 pub(super) fn apply_ai_model_overrides(
     config: &mut crate::config::ai::AiConfig,
     overrides: AiModelsOverrides,
-) {
-    if let Some(value) = overrides.provider {
+) -> bool {
+    let AiModelsOverrides {
+        provider,
+        endpoint,
+        responses_endpoint,
+        api_key,
+        http_proxy,
+        wire_api,
+    } = overrides;
+    // 先算"地址是否真的变了"，再改 config：只要 endpoint / responses_endpoint /
+    // http_proxy 中任一提交了与已保存值不同的地址，就不能复用已保存的明文密钥，
+    // 否则一条 `{"endpoint":"http://attacker"}` 就能把 `ai.api_key` 发到任意外部地址。
+    // 与已保存值相同（面板每次都会回传当前值）不算换地址，保持原行为。
+    let address_changed = endpoint
+        .as_deref()
+        .is_some_and(|value| value != config.endpoint)
+        || responses_endpoint
+            .as_deref()
+            .is_some_and(|value| value != config.responses_endpoint)
+        || http_proxy
+            .as_deref()
+            .is_some_and(|value| value != config.http_proxy);
+    if let Some(value) = provider {
         config.provider = value;
     }
-    if let Some(value) = overrides.endpoint {
+    if let Some(value) = endpoint {
         config.endpoint = value;
     }
-    if let Some(value) = overrides.responses_endpoint {
+    if let Some(value) = responses_endpoint {
         config.responses_endpoint = value;
     }
-    if let Some(value) = overrides.api_key {
-        // 面板回传的 secret 掩码不是真实密钥：视为“沿用已保存值”，
-        // 否则会把 •••••• 当 key 发给上游，得到 500「内部错误」。
-        if value.trim() != crate::config::SECRET_MASK {
-            config.api_key = value;
+    let mut dropped_saved_key = false;
+    // 面板回传的 secret 掩码不是真实密钥：视为“沿用已保存值”，
+    // 否则会把 •••••• 当 key 发给上游，得到 500「内部错误」。
+    match api_key.filter(|value| value.trim() != crate::config::SECRET_MASK) {
+        Some(value) => config.api_key = value,
+        // 换地址且请求没给新 key：明确清空，宁可失败也不把明文密钥发往新地址。
+        None if address_changed => {
+            dropped_saved_key = !config.api_key.trim().is_empty();
+            config.api_key.clear();
         }
+        None => {}
     }
-    if let Some(value) = overrides.http_proxy {
+    if let Some(value) = http_proxy {
         config.http_proxy = value;
     }
-    if let Some(value) = overrides.wire_api {
+    if let Some(value) = wire_api {
         config.wire_api = value;
     }
+    dropped_saved_key
 }
+
+/// 换了地址却没给新 key 时给用户的提示（响应与日志共用，避免两处措辞漂移）。
+const API_KEY_REFILL_HINT: &str =
+    "；接口地址已变更，未复用已保存的 API Key，请重新填写 API Key 后重试";
 
 /// POST /ai/models：用面板当前值（未保存也算）拉取模型列表。
 pub(super) fn ai_models_body_route(
@@ -168,9 +203,23 @@ pub(super) fn ai_models_body_route(
         .load_full()
         .map_err(internal_error)?
         .ai;
-    apply_ai_model_overrides(&mut config, overrides);
-    let models = crate::config::ai::fetch_models(&config).map_err(model_list_error)?;
-    serde_json::to_string(&json!({ "models": models })).map_err(internal_error)
+    let dropped_saved_key = apply_ai_model_overrides(&mut config, overrides);
+    if dropped_saved_key {
+        log::info!("AI 模型列表：接口地址已变更，未复用已保存的 API Key，需要重新填写");
+    }
+    let models = crate::config::ai::fetch_models(&config).map_err(|error| {
+        let mut app_error = model_list_error(error);
+        if dropped_saved_key {
+            app_error.message.push_str(API_KEY_REFILL_HINT);
+        }
+        app_error
+    })?;
+    serde_json::to_string(&json!({
+        "models": models,
+        // 换地址后没有可用 key：面板据此提示用户重新填写，而不是以为接口挂了。
+        "needs_api_key": dropped_saved_key,
+    }))
+    .map_err(internal_error)
 }
 
 /// GET /tts/models：用已保存的 tts 配置拉 fish 音色列表 + TTS 模型 fallback。
@@ -321,16 +370,34 @@ pub(super) fn apply_ai_vision_status_overrides(
     ai_chat: &mut crate::features::ai_chat::AiChatConfig,
     overrides: AiVisionStatusOverrides,
 ) -> Option<String> {
-    if let Some(value) = overrides.provider {
+    let AiVisionStatusOverrides {
+        model,
+        provider,
+        endpoint,
+        api_key,
+    } = overrides;
+    // 先算"地址是否真的变了"，再改 ai：换地址就不能复用已保存的明文 key。
+    let address_changed = endpoint
+        .as_deref()
+        .is_some_and(|value| value != ai.endpoint);
+    if let Some(value) = provider {
         ai.provider = value;
     }
-    if let Some(value) = overrides.endpoint {
+    if let Some(value) = endpoint {
         ai.endpoint = value;
     }
-    if let Some(value) = overrides.api_key {
-        ai.api_key = value;
+    // 掩码和空串都表示"面板没给新 key"，只能沿用已保存值：
+    // 把 •••••• 当真实密钥去探测能力，必然 401，再被误报成"不支持识图"。
+    match api_key.filter(|value| {
+        let trimmed = value.trim();
+        !trimmed.is_empty() && trimmed != crate::config::SECRET_MASK
+    }) {
+        Some(value) => ai.api_key = value,
+        // 换地址且没给新 key：明确清空，宁可探测失败也不把明文密钥发往新地址。
+        None if address_changed => ai.api_key.clear(),
+        None => {}
     }
-    overrides.model.map(|model| {
+    model.map(|model| {
         ai_chat.vision.model = model.clone();
         ai_chat.model = model.clone();
         model
@@ -349,10 +416,16 @@ pub(super) fn ai_vision_status_body_route(
         .map_err(|_| internal_error(anyhow!("配置存储锁已损坏")))?
         .load_full()
         .map_err(internal_error)?;
+    let saved_api_key_present = !config.ai.api_key.trim().is_empty();
     let model_override =
         apply_ai_vision_status_overrides(&mut config.ai, &mut config.ai_chat, overrides);
+    // 地址变了 → 已保存的明文 key 被丢弃：要在响应里说清楚，别让面板把它当成"模型不支持识图"。
+    let needs_api_key = saved_api_key_present && config.ai.api_key.trim().is_empty();
+    if needs_api_key {
+        log::info!("AI 识图状态：接口地址已变更，未复用已保存的 API Key，需要重新填写");
+    }
     let model = model_override.unwrap_or_else(|| ai_vision_model(&config.ai_chat, &config.ai));
-    let payload = if !config.ai_chat.vision.enabled {
+    let mut payload = if !config.ai_chat.vision.enabled {
         disabled_vision_status_payload(
             &model,
             &config.ai_chat.vision.capture_scope,
@@ -374,6 +447,9 @@ pub(super) fn ai_vision_status_body_route(
             capabilities,
         )
     };
+    if needs_api_key {
+        payload["needs_api_key"] = Value::Bool(true);
+    }
     serde_json::to_string(&payload).map_err(internal_error)
 }
 
@@ -662,6 +738,120 @@ mod tests {
             },
         );
         assert_eq!(config.api_key, "new-key");
+    }
+
+    #[test]
+    fn model_overrides_clear_saved_key_when_address_changes() {
+        // 请求换了 endpoint 却没给新 key：不能把已保存的明文 key 发到新地址。
+        let mut config = crate::config::ai::AiConfig::default();
+        config.endpoint = "https://saved.example/v1/chat/completions".into();
+        config.api_key = "saved-real-key".into();
+        let dropped = apply_ai_model_overrides(
+            &mut config,
+            AiModelsOverrides {
+                endpoint: Some("http://attacker.example/v1/chat/completions".into()),
+                ..Default::default()
+            },
+        );
+        assert!(dropped, "换地址必须报告 key 已被丢弃");
+        assert_eq!(config.api_key, "", "换地址不能复用已保存的 key");
+        assert_eq!(
+            config.endpoint,
+            "http://attacker.example/v1/chat/completions"
+        );
+
+        // responses_endpoint / http_proxy 也算地址：任何一个变了都不能复用 key。
+        for overrides in [
+            AiModelsOverrides {
+                responses_endpoint: Some("http://attacker.example/v1/responses".into()),
+                ..Default::default()
+            },
+            AiModelsOverrides {
+                http_proxy: Some("http://attacker.example:8080".into()),
+                ..Default::default()
+            },
+        ] {
+            let mut config = crate::config::ai::AiConfig::default();
+            config.responses_endpoint = "https://saved.example/v1/responses".into();
+            config.http_proxy = "http://127.0.0.1:7890".into();
+            config.api_key = "saved-real-key".into();
+            let dropped = apply_ai_model_overrides(&mut config, overrides);
+            assert!(dropped);
+            assert_eq!(config.api_key, "");
+        }
+
+        // 地址没变（面板每次都会回传当前值）时保持原行为：继续沿用已保存 key。
+        let mut config = crate::config::ai::AiConfig::default();
+        config.endpoint = "https://saved.example/v1/chat/completions".into();
+        config.api_key = "saved-real-key".into();
+        let dropped = apply_ai_model_overrides(
+            &mut config,
+            AiModelsOverrides {
+                endpoint: Some("https://saved.example/v1/chat/completions".into()),
+                api_key: Some(crate::config::SECRET_MASK.into()),
+                ..Default::default()
+            },
+        );
+        assert!(!dropped);
+        assert_eq!(config.api_key, "saved-real-key");
+
+        // 换地址同时给了新 key：用新 key，不回填旧值。
+        let mut config = crate::config::ai::AiConfig::default();
+        config.endpoint = "https://saved.example/v1".into();
+        config.api_key = "saved-real-key".into();
+        let dropped = apply_ai_model_overrides(
+            &mut config,
+            AiModelsOverrides {
+                endpoint: Some("https://other.example/v1".into()),
+                api_key: Some("new-key".into()),
+                ..Default::default()
+            },
+        );
+        assert!(!dropped);
+        assert_eq!(config.api_key, "new-key");
+    }
+
+    #[test]
+    fn vision_overrides_keep_saved_key_for_mask_or_empty_and_drop_it_on_address_change() {
+        let mut ai = crate::config::ai::AiConfig::default();
+        let mut ai_chat = crate::features::ai_chat::AiChatConfig::default();
+        ai.endpoint = "https://saved.example/v1".into();
+        ai.api_key = "saved-real-key".into();
+
+        // 掩码 = 面板未修改 → 沿用已保存值，不能拿 •••••• 当 key 去探测能力。
+        let mask: AiVisionStatusOverrides = serde_json::from_value(serde_json::json!({
+            "endpoint": "https://saved.example/v1",
+            "api_key": crate::config::SECRET_MASK,
+        }))
+        .expect("mask override");
+        apply_ai_vision_status_overrides(&mut ai, &mut ai_chat, mask);
+        assert_eq!(ai.api_key, "saved-real-key", "掩码应视为沿用已存值");
+
+        // 空串 = 面板没填 → 同样沿用。
+        let empty: AiVisionStatusOverrides =
+            serde_json::from_str(r#"{"endpoint":"https://saved.example/v1","api_key":""}"#)
+                .expect("empty override");
+        apply_ai_vision_status_overrides(&mut ai, &mut ai_chat, empty);
+        assert_eq!(ai.api_key, "saved-real-key", "空串应视为沿用已存值");
+
+        // 换地址且没给新 key → 清空，不能把明文 key 发往新地址。
+        let moved: AiVisionStatusOverrides =
+            serde_json::from_str(r#"{"endpoint":"http://attacker.example/v1"}"#)
+                .expect("endpoint override");
+        apply_ai_vision_status_overrides(&mut ai, &mut ai_chat, moved);
+        assert_eq!(ai.api_key, "");
+        assert_eq!(ai.endpoint, "http://attacker.example/v1");
+
+        // 换地址同时给了新 key → 用新 key。
+        let mut ai = crate::config::ai::AiConfig::default();
+        let mut ai_chat = crate::features::ai_chat::AiChatConfig::default();
+        ai.endpoint = "https://saved.example/v1".into();
+        ai.api_key = "saved-real-key".into();
+        let fresh: AiVisionStatusOverrides =
+            serde_json::from_str(r#"{"endpoint":"https://other.example/v1","api_key":"new-key"}"#)
+                .expect("new key override");
+        apply_ai_vision_status_overrides(&mut ai, &mut ai_chat, fresh);
+        assert_eq!(ai.api_key, "new-key");
     }
 
     #[test]

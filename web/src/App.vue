@@ -60,7 +60,16 @@
 
 <script setup>
 import { computed, onBeforeUnmount, onMounted } from 'vue'
-import { NAV_GROUPS, ROUTES, applyRoute, currentRoute, navigateTo, routeFromHash } from './router.js'
+import {
+  NAV_GROUPS,
+  ROUTES,
+  applyRoute,
+  confirmLeave,
+  currentRoute,
+  hasUnsavedChanges,
+  navigateTo,
+  routeFromHash,
+} from './router.js'
 import { initTheme, loadStatus, state, toggleTheme as flipTheme } from './store.js'
 import ConfigPage from './pages/ConfigPage.vue'
 import AiConfigPage from './pages/AiConfigPage.vue'
@@ -138,19 +147,40 @@ function toggleTheme() {
   flipTheme()
 }
 
+/**
+ * 浏览器前进/后退或手改 hash：路由是 hash 驱动的，不经过 navigateTo，
+ * 所以这里补一道同样的确认；用户取消就把 hash 还原，页面不切走。
+ */
 function onHashChange() {
-  applyRoute(routeFromHash())
+  const next = routeFromHash()
+  if (next !== currentRoute.value && !confirmLeave(next)) {
+    applyRoute(currentRoute.value)
+    return
+  }
+  applyRoute(next)
+}
+
+/**
+ * 关标签/刷新：页面自己的 beforeunload 只覆盖本页，这里统一兜底
+ * （包括把脏标记写进 store 的页面，以及配置中心这类带草稿的页面）。
+ */
+function onBeforeUnload(event) {
+  if (!hasUnsavedChanges()) return
+  event.preventDefault()
+  event.returnValue = ''
 }
 
 onMounted(() => {
   initTheme()
   applyRoute(routeFromHash())
   window.addEventListener('hashchange', onHashChange)
+  window.addEventListener('beforeunload', onBeforeUnload)
   tick()
   timer = setInterval(tick, 15000)
 })
 onBeforeUnmount(() => {
   window.removeEventListener('hashchange', onHashChange)
+  window.removeEventListener('beforeunload', onBeforeUnload)
   clearInterval(timer)
 })
 </script>

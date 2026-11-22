@@ -156,6 +156,7 @@ impl StartupUi {
             request,
             ocr: self.ocr.clone(),
             config: self.config.clone(),
+            recovery: self.recovery.clone(),
         })
     }
 }
@@ -290,6 +291,10 @@ impl UiRoutine for EnterWonderlandRoutine {
             {
                 Ok(true) => {}
                 Ok(false) => {
+                    // 自动进入的前提已不成立：本次什么都不做，也**不允许收尾再动界面**。
+                    // spec 声明了 `Fixed(Primary)`，不收口就会按 Esc 打断玩家当前界面
+                    // （例如正在二级聊天/面板里）；B15-P1-6。
+                    context.force_finish();
                     return EnterWonderlandOutcome {
                         effect: EnterWonderlandEffect::Skipped,
                         residency: None,
@@ -333,22 +338,74 @@ impl UiRoutine for EnterWonderlandRoutine {
 ///
 /// `Leave` 是正式建模（不是兼容层）：不导航、不恢复入口，只如实记录离开时界面；
 /// 配合 `EntryPolicy::Passthrough` 保证包装器**不观测、不导航**。
-fn enter_game_task_spec(environment: SettleEnvironment) -> UiTaskSpec {
+fn enter_game_task_spec(environment: SettleEnvironment, startup: &StartupUiConfig) -> UiTaskSpec {
     UiTaskSpec::new(ResidencyTarget::Primary, FinishPolicy::Leave, environment)
         .with_entry(EntryPolicy::Passthrough)
-        .with_total_budget(Duration::from_secs(15))
+        .with_total_budget(enter_game_total_budget(startup))
 }
 
 /// 进千星的任务目标是一级大厅，收尾语义是 `Fixed(Primary)`；由唯一 residency
 /// 引擎验证（已在 Primary 时零动作）。
-fn enter_wonderland_task_spec(environment: SettleEnvironment) -> UiTaskSpec {
+fn enter_wonderland_task_spec(
+    environment: SettleEnvironment,
+    config: &StartupRoutineConfig,
+) -> UiTaskSpec {
     UiTaskSpec::new(
         ResidencyTarget::Primary,
         FinishPolicy::Fixed(ResidencyTarget::Primary),
         environment,
     )
     .with_entry(EntryPolicy::Passthrough)
-    .with_total_budget(Duration::from_secs(15))
+    .with_total_budget(enter_wonderland_total_budget(config))
+}
+
+/// 收尾观测与失败帧采样的最小保留时间。
+const STARTUP_FINISH_MARGIN: Duration = Duration::from_secs(5);
+
+/// `EnterGame` 包装器的总预算。
+///
+/// 旧实现硬编码 15 秒，而内层仅首次观测就可能要 `enter_game_timeout_ms`（默认
+/// 45 秒），开着「加载过久重启」时还要再加一个完整的加载阈值 + 重开周期；
+/// 一旦内层正常跑完，包装器收尾阶段拿到的剩余预算是 0，连“停在哪个界面”
+/// 都观测不到，成功进入也会被记成收尾失败（B15-P1-6）。
+fn enter_game_total_budget(startup: &StartupUiConfig) -> Duration {
+    let launch = Duration::from_millis(
+        startup
+            .launch_wait_ms
+            .saturating_mul(u64::from(startup.launch_retries).saturating_add(1)),
+    );
+    let restart_cycle = if startup.restart_game_on_loading && startup.loading_restart_timeout_ms > 0
+    {
+        // 关窗核实（5s）+ 重开后的完整观测窗口。
+        Duration::from_millis(
+            startup
+                .loading_restart_timeout_ms
+                .saturating_add(WINDOW_GONE_LIMIT.as_millis() as u64)
+                .saturating_add(startup.enter_game_timeout_ms),
+        )
+    } else {
+        Duration::ZERO
+    };
+    enter_game_budget_for(startup) + launch + restart_cycle + STARTUP_FINISH_MARGIN
+}
+
+/// `EnterWonderland` 包装器的总预算：逐阶段超时之和 + 收尾余量。
+///
+/// 内层每一段都有自己的期限（派蒙菜单、地图打开、星标定位、大厅选项、
+/// 确认弹窗、过场稳定、一级驻留）；包装器的预算必须覆盖这些上限，
+/// 否则收尾阶段会在 0 预算下观测，凭空产生一次“驻留失败”。
+fn enter_wonderland_total_budget(config: &StartupRoutineConfig) -> Duration {
+    let startup = &config.startup;
+    let observation = config.residency.timeout_ms();
+    let mut total_ms = observation.saturating_mul(2); // 派蒙菜单 + 确认按钮
+    total_ms = total_ms.saturating_add(startup.wonderland_transition_timeout_ms.saturating_mul(3));
+    total_ms = total_ms.saturating_add(startup.enter_wonderland_timeout_ms.saturating_mul(2));
+    total_ms = total_ms
+        .saturating_add(startup.wonderland_confirm_stable_timeout_ms)
+        .saturating_add(startup.final_primary_timeout_ms)
+        .saturating_add(startup.poll_ms)
+        .saturating_add(STARTUP_FINISH_MARGIN.as_millis() as u64);
+    Duration::from_millis(total_ms)
 }
 
 /// 包装器在“开始前取消/入口失败”时没有内层输出；旧调用点只认识旧 Outcome 类型，
@@ -376,9 +433,13 @@ impl UiRoutine for EnterGameTask {
     type Output = EnterGameOutcome;
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
-        let environment = SettleEnvironment::new(self.ocr.clone(), self.config.residency.clone());
+        // 进入游戏期间的收尾恢复也必须记进进程级协调器：加载卡死重启用的就是
+        // 这一份，两边各建一份会让冷却与互斥对彼此不可见。
+        let environment = SettleEnvironment::new(self.ocr.clone(), self.config.residency.clone())
+            .with_recovery(self.recovery.clone());
+        let spec = enter_game_task_spec(environment, &self.config.startup);
         let outcome = UiTask::new(
-            enter_game_task_spec(environment),
+            spec,
             EnterGameRoutine {
                 request: self.request,
                 ocr: self.ocr,
@@ -400,6 +461,7 @@ struct EnterWonderlandTask {
     request: EnterWonderland,
     ocr: OcrRuntimeHandle,
     config: StartupRoutineConfig,
+    recovery: GameRecoveryCoordinator,
 }
 
 impl sealed::UiRoutineSealed for EnterWonderlandTask {}
@@ -408,9 +470,12 @@ impl UiRoutine for EnterWonderlandTask {
     type Output = EnterWonderlandOutcome;
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
-        let environment = SettleEnvironment::new(self.ocr.clone(), self.config.residency.clone());
+        // 与进入游戏、加载卡死观测共用同一份协调器（收尾恢复也记账）。
+        let environment = SettleEnvironment::new(self.ocr.clone(), self.config.residency.clone())
+            .with_recovery(self.recovery);
+        let spec = enter_wonderland_task_spec(environment, &self.config);
         let outcome = UiTask::new(
-            enter_wonderland_task_spec(environment),
+            spec,
             EnterWonderlandRoutine {
                 request: self.request,
                 ocr: self.ocr,
@@ -480,6 +545,13 @@ fn confirm_automatic_entry(
 ///
 /// 用户要求：进入游戏只要检测到主世界就无条件停止；进入千星只要检测到千星就
 /// 无条件停止。这里直接读最近一次 UI 分类，不额外截图、不发输入。
+///
+/// 判据由调用方给出，**只有真正的目标界面才算到达**：进千星的唯一到达条件是
+/// [`UiStateKind::Primary`]（千星一级大厅）。地图（`Secondary`·千星地图）、
+/// 派蒙菜单（`MainMenu`）、模态面板（`Panel`）都是流程**中间**界面，命中它们就
+/// `force_finish` 等于在用户文档流程第 2 步宣告成功
+/// （`docs/user-guide.md:34/41`：按 M 开地图 → 点星标 → 选「千星奇域/大厅」→
+/// 点「确认」→ 停留在可继续操作的界面）。
 fn force_finish_if_kind(context: &mut UiRoutineContext<'_>, kinds: &[UiStateKind]) -> bool {
     let Some(observation) = context.latest_ui_state() else {
         return false;
@@ -496,22 +568,59 @@ fn force_finish_if_kind(context: &mut UiRoutineContext<'_>, kinds: &[UiStateKind
 
 /// 等待游戏窗口真正消失；超时返回 false。
 ///
-/// `close_window` 返回错误时不能想当然认为"已经关了"：它也可能是
-/// `PostMessage(WM_CLOSE)` 发出但窗口没在超时内退出。只有 `ensure_window`
-/// 报错才说明窗口确实不在了。
+/// `close_window` 返回成功只代表“关闭请求已发出”，窗口可能要几十到几百毫秒
+/// 才从系统里消失。若不核实就调用 `ensure_game_window`，会直接复用旧窗口并
+/// 返回成功——重启实际没发生，却消耗掉了唯一一次重开预算（B15-P1-7）。
+///
+/// 等待必须**可取消**：这里占着 UI 例程和扫描租约，用 `std::thread::sleep`
+/// 会让取消请求一直压到超时之后。
 fn wait_game_window_gone(
     context: &mut UiRoutineContext<'_>,
-    _config: &StartupRoutineConfig,
+    limit: Duration,
 ) -> Result<bool, UiRoutineFailure> {
-    const WINDOW_GONE_WAIT_MS: u64 = 5_000;
-    let deadline = Instant::now() + Duration::from_millis(WINDOW_GONE_WAIT_MS);
+    let deadline = Instant::now() + limit;
     while Instant::now() < deadline {
         if context.device().ensure_window().is_err() {
             return Ok(true);
         }
-        std::thread::sleep(Duration::from_millis(200));
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let step = remaining
+            .min(Duration::from_millis(200))
+            .max(Duration::from_millis(1));
+        wait_ms(
+            context,
+            step.as_millis() as u64,
+            "wait_restart_window_gone",
+            InputCertainty::AfterInputUnknown,
+        )?;
     }
     Ok(context.device().ensure_window().is_err())
+}
+
+/// 等待旧窗口消失的最长时间；超时即放弃这次重启（不消耗重开预算）。
+const WINDOW_GONE_LIMIT: Duration = Duration::from_secs(5);
+
+/// 关掉旧游戏窗口 → 核实它真的消失 → 重新拉起。
+///
+/// 三步必须**无条件**按顺序执行：`close_window` 的返回值不代表窗口已消失，
+/// 只代表关闭请求已送出。缺少核实就会复用濒死旧窗口（假重启，B15-P1-7）。
+fn restart_game_window(
+    context: &mut UiRoutineContext<'_>,
+    config: &StartupRoutineConfig,
+    window_gone_limit: Duration,
+) -> Result<(), UiRoutineFailure> {
+    if let Err(error) = context.device().close_window() {
+        log::warn!("加载过久重启时关闭游戏窗口失败，继续核实窗口是否已消失：{error:#}");
+    }
+    if !wait_game_window_gone(context, window_gone_limit)? {
+        return Err(UiRoutineFailure::new(
+            InputCertainty::AfterInputUnknown,
+            "restart_game_on_loading_unavailable",
+            "界面卡在加载，但关闭游戏后窗口仍然存在；继续重开会复用旧进程（等于没有重启），已放弃自动重启",
+        ));
+    }
+    // 与首次启动同一路径：开着外部聊天源时由桥重新创建进程并注入 DLL。
+    ensure_game_window(context, config)
 }
 
 /// 「进入游戏」阶段的观测预算。
@@ -519,18 +628,21 @@ fn wait_game_window_gone(
 /// 平时就是 `enter_game_timeout_ms`；开启「加载过久重启」时至少要能看到
 /// 加载阈值那一刻，否则判定条件永远不成立（见调用处注释）。
 fn enter_game_budget(config: &StartupRoutineConfig) -> Duration {
-    let base = config.startup.enter_game_timeout_ms;
-    if !config.startup.restart_game_on_loading || config.startup.loading_restart_timeout_ms == 0 {
+    enter_game_budget_for(&config.startup)
+}
+
+fn enter_game_budget_for(startup: &StartupUiConfig) -> Duration {
+    let base = startup.enter_game_timeout_ms;
+    if !startup.restart_game_on_loading || startup.loading_restart_timeout_ms == 0 {
         return Duration::from_millis(base);
     }
     // 首段必须**严格活过**「加载阈值 + 一次轮询」：只取到阈值那一刻会与循环
     // 条件 `Instant::now() < deadline` 打平，判定永远赶不上触发
     //（默认 45s 期限 vs 60s 阈值时更极端：连阈值都到不了）。
     // 用户明确要求默认阈值为 60 秒，因此这个阶段的观测窗口必须容得下它。
-    let needed = config
-        .startup
+    let needed = startup
         .loading_restart_timeout_ms
-        .saturating_add(config.startup.poll_ms.max(1));
+        .saturating_add(startup.poll_ms.max(1));
     Duration::from_millis(base.max(needed))
 }
 
@@ -627,22 +739,11 @@ fn execute_enter_game(
                     );
                     // 关闭失败不算致命：加载卡死的常见形态正是游戏已经崩溃、
                     // 窗口不复存在，那种情况下"关不掉"恰恰等于"已经关了"。
-                    // 但这必须**核实**：若窗口其实还在，`ensure_game_window`
-                    // 会直接复用旧窗口并返回成功，于是"重启"实际没发生，
-                    // 却已经消耗掉唯一一次重开机会（假重启）。
-                    if let Err(error) = context.device().close_window() {
-                        log::warn!("加载过久重启时关闭游戏窗口失败，核实窗口是否已消失：{error:#}");
-                        let gone = wait_game_window_gone(context, config)?;
-                        if !gone {
-                            return Err(UiRoutineFailure::new(
-                                InputCertainty::AfterInputUnknown,
-                                "restart_game_on_loading_unavailable",
-                                "界面卡在加载，但关闭游戏失败且窗口仍然存在；继续重开会复用旧进程（等于没有重启），已放弃自动重启",
-                            ));
-                        }
-                    }
-                    // 与首次启动同一路径：开着外部聊天源时由桥重新创建进程并注入 DLL。
-                    ensure_game_window(context, config)?;
+                    // 但**无论 close_window 返回什么**都必须核实窗口真的消失：
+                    // 它只代表关闭请求已发出；若窗口还在，`ensure_game_window`
+                    // 会直接复用旧进程并返回成功，于是"重启"实际没发生，
+                    // 却已经消耗掉唯一一次重开机会（假重启，B15-P1-7）。
+                    restart_game_window(context, config, WINDOW_GONE_LIMIT)?;
                     context
                         .device()
                         .focus(config.residency.after_activate_ms)
@@ -856,15 +957,9 @@ fn execute_enter_wonderland(
         .device()
         .focus(config.residency.after_activate_ms)
         .map_err(|error| before_input_failure("focus_wonderland_window", error))?;
-    // 已经在千星（任意千星界面）就直接完成，不再按 M / 点星标 / 确认。
-    if force_finish_if_kind(
-        context,
-        &[
-            UiStateKind::MainMenu,
-            UiStateKind::Secondary,
-            UiStateKind::Panel,
-        ],
-    ) {
+    // 已经在千星**一级大厅**才直接完成：地图/派蒙菜单/面板都是流程中间界面，
+    // 在那里强制完成等于把「按 M 打开地图」当成进千星成功（`docs/user-guide.md:41`）。
+    if force_finish_if_kind(context, &[UiStateKind::Primary]) {
         return Ok(());
     }
     wait_for_paimon_menu(context, config)?;
@@ -887,14 +982,9 @@ fn execute_enter_wonderland(
     // 所以「世界判据由真变假」就是地图已开的充分可观测证据。
     // （第 71 节也试过为提瓦特地图单独建区域/二维统计判据，全部过拟合失败，见该节。）
     wait_for_wonderland_map_open(context, config)?;
-    if force_finish_if_kind(
-        context,
-        &[
-            UiStateKind::MainMenu,
-            UiStateKind::Secondary,
-            UiStateKind::Panel,
-        ],
-    ) {
+    // 地图刚打开时若分类器已经报一级（地图没盖住大厅），才算已到达；地图本身
+    // （`Secondary`/千星地图）不是到达证据。
+    if force_finish_if_kind(context, &[UiStateKind::Primary]) {
         return Ok(());
     }
 
@@ -940,14 +1030,8 @@ fn execute_enter_wonderland(
             )
         })?;
     *goal_attempted = true;
-    if force_finish_if_kind(
-        context,
-        &[
-            UiStateKind::MainMenu,
-            UiStateKind::Secondary,
-            UiStateKind::Panel,
-        ],
-    ) {
+    // 点了星标之后只有落到一级大厅才算成功；侧栏/确认弹窗仍要继续走完。
+    if force_finish_if_kind(context, &[UiStateKind::Primary]) {
         return Ok(());
     }
     wait_template_absent(
@@ -1537,7 +1621,9 @@ mod tests {
 
     use crate::config::AppConfig;
     use crate::runtime::ocr::{OcrDevice, OcrLine, OcrRuntime};
-    use crate::runtime::ui::{UiDevice, UiRuntime};
+    use crate::runtime::ui::{
+        UiDevice, UiRuntime, UiStateClassification, UiStateClassifier, execute_routine_for_test,
+    };
     use crate::ui::routines::friend_delivery::FriendDeliveryRoutineConfig;
     use anyhow::Result;
     use image::DynamicImage;
@@ -1637,7 +1723,7 @@ mod tests {
     /// 循环先到 45 秒就退出，功能即使打开也永不触发。
     #[test]
     fn loading_restart_budget_covers_the_threshold() {
-        let app = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let app = crate::config::bundled_config();
         let mut config = test_startup_config(&app);
         config.startup.restart_game_on_loading = true;
         config.startup.loading_restart_timeout_ms = 60_000;
@@ -1654,7 +1740,7 @@ mod tests {
     /// 关闭该功能时预算保持原样，不影响既有「每阶段一分钟」的分配。
     #[test]
     fn loading_restart_budget_is_untouched_when_disabled() {
-        let app = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let app = crate::config::bundled_config();
         let mut config = test_startup_config(&app);
         config.startup.restart_game_on_loading = false;
         config.startup.loading_restart_timeout_ms = 60_000;
@@ -1665,7 +1751,12 @@ mod tests {
 
     #[test]
     fn enter_wonderland_accepts_a_paimon_only_primary_screen() {
-        let app = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        if crate::test_support::corpus::skip_without_corpus(
+            "enter_wonderland_accepts_a_paimon_only_primary_screen",
+        ) {
+            return;
+        }
+        let app = crate::config::bundled_config();
         let mut config = test_startup_config(&app);
         config.startup.enter_wonderland_timeout_ms = 1;
         config.startup.wonderland_map_star_retries = 1;
@@ -1714,7 +1805,12 @@ mod tests {
 
     #[test]
     fn automatic_entry_skips_both_actions_when_the_screen_changed() {
-        let app = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        if crate::test_support::corpus::skip_without_corpus(
+            "automatic_entry_skips_both_actions_when_the_screen_changed",
+        ) {
+            return;
+        }
+        let app = crate::config::bundled_config();
         let config = test_startup_config(&app);
         let keys = Arc::new(Mutex::new(Vec::new()));
         // 真实过场（暗色加载屏）帧：游戏还在加载，既没有"点击进入"文案，
@@ -1753,7 +1849,12 @@ mod tests {
 
     #[test]
     fn entering_game_finishes_in_the_overworld_without_claiming_chat_residency() {
-        let app = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        if crate::test_support::corpus::skip_without_corpus(
+            "entering_game_finishes_in_the_overworld_without_claiming_chat_residency",
+        ) {
+            return;
+        }
+        let app = crate::config::bundled_config();
         let mut config = test_startup_config(&app);
         config.startup.enter_game = true;
         // 真实提瓦特大世界帧：进入游戏后的落地画面，派蒙图标在左上角。
@@ -1777,6 +1878,66 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.effect(), &EnterGameEffect::Entered);
         assert!(keys.lock().unwrap().is_empty());
+        ui_runtime.shutdown().unwrap();
+        ocr_runtime.shutdown().unwrap();
+    }
+
+    /// B15-P0-2：进千星时**只有**一级大厅（`Primary`）算到达。
+    ///
+    /// 用一帧"界面还停在地图、不是一级大厅"的场景驱动真实入口
+    /// `execute_enter_wonderland`：旧判据把 `Secondary`（地图）当到达 →
+    /// 立即 `force_finish` 并返回 `Ok`（对外报 `Entered`）；新判据必须继续走流程，
+    /// 最终如实失败，绝不把中间界面当成"已进入千星"。
+    #[test]
+    fn wonderland_map_alone_does_not_count_as_arrival() {
+        if crate::test_support::corpus::skip_without_corpus(
+            "wonderland_map_alone_does_not_count_as_arrival",
+        ) {
+            return;
+        }
+        let app = crate::config::bundled_config();
+        let mut config = test_startup_config(&app);
+        config.startup.enter_wonderland_timeout_ms = 1;
+        config.startup.wonderland_map_star_retries = 1;
+        config.startup.wonderland_map_star_retry_ms = 1;
+        config.startup.final_primary_timeout_ms = 1;
+
+        // 真实提瓦特地图帧：地图盖住了大世界 HUD，既不是一级大厅也不是主世界。
+        let map =
+            image::open("tests/fixtures/ui/map-teyvat-1920x1080.png").expect("打开真实地图帧失败");
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let ui_runtime = UiRuntime::start(
+            PaimonOnlyDevice {
+                frame: map,
+                after_m: None,
+                keys: keys.clone(),
+            },
+            4,
+        )
+        .unwrap();
+        let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
+
+        let outcome = ui_runtime
+            .handle()
+            .submit(EnterWonderlandRoutine {
+                request: EnterWonderland::default(),
+                ocr: ocr_runtime.handle(),
+                config,
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        assert!(
+            !matches!(outcome.effect(), EnterWonderlandEffect::Entered),
+            "地图帧不是千星一级大厅，绝不能报已进入千星：{:?}",
+            outcome.effect()
+        );
+        assert!(
+            matches!(outcome.effect(), EnterWonderlandEffect::Failed(_)),
+            "该场景没有千星家园模板，必须如实失败：{:?}",
+            outcome.effect()
+        );
         ui_runtime.shutdown().unwrap();
         ocr_runtime.shutdown().unwrap();
     }
@@ -1806,10 +1967,11 @@ mod tests {
     /// 进千星的目标是一级，但实际等待/失败仍由例程的 wait_for_primary 负责。
     #[test]
     fn startup_tasks_declare_leave_and_primary_finish() {
-        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let app = crate::config::bundled_config();
+        let config = test_startup_config(&app);
         let environment =
-            SettleEnvironment::without_ocr(FriendDeliveryRoutineConfig::from_app(&config));
-        let game = enter_game_task_spec(environment.clone());
+            SettleEnvironment::without_ocr(FriendDeliveryRoutineConfig::from_app(&app));
+        let game = enter_game_task_spec(environment.clone(), &config.startup);
         assert_eq!(game.entry, EntryPolicy::Passthrough);
         assert_eq!(
             game.finish,
@@ -1817,12 +1979,36 @@ mod tests {
             "EnterGame 结束后没有可回入口，必须正式声明 Leave"
         );
 
-        let wonderland = enter_wonderland_task_spec(environment);
+        let wonderland = enter_wonderland_task_spec(environment, &config);
         assert_eq!(wonderland.entry, EntryPolicy::Passthrough);
         assert_eq!(
             wonderland.finish,
             FinishPolicy::Fixed(ResidencyTarget::Primary),
             "进千星固定收尾到 Primary，由唯一引擎验证（已在 Primary 时零动作）"
+        );
+
+        // B15-P1-6：预算必须覆盖内层各阶段超时，不能再是 15 秒硬编码。
+        assert!(
+            game.total_budget >= Duration::from_millis(config.startup.enter_game_timeout_ms),
+            "EnterGame 预算必须容得下首次观测：{:?}",
+            game.total_budget
+        );
+        assert!(
+            game.total_budget > Duration::from_secs(15),
+            "旧的 15 秒预算会让收尾阶段没有剩余时间：{:?}",
+            game.total_budget
+        );
+        assert!(
+            wonderland.total_budget
+                >= Duration::from_millis(config.startup.enter_wonderland_timeout_ms),
+            "EnterWonderland 预算必须容得下各阶段超时：{:?}",
+            wonderland.total_budget
+        );
+        assert!(
+            wonderland.total_budget
+                >= Duration::from_millis(config.startup.final_primary_timeout_ms),
+            "EnterWonderland 预算必须容得下最后的一级驻留等待：{:?}",
+            wonderland.total_budget
         );
     }
 
@@ -1830,7 +2016,12 @@ mod tests {
     /// 与例程自身完全一致（这里只有一次 M）。
     #[test]
     fn wrapped_wonderland_failure_keeps_the_routine_input_log() {
-        let app = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        if crate::test_support::corpus::skip_without_corpus(
+            "wrapped_wonderland_failure_keeps_the_routine_input_log",
+        ) {
+            return;
+        }
+        let app = crate::config::bundled_config();
         let mut config = test_startup_config(&app);
         config.startup.enter_wonderland_timeout_ms = 1;
         config.startup.wonderland_map_star_retries = 1;
@@ -1872,5 +2063,164 @@ mod tests {
         );
         ui_runtime.shutdown().unwrap();
         ocr_runtime.shutdown().unwrap();
+    }
+
+    // ---- B15-P1-6 / P1-7：跳过不收尾、重启必须核实 ----
+
+    struct AlwaysSecondaryClassifier;
+
+    impl UiStateClassifier for AlwaysSecondaryClassifier {
+        fn classify(&mut self, _image: &DynamicImage) -> Result<UiStateClassification> {
+            Ok(UiStateClassification::new(
+                UiStateKind::Secondary,
+                "secondary:chat",
+            ))
+        }
+    }
+
+    /// `Skipped` 表示“本次不执行进入千星”，收尾绝不能因为 spec 的
+    /// `Fixed(Primary)` 去按 Esc 关闭玩家当前界面。
+    ///
+    /// 旧实现只在没有状态分类器时碰巧零输入（settle 在首帧报错）；生产环境
+    /// 配有分类器，会真的发导航输入，所以这里必须显式装分类器。
+    #[test]
+    fn skipped_enter_wonderland_does_not_touch_the_current_screen() {
+        if crate::test_support::corpus::skip_without_corpus(
+            "skipped_enter_wonderland_does_not_touch_the_current_screen",
+        ) {
+            return;
+        }
+        let app = crate::config::bundled_config();
+        let config = test_startup_config(&app);
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let ui_runtime = UiRuntime::start_with_state_classifier(
+            PaimonOnlyDevice {
+                // 过场帧：既没有大世界顶栏锚点，也没有“点击进入”文案 ⇒ Skipped。
+                frame: image::open("tests/fixtures/ui/loading-dark-1920x1080.jpg")
+                    .expect("打开真实过场帧失败"),
+                after_m: None,
+                keys: keys.clone(),
+            },
+            4,
+            AlwaysSecondaryClassifier,
+            2,
+        )
+        .unwrap();
+        let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
+        let startup = StartupUi::new(ui_runtime.handle(), ocr_runtime.handle(), config);
+
+        let outcome = startup
+            .submit_enter_wonderland(EnterWonderland {
+                require_overworld: true,
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+
+        assert_eq!(outcome.effect(), &EnterWonderlandEffect::Skipped);
+        assert!(
+            keys.lock().unwrap().is_empty(),
+            "Skipped 之后不允许任何收尾导航按键，实际：{:?}",
+            keys.lock().unwrap()
+        );
+        ui_runtime.shutdown().unwrap();
+        ocr_runtime.shutdown().unwrap();
+    }
+
+    struct StickyWindowDevice {
+        window_alive: bool,
+        ensure_calls: Arc<Mutex<u32>>,
+    }
+
+    impl UiDevice for StickyWindowDevice {
+        fn capture(&mut self) -> Result<DynamicImage> {
+            Ok(DynamicImage::new_rgba8(8, 8))
+        }
+
+        fn ensure_window(&mut self) -> Result<()> {
+            *self.ensure_calls.lock().unwrap() += 1;
+            if self.window_alive {
+                Ok(())
+            } else {
+                anyhow::bail!("game window is gone")
+            }
+        }
+
+        fn close_window(&mut self) -> Result<()> {
+            // 关闭请求成功，但窗口没有立刻从系统里消失（假重启的典型形态）。
+            Ok(())
+        }
+    }
+
+    struct RestartWindowOnly {
+        config: StartupRoutineConfig,
+        limit: Duration,
+    }
+
+    impl sealed::UiRoutineSealed for RestartWindowOnly {}
+
+    impl UiRoutine for RestartWindowOnly {
+        type Output = std::result::Result<(), UiRoutineFailure>;
+
+        fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
+            restart_game_window(context, &self.config, self.limit)
+        }
+    }
+
+    /// `close_window()` 返回 `Ok(())` 只代表“关闭请求已发出”，不代表窗口已消失。
+    /// 旧实现只在返回 `Err` 时核实，于是会复用旧窗口、把假重启当成功。
+    #[test]
+    fn restart_verifies_the_old_window_is_gone_even_when_close_succeeds() {
+        let app = crate::config::bundled_config();
+        let config = test_startup_config(&app);
+        let ensure_calls = Arc::new(Mutex::new(0));
+        let execution = execute_routine_for_test(
+            StickyWindowDevice {
+                window_alive: true,
+                ensure_calls: ensure_calls.clone(),
+            },
+            None,
+            2,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            RestartWindowOnly {
+                config,
+                limit: Duration::from_millis(60),
+            },
+        );
+        assert!(
+            execution.output.is_err(),
+            "窗口仍在时不得继续重启（会把旧进程复用成“假重启”）"
+        );
+        assert!(
+            *ensure_calls.lock().unwrap() >= 2,
+            "必须多次核实窗口是否真的消失"
+        );
+    }
+
+    /// 关窗核实必须可取消：不能让取消请求压到 5 秒窗口等待之后。
+    #[test]
+    fn waiting_for_the_old_window_is_cancellable() {
+        let app = crate::config::bundled_config();
+        let config = test_startup_config(&app);
+        let started = std::time::Instant::now();
+        let execution = execute_routine_for_test(
+            StickyWindowDevice {
+                window_alive: true,
+                ensure_calls: Arc::new(Mutex::new(0)),
+            },
+            None,
+            2,
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            RestartWindowOnly {
+                config,
+                limit: Duration::from_secs(5),
+            },
+        );
+        assert!(execution.output.is_err(), "取消后不得假装重启完成");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "取消后不能继续睡满关窗等待时限：{:?}",
+            started.elapsed()
+        );
     }
 }

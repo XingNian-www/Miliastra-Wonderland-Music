@@ -7,7 +7,7 @@
       <div class="panel-body">
         <label class="config-field-label">Token</label>
         <input v-model="tokenDraft" class="config-input" type="password" placeholder="填入面板访问令牌" />
-        <p class="config-field-hint">保存在本机 cookie / localStorage；换浏览器需重新填。</p>
+        <p class="config-field-hint">保存在本机浏览器 cookie；换浏览器或清除 cookie 后需要重新填。</p>
         <div style="display:flex;gap:8px;margin-top:8px">
           <button class="btn primary" @click="saveToken">保存并测试</button>
           <button class="btn ghost" @click="clear">清除</button>
@@ -73,6 +73,6 @@ function clear() {
   clearToken()
   state.token = ''
   tokenDraft.value = ''
-  tokenMessage.value = '已清除，请到旧版设置页或重新填入'
+  tokenMessage.value = '已清除，请重新填入'
 }
 </script>

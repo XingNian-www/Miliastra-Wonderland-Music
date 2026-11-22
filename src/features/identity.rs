@@ -118,8 +118,13 @@ impl IdentityConfig {
             //
             // 只校验 remark：real_nickname 是玩家可改的昵称，允许重复；
             // display_name 是软件内标签，也允许重复。
-            if !mapping.remark.trim().is_empty() && !remarks.insert(mapping.remark.as_str()) {
-                bail!("identity.mappings 备注串重复: {}", mapping.remark);
+            //
+            // 判重键必须与解析链一致（[remark_key]）：面板粘贴/手改可能带首尾空白，
+            // 而 `resolve()` 比的是 trim 后的值。旧实现拿**未 trim 的原串**做判重键，
+            // 于是 `"甲"` 与 `"甲 "` 能同时存进配置——校验通过，但两条映射在解析时
+            // 都会命中 `"甲"`，`resolve()` 取第一条，第二条永远无法被选中。
+            if !mapping.remark.trim().is_empty() && !remarks.insert(remark_key(&mapping.remark)) {
+                bail!("identity.mappings 备注串重复: {}", mapping.remark.trim());
             }
             if !ids.insert(mapping.id) {
                 bail!("identity.mappings UUID 重复: {}", mapping.id);
@@ -128,17 +133,14 @@ impl IdentityConfig {
                 if account.uid.trim().is_empty() {
                     bail!(
                         "identity.mappings 账号 UID 不能为空（备注串: {}）",
-                        mapping.remark
+                        mapping.remark.trim()
                     );
                 }
-                if !accounts.insert((
-                    account.game.trim().to_ascii_lowercase(),
-                    account.uid.trim().to_string(),
-                )) {
+                if !accounts.insert((account_key(&account.game), account.uid.trim().to_string())) {
                     bail!(
                         "identity.mappings 账号重复: {}:{}",
-                        account.game,
-                        account.uid
+                        account.game.trim(),
+                        account.uid.trim()
                     );
                 }
             }
@@ -151,6 +153,31 @@ impl IdentityConfig {
         }
         Ok(())
     }
+}
+
+/// 备注串（游戏内昵称 / OCR 匹配键）的**唯一归一化**。
+///
+/// 校验、解析、写路径三处必须用同一个键比较，否则会出现「校验通过但永远匹配不上」
+/// 或「写路径认为不同、解析认为相同」的分叉：
+///
+/// - `validate()` 的 remark 判重；
+/// - `resolve()` / `resolve_by_any_name()` 的匹配；
+/// - `set_account_remark` / `record_real_nickname` / `ensure_identity_for_account`
+///   这些**写**路径的比对。
+///
+/// 只 trim（不折全角、不丢内部空白）：备注串是屏幕上的真实字形，内部空白与大小写
+/// 都是玩家可见差异，不能在这里抹平；首尾空白则一定是面板粘贴带来的噪音。
+fn remark_key(remark: &str) -> &str {
+    remark.trim()
+}
+
+/// 「游戏 + UID」比对里的游戏键归一化。
+///
+/// 与 `resolve_account` 完全同源（`trim().to_ascii_lowercase()`）：写路径旧实现只做
+/// `eq_ignore_ascii_case`，配置里存成 `" genshin "` 时读路径认、写路径不认，
+/// 表现为「能识别成管理员，却写不进真实昵称/备注」。
+fn account_key(game: &str) -> String {
+    game.trim().to_ascii_lowercase()
 }
 
 /// 玩家可见文案在三个来源都为空时的占位。
@@ -262,13 +289,34 @@ impl AiNamePair {
 ///
 /// 调用方用 [`IdentityAccess::remark_texts`] 提供列表；display_name/real_nickname
 /// 不在列表里，因此不会被误删。空 remark 安全跳过。
+///
+/// 实现是**单遍最长前缀扫描**：不能对结果串行 `str::replace`，否则删掉前一个
+/// 备注后残留字符会拼成新串被后续循环误删（`["XY","AB"]` + `"AXYB"` 会被清空），
+/// 也不依赖调用方预排序（`["AB","ABCD"]` 会先删短的、把长的撕成残片）。
 pub(crate) fn redact_remark_strings(text: &str, remarks: &[String]) -> String {
-    let mut result = text.to_string();
-    for remark in remarks {
-        if remark.is_empty() {
-            continue;
+    let mut needles = remarks
+        .iter()
+        .map(|remark| remark.trim())
+        .filter(|remark| !remark.is_empty())
+        .collect::<Vec<_>>();
+    if needles.is_empty() {
+        return text.trim().to_string();
+    }
+    needles.sort_by_key(|remark| std::cmp::Reverse(remark.len()));
+
+    let mut result = String::with_capacity(text.len());
+    let mut remaining = text;
+    while !remaining.is_empty() {
+        if let Some(remark) = needles
+            .iter()
+            .find(|remark| remaining.starts_with(**remark))
+        {
+            remaining = &remaining[remark.len()..];
+        } else {
+            let character = remaining.chars().next().expect("非空字符串必定包含字符");
+            result.push(character);
+            remaining = &remaining[character.len_utf8()..];
         }
-        result = result.replace(remark, "");
     }
     result.trim().to_string()
 }
@@ -439,7 +487,7 @@ impl IdentityAccess {
         config
             .mappings
             .iter()
-            .find(|mapping| mapping.remark.trim() == nickname)
+            .find(|mapping| remark_key(&mapping.remark) == nickname)
             .map(|mapping| ResolvedIdentity {
                 id: mapping.id,
                 role: mapping.role,
@@ -495,9 +543,7 @@ impl IdentityAccess {
             mapping
                 .accounts
                 .iter()
-                .any(|account| {
-                    account.game.trim().to_ascii_lowercase() == game && account.uid.trim() == uid
-                })
+                .any(|account| account_key(&account.game) == game && account.uid.trim() == uid)
                 .then(|| ResolvedIdentity {
                     id: mapping.id,
                     role: mapping.role,
@@ -557,6 +603,9 @@ impl IdentityAccess {
         } else {
             game.trim()
         };
+        // 与 `resolve_account` 同源的归一化：这里的双检必须和读路径认同一个键，
+        // 否则配置存的是 `" genshin "` 时读路径命中、写路径又插一条重复身份。
+        let game_key = account_key(game);
         if let Some(existing) = self.resolve_account(game, uid) {
             return Some(existing.id);
         }
@@ -566,7 +615,7 @@ impl IdentityAccess {
             mapping
                 .accounts
                 .iter()
-                .any(|account| account.game.eq_ignore_ascii_case(game) && account.uid.trim() == uid)
+                .any(|account| account_key(&account.game) == game_key && account.uid.trim() == uid)
         }) {
             return Some(existing.id);
         }
@@ -625,12 +674,15 @@ impl IdentityAccess {
         if nickname.is_empty() || uid.is_empty() {
             return false;
         }
+        // 写路径的游戏键必须与 `resolve_account` 同源（trim + 小写）。
+        // 旧实现只有 `eq_ignore_ascii_case`，配置里带首尾空白时读路径认、写路径不认。
+        let game_key = account_key(game);
         let mut config = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         let Some(mapping) = config.mappings.iter_mut().find(|mapping| {
             mapping
                 .accounts
                 .iter()
-                .any(|account| account.game.eq_ignore_ascii_case(game) && account.uid.trim() == uid)
+                .any(|account| account_key(&account.game) == game_key && account.uid.trim() == uid)
         }) else {
             return false;
         };
@@ -654,12 +706,13 @@ impl IdentityAccess {
         if remark.is_empty() || uid.is_empty() {
             return false;
         }
+        let game_key = account_key(game);
         let mut config = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         // 昵称必须全局唯一：已被**别人**占用就不写，避免把配置搞成非法。
         let taken_by_other = config.mappings.iter().any(|mapping| {
-            mapping.remark.trim() == remark
+            remark_key(&mapping.remark) == remark
                 && !mapping.accounts.iter().any(|account| {
-                    account.game.eq_ignore_ascii_case(game) && account.uid.trim() == uid
+                    account_key(&account.game) == game_key && account.uid.trim() == uid
                 })
         });
         if taken_by_other {
@@ -673,7 +726,7 @@ impl IdentityAccess {
             mapping
                 .accounts
                 .iter()
-                .any(|account| account.game.eq_ignore_ascii_case(game) && account.uid.trim() == uid)
+                .any(|account| account_key(&account.game) == game_key && account.uid.trim() == uid)
         }) else {
             return false;
         };
@@ -705,12 +758,13 @@ impl IdentityAccess {
         if uid.is_empty() {
             return false;
         }
+        let game_key = account_key(game);
         let mut config = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         let Some(mapping) = config.mappings.iter_mut().find(|mapping| {
             mapping
                 .accounts
                 .iter()
-                .any(|account| account.game.eq_ignore_ascii_case(game) && account.uid.trim() == uid)
+                .any(|account| account_key(&account.game) == game_key && account.uid.trim() == uid)
         }) else {
             return false;
         };
@@ -741,8 +795,11 @@ impl IdentityAccess {
 
     /// 这个字符串像不像内部键：纯数字（UID）或 UUID。
     ///
-    /// 只用于决定"能不能把未解析的名字直接展示"，不参与任何匹配。
-    fn looks_like_internal_key(name: &str) -> bool {
+    /// 只用于决定"能不能把未解析的名字直接展示/拿去搜索"，不参与任何匹配。
+    ///
+    /// `pub(crate)`：自定义流程的缺省好友目标也要用同一条判据
+    /// （不能把 UID/UUID 当搜索名），两处各写一份必然会漂移。
+    pub(crate) fn looks_like_internal_key(name: &str) -> bool {
         let name = name.trim();
         !name.is_empty()
             && (name.chars().all(|character| character.is_ascii_digit())
@@ -814,14 +871,14 @@ impl IdentityAccess {
         }
         let config = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         let mappings = config.mappings.as_slice();
-        let remark = count(mappings, |mapping| mapping.remark.trim() == name);
+        let remark = count(mappings, |mapping| remark_key(&mapping.remark) == name);
         if remark > 1 {
             return Err(());
         }
         if remark == 1 {
             return Ok(mappings
                 .iter()
-                .find(|mapping| mapping.remark.trim() == name)
+                .find(|mapping| remark_key(&mapping.remark) == name)
                 .map(Self::resolved_from_mapping));
         }
         let display = count(mappings, |mapping| mapping.display_name.trim() == name);
@@ -889,12 +946,11 @@ impl IdentityAccess {
     /// ChatBridge 的 `from.name` 是真实昵称，OCR 文本是备注串，面板回传的是显示名。
     /// 未登记的玩家没有 UUID，只能用展示名当键（既有局限）。
     pub fn memory_key(&self, name: &str) -> String {
-        self.resolve(name)
-            .or_else(|| self.resolve_by_real_nickname(name))
-            .or_else(|| self.resolve_by_display_name(name))
-            .map(|identity| identity.id.to_string())
-            // 记忆键是**键**，不是文案：未登记时必须原样保留传入的名字，
-            // 不能走展示名兜底（那会把 UID/UUID 换成占位，键就变了）。
+        self.ownership_uuid_by_name(name)
+            .map(|uuid| uuid.to_string())
+            // 记忆键是**键**，不是文案：未登记（或名字命中多条、无法确定是谁）时
+            // 必须原样保留传入的名字，不能走展示名兜底（那会把 UID/UUID 换成占位，
+            // 键就变了），也不能猜第一条（那会把两个人的记忆并到一个人头上）。
             .unwrap_or_else(|| name.to_owned())
     }
 
@@ -912,10 +968,65 @@ impl IdentityAccess {
     pub fn ownership_uuid_by_name(&self, name: &str) -> Option<Uuid> {
         // 顺序：备注串（对方改不了）→ 真实昵称（外部源的 from.name）→
         // 软件显示名（面板里手填的标签，只做最后的兜底）。
-        self.resolve(name)
-            .or_else(|| self.resolve_by_real_nickname(name))
-            .or_else(|| self.resolve_by_display_name(name))
+        self.resolve_unique_by_ownership_name(name)
             .map(|identity| identity.id)
+    }
+
+    /// 归属链的三档解析：**同一档命中多条不同身份就返回 None**。
+    ///
+    /// `identity-name-display-and-permission.md:131` 把「同一档命中多条不同身份就返回
+    /// 空表，宁可报找不到人」写成了硬规则；旧实现三个辅助函数都是 `.find()` 取第一条，
+    /// 于是两个人都叫「小明」时，第二个人的歌单/记忆/队列全部归到第一个人头上——
+    /// 这是**串号**，不是「猜错一个无关紧要的名字」。
+    ///
+    /// 只比 id：同一条身份在 `display_name` 与 `real_nickname` 各写一次不算歧义
+    /// （那本来就是同一个人）。
+    fn resolve_unique_by_ownership_name(&self, name: &str) -> Option<ResolvedIdentity> {
+        for tier in [
+            Self::resolve_by_remark_exact,
+            Self::resolve_by_real_nickname,
+            Self::resolve_by_display_name,
+        ] {
+            if let Some(identity) = tier(self, name) {
+                return Some(identity);
+            }
+        }
+        None
+    }
+
+    fn resolve_by_remark_exact(&self, name: &str) -> Option<ResolvedIdentity> {
+        if name.trim().is_empty() {
+            return None;
+        }
+        let config = self.inner.read().unwrap_or_else(PoisonError::into_inner);
+        Self::unique_in_mappings(&config.mappings, "备注串", |mapping| {
+            remark_key(&mapping.remark) == name
+        })
+    }
+
+    /// 在一档里取**唯一**命中：0 条 → None，1 条 → Some，多条不同身份 → None + 告警。
+    ///
+    /// 告警**不含任何真实标识**（不打印名字、UUID、UID）：串号判定本身已经说明
+    /// "有重名"，把它写进日志等于把重名者的身份关联记录一遍（MUST_READ §9）。
+    /// 只报这一档的名字与命中条数，够定位问题即可。
+    fn unique_in_mappings(
+        mappings: &[IdentityMapping],
+        tier: &'static str,
+        predicate: impl Fn(&IdentityMapping) -> bool,
+    ) -> Option<ResolvedIdentity> {
+        let hits: Vec<&IdentityMapping> = mappings
+            .iter()
+            .filter(|mapping| predicate(mapping))
+            .collect();
+        let first = *hits.first()?;
+        let total = hits.len();
+        if hits.iter().any(|mapping| mapping.id != first.id) {
+            log::warn!(
+                "身份归属解析遇到重名：{tier}一档命中 {total} 条身份且不属于同一个人，无法确定是谁，按「找不到人」处理（宁可报找不到人，也不把归属串给另一个人）"
+            );
+            return None;
+        }
+        Some(Self::resolved_from_mapping(first))
     }
 
     /// 由记忆键反查展示名：键是 UUID 时找对应身份，否则原样返回。
@@ -934,35 +1045,42 @@ impl IdentityAccess {
                 .to_owned();
             }
         }
+        // 映射已被删除（旧记忆/歌单仍留着 UUID 键）时不能把内部键原样回传：
+        // 它会一路进大厅/私聊文案与 AI 提示词。内部键一律折成占位名。
+        if Self::looks_like_internal_key(key) {
+            return PLAYER_NAME_PLACEHOLDER.to_owned();
+        }
         key.to_owned()
     }
 
     /// 按**软件显示名**反查身份（归属用途；不参与授权）。
+    ///
+    /// 显示名允许重名，所以这里走 [Self::unique_in_mappings]：同一档命中多条
+    /// 不同身份时返回 None（宁可解析不出来，也不猜一个人）。
     fn resolve_by_display_name(&self, name: &str) -> Option<ResolvedIdentity> {
-        if name.trim().is_empty() {
+        let name = name.trim();
+        if name.is_empty() {
             return None;
         }
         let config = self.inner.read().unwrap_or_else(PoisonError::into_inner);
-        config
-            .mappings
-            .iter()
-            .find(|mapping| mapping.display_name.trim() == name.trim())
-            .map(Self::resolved_from_mapping)
+        Self::unique_in_mappings(&config.mappings, "软件显示名", |mapping| {
+            mapping.display_name.trim() == name
+        })
     }
 
     /// 按**真实昵称**反查身份。
     ///
     /// 只用于投递层把展示名换回屏幕名；真实昵称可被玩家随意改，**不参与授权**。
+    /// 同样按「多条即无解」处理：重名时谁的展示名都不换，好过换成另一个人。
     fn resolve_by_real_nickname(&self, name: &str) -> Option<ResolvedIdentity> {
-        if name.trim().is_empty() {
+        let name = name.trim();
+        if name.is_empty() {
             return None;
         }
         let config = self.inner.read().unwrap_or_else(PoisonError::into_inner);
-        config
-            .mappings
-            .iter()
-            .find(|mapping| mapping.real_nickname.trim() == name.trim())
-            .map(Self::resolved_from_mapping)
+        Self::unique_in_mappings(&config.mappings, "真实昵称", |mapping| {
+            mapping.real_nickname.trim() == name
+        })
     }
 
     fn resolved_from_mapping(mapping: &IdentityMapping) -> ResolvedIdentity {
@@ -2076,6 +2194,144 @@ mod tests {
         assert_eq!(accounts.len(), 2);
     }
 
+    /// B06-P1-09：`validate` 的备注判重必须和 `resolve` 用同一个归一化键。
+    ///
+    /// 旧实现的判重键是**未 trim 的原串**，于是 `"甲"` 与 `"甲 "` 都能存进配置：
+    /// 校验通过，可是两条映射在解析时都命中 `"甲"`，`resolve()` 只取第一条，
+    /// 第二条永远无法被选中，权限与归属都是错的。
+    #[test]
+    fn remark_dedupe_uses_the_same_normalization_as_resolution() {
+        let padded = IdentityConfig {
+            mappings: vec![
+                mapping("甲", Uuid::from_u128(1), IdentityRole::Friend),
+                mapping("  甲  ", Uuid::from_u128(2), IdentityRole::Friend),
+            ],
+        };
+        let error = padded
+            .validate()
+            .expect_err("带首尾空白的同名备注串必须判重失败");
+        assert!(
+            error.to_string().contains("备注串重复"),
+            "报错要指向备注串重复，实际：{error}"
+        );
+
+        // 对照：只差内部空白/大小写不算重复（那是玩家可见的真实字形差异）。
+        let distinct = IdentityConfig {
+            mappings: vec![
+                mapping("甲 乙", Uuid::from_u128(1), IdentityRole::Friend),
+                mapping("甲乙", Uuid::from_u128(2), IdentityRole::Friend),
+            ],
+        };
+        distinct.validate().expect("内部空白不同不是重复");
+
+        // 单条带空白的配置既能通过校验，也能被解析到（两侧都用 remark_key）。
+        let single = IdentityConfig {
+            mappings: vec![mapping(" 甲 ", Uuid::from_u128(3), IdentityRole::Friend)],
+        };
+        single.validate().unwrap();
+        let access = IdentityAccess::new(single);
+        assert_eq!(
+            access.resolve("甲").map(|identity| identity.id),
+            Some(Uuid::from_u128(3)),
+            "存下来的空白不该影响匹配"
+        );
+    }
+
+    /// B06-P1-10：写路径比对 `account.game` 必须与 `resolve_account` 同源。
+    ///
+    /// 旧实现只有 `eq_ignore_ascii_case`，配置里存成 `" genshin "` 时
+    /// 读路径（`trim().to_ascii_lowercase()`）命中，写路径却不命中：
+    /// 表现为「能识别成这个身份，但真实昵称/备注永远写不进去」。
+    #[test]
+    fn account_write_paths_trim_the_game_like_resolution_does() {
+        let mut config = IdentityConfig::default();
+        let mut entry = mapping("abcd1234", Uuid::from_u128(21), IdentityRole::Friend);
+        entry.accounts = vec![GameAccount {
+            game: "  Genshin  ".to_string(),
+            uid: "900000001".to_string(),
+        }];
+        config.mappings.push(entry);
+        let access = IdentityAccess::new(config);
+
+        // 读路径（一直是对的）。
+        assert!(access.resolve_account("genshin", "900000001").is_some());
+
+        // 写路径：旧实现这里返回 false，配置永远停在旧值。
+        assert!(
+            access.record_real_nickname("Genshin", "900000001", "真名甲"),
+            "写真实昵称必须能命中带空白的 game 字段"
+        );
+        assert_eq!(
+            access
+                .resolve_account("genshin", "900000001")
+                .unwrap()
+                .real_nickname,
+            "真名甲"
+        );
+        assert!(
+            access.set_account_remark(" genshin ", "900000001", "新备注"),
+            "写备注必须能命中带空白的 game 字段"
+        );
+        assert_eq!(
+            access.resolve("新备注").map(|identity| identity.id),
+            Some(Uuid::from_u128(21))
+        );
+
+        // 双检复用：已经存在该 UID 时不得再插一条身份。
+        assert_eq!(
+            access.ensure_identity_for_account("genSHIN", "900000001", None),
+            Some(Uuid::from_u128(21)),
+            "自动注册的双检必须认同一个 game 键"
+        );
+        assert_eq!(access.mapping_count_for_test(), 1);
+    }
+
+    /// B06-P1-11：归属链遇到重名必须返回「找不到」，不能 `.find()` 取第一条。
+    ///
+    /// `identity-name-display-and-permission.md:131` 把「同一档命中多条不同身份就返回空表」
+    /// 写成硬规则。旧实现 `resolve_by_display_name`/`resolve_by_real_nickname` 都是
+    /// `.find()`，于是两个都叫「小明」的人，第二个人的歌单与记忆会归到第一个人头上。
+    #[test]
+    fn ambiguous_ownership_names_resolve_to_nobody_instead_of_the_first_hit() {
+        let mut first = mapping("玩家甲", Uuid::from_u128(31), IdentityRole::Friend);
+        first.display_name = "小明".to_string();
+        first.real_nickname = "真名小明".to_string();
+        let mut second = mapping("玩家乙", Uuid::from_u128(32), IdentityRole::Friend);
+        second.display_name = "小明".to_string();
+        second.real_nickname = "真名小明".to_string();
+        let config = IdentityConfig {
+            mappings: vec![first, second],
+        };
+        assert!(config.validate().is_ok(), "显示名/真实昵称允许重名");
+        let access = IdentityAccess::new(config);
+
+        // 备注串仍然唯一 → 照常解析。
+        assert_eq!(
+            access.ownership_uuid_by_name("玩家甲"),
+            Some(Uuid::from_u128(31))
+        );
+        // 重名档位 → 拒绝歧义。
+        assert_eq!(access.ownership_uuid_by_name("小明"), None);
+        assert_eq!(access.ownership_uuid_by_name("真名小明"), None);
+        // 记忆键退化成原样的名字（键不变），而不是某个人的 UUID。
+        assert_eq!(access.memory_key("小明"), "小明");
+        // 展示名同样不能猜：解析不出身份时原样返回 OCR 文本。
+        assert_eq!(access.player_name("小明", None), "小明");
+
+        // 对照：同一条身份在两个档位写同一个名字不算歧义。
+        let mut solo = mapping("玩家丙", Uuid::from_u128(33), IdentityRole::Friend);
+        solo.display_name = "小红".to_string();
+        solo.real_nickname = "小红".to_string();
+        let access = IdentityAccess::new(IdentityConfig {
+            mappings: vec![solo],
+        });
+        assert_eq!(
+            access.ownership_uuid_by_name("小红"),
+            Some(Uuid::from_u128(33)),
+            "同一个人在两档重名不是歧义"
+        );
+    }
+
     #[test]
     fn empty_uid_never_creates_identity() {
         let access = IdentityAccess::new(IdentityConfig::default());
@@ -2085,5 +2341,44 @@ mod tests {
                 .is_none()
         );
         assert_eq!(access.mapping_count_for_test(), 0);
+    }
+
+    /// B06-P1-12：映射已删除的孤儿 UUID 不能原样回传给展示位。
+    #[test]
+    fn player_name_for_key_never_returns_an_orphan_uuid() {
+        let access = IdentityAccess::new(sample_config());
+        let orphan = Uuid::from_u128(0xdead_beef);
+        assert_eq!(
+            access.player_name_for_key(&orphan.to_string()),
+            PLAYER_NAME_PLACEHOLDER,
+            "找不到映射的 UUID 必须折成占位名"
+        );
+        // 纯数字 UID 同理。
+        assert_eq!(
+            access.player_name_for_key("900000001"),
+            PLAYER_NAME_PLACEHOLDER
+        );
+        // 普通昵称（老库里按昵称存的孤儿行）仍原样返回。
+        assert_eq!(access.player_name_for_key("陌生人"), "陌生人");
+    }
+
+    /// B06-P1-12：串行 `replace` 会级联误删，且强依赖调用方预排序。
+    #[test]
+    fn redact_remark_strings_scans_once_and_never_cascades() {
+        // 删掉 "XY" 后残留的 "AB" 不能被当成第二个备注再删（旧实现会删成空串）。
+        assert_eq!(
+            redact_remark_strings("AXYB", &["XY".to_string(), "AB".to_string()]),
+            "AB"
+        );
+        // 未排序时也必须先删长串，否则长串会被短串撕成残片。
+        assert_eq!(
+            redact_remark_strings("ABCD", &["AB".to_string(), "ABCD".to_string()]),
+            ""
+        );
+        // 首尾空白备注照样生效。
+        assert_eq!(
+            redact_remark_strings("  老板 你好 ", &[" 老板 ".to_string()]),
+            "你好"
+        );
     }
 }

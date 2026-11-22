@@ -12,6 +12,7 @@ use super::friend_delivery::{
 use super::residency::{ResidencyTarget, SettleEnvironment};
 use super::transaction::{EntryPolicy, FinishPolicy, UiTask, UiTaskOutcome, UiTaskSpec};
 use crate::geometry::{Point, Rect};
+use crate::runtime::recovery::GameRecoveryCoordinator;
 use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure, UiRuntimeHandle,
     UiSubmitError, sealed,
@@ -65,11 +66,23 @@ impl ExecuteModerationOutcome {
 pub(crate) struct ModerationUi {
     runtime: UiRuntimeHandle,
     config: ModerationRoutineConfig,
+    /// 进程级共享的恢复协调器（见 [`SettleEnvironment::with_recovery`]）。
+    recovery: GameRecoveryCoordinator,
 }
 
 impl ModerationUi {
     pub(crate) fn new(runtime: UiRuntimeHandle, config: ModerationRoutineConfig) -> Self {
-        Self { runtime, config }
+        Self {
+            runtime,
+            config,
+            recovery: GameRecoveryCoordinator::default(),
+        }
+    }
+
+    /// 用进程级共享的恢复协调器替换默认实例（装配层只 `default()` 一次）。
+    pub(crate) fn with_recovery(mut self, recovery: GameRecoveryCoordinator) -> Self {
+        self.recovery = recovery;
+        self
     }
 
     pub(crate) fn submit(
@@ -79,6 +92,7 @@ impl ModerationUi {
         self.runtime.submit(ExecuteModerationRoutine {
             request,
             config: self.config.clone(),
+            recovery: self.recovery.clone(),
         })
     }
 }
@@ -166,6 +180,15 @@ impl ModerationRoutineConfig {
 struct ExecuteModerationRoutine {
     request: ExecuteModeration,
     config: ModerationRoutineConfig,
+    recovery: GameRecoveryCoordinator,
+}
+
+impl ExecuteModerationRoutine {
+    /// 收尾环境必须挂着进程级共享的协调器，否则本次恢复记账只活在本例程里。
+    fn environment(&self) -> SettleEnvironment {
+        SettleEnvironment::without_ocr(self.config.residency.clone())
+            .with_recovery(self.recovery.clone())
+    }
 }
 
 impl sealed::UiRoutineSealed for ExecuteModerationRoutine {}
@@ -177,7 +200,7 @@ impl UiRoutine for ExecuteModerationRoutine {
         // 统一事务：入口必须是稳定 Primary（RequireTarget：不满足时零按键拒绝），
         // 收尾由 settle_to 吸收，面板/弹窗的有界 Esc 不再由例程自己 recover。
         // 管理任务只恢复 Primary/面板，不需要 OCR；仍走同一环境类型与唯一引擎。
-        let environment = SettleEnvironment::without_ocr(self.config.residency.clone());
+        let environment = self.environment();
         let inner = ModerationInner {
             request: self.request,
             config: self.config,
@@ -540,11 +563,13 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicBool;
+    use std::time::Instant;
 
     use image::DynamicImage;
 
     use super::*;
     use crate::config::AppConfig;
+    use crate::runtime::recovery::{GameRecoveryCoordinator, RecoveryTrigger};
     use crate::runtime::ui::{
         UiDevice, UiRoutine, UiRoutineContext, UiStateClassification, UiStateClassifier,
         UiStateEvidence, UiStateKind, execute_routine_for_test, sealed::UiRoutineSealed,
@@ -632,7 +657,7 @@ mod tests {
     fn run_task(
         script: Vec<UiStateClassification>,
     ) -> (UiTaskOutcome<ModerationEffect>, RecordingDevice) {
-        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let config = crate::config::bundled_config();
         let spec = moderation_task_spec(SettleEnvironment::without_ocr(
             FriendDeliveryRoutineConfig::from_app(&config),
         ));
@@ -710,5 +735,119 @@ mod tests {
         assert!(!stability.observe(None, 2));
         assert!(!stability.observe(Some(2), 2));
         assert!(stability.observe(Some(2), 2));
+    }
+
+    fn routine_config(config: &AppConfig) -> ModerationRoutineConfig {
+        ModerationRoutineConfig::resolve(ModerationRoutineConfigSource {
+            residency: FriendDeliveryRoutineConfig::from_app(config),
+            friend_panel_template: config.templates.friend_panel.clone(),
+            search_panel_template: config.templates.friend_search_panel.clone(),
+            more_settings_template: config.templates.friend_more_settings.clone(),
+            blacklist_template: config.templates.friend_blacklist.clone(),
+            block_chat_template: config.templates.friend_block_chat.clone(),
+            confirm_button_template: config.templates.confirm_button.clone(),
+            friend_panel_region: config.moderation.friend_panel_region.into(),
+            search_panel_region: config.moderation.search_panel_region.into(),
+            more_settings_region: config.moderation.more_settings_region.into(),
+            blacklist_region: config.moderation.blacklist_region.into(),
+            block_chat_region: config.moderation.block_chat_region.into(),
+            confirm_button_region: config.moderation.confirm_button_region.into(),
+            search_input: crate::geometry::Point::new(
+                config.moderation.search_input_point.x,
+                config.moderation.search_input_point.y,
+            ),
+            search_button: crate::geometry::Point::new(
+                config.moderation.search_button_point.x,
+                config.moderation.search_button_point.y,
+            ),
+            marker_threshold: config.templates.marker_threshold,
+            ui_timeout_ms: config.timing.command.ui_timeout_ms,
+            search_timeout_ms: config.timing.moderation.search_result_timeout_ms,
+            confirm_wait_ms: config.timing.moderation.confirm_wait_ms,
+            step_ms: config.timing.invite.step_ms,
+            text_ms: config.timing.input.text_ms,
+            return_retry_ms: config.timing.command.return_retry_ms,
+        })
+    }
+
+    fn moderation_routine(
+        config: &AppConfig,
+        recovery: GameRecoveryCoordinator,
+    ) -> ExecuteModerationRoutine {
+        ExecuteModerationRoutine {
+            request: ExecuteModeration::new(ModerationUiAction::BlockChat, "100000001"),
+            config: routine_config(config),
+            recovery,
+        }
+    }
+
+    /// B15-P2-4 回归：注入的协调器必须收到本管理的收尾记账；
+    /// 另建一份默认协调器（从未注入）不能被这次恢复影响——证明没有偷偷回退到全局单例。
+    #[test]
+    fn moderation_routine_accounts_settlement_to_the_injected_coordinator() {
+        let config = crate::config::bundled_config();
+        let injected = GameRecoveryCoordinator::default();
+        let bystander = GameRecoveryCoordinator::default();
+
+        let _ = execute_routine_for_test(
+            RecordingDevice::default(),
+            Some(Box::new(ScriptedClassifier::new(vec![state(
+                UiStateKind::Primary,
+            )]))),
+            2,
+            Arc::new(AtomicBool::new(false)),
+            moderation_routine(&config, injected.clone()),
+        )
+        .output;
+
+        assert!(
+            injected.health_snapshot_now().residency_settled >= 1,
+            "注入的协调器必须收到本次收尾落定记账"
+        );
+        assert_eq!(
+            bystander.health_snapshot_now().residency_settled,
+            0,
+            "未注入的协调器不得被这次恢复影响"
+        );
+    }
+
+    /// B15-P2-4 回归：同一份 `recovery.clone()` 交给两个例程后，恢复状态必须共享可见。
+    ///
+    /// 用「已完成的失联重启」当探针：两个例程的收尾环境都能看到同一个冷却起点，
+    /// 而各自默认构造的看不到。这证明装配层传的是同一实例，不是各建一份。
+    #[test]
+    fn shared_recovery_coordinator_is_visible_across_two_moderation_routines() {
+        let config = crate::config::bundled_config();
+        let shared = GameRecoveryCoordinator::default();
+        shared.record_restart_completed(Instant::now(), RecoveryTrigger::ExternalChatDisconnect);
+
+        let first = moderation_routine(&config, shared.clone())
+            .environment()
+            .recovery()
+            .health_snapshot_now();
+        let second = moderation_routine(&config, shared.clone())
+            .environment()
+            .recovery()
+            .health_snapshot_now();
+        for (name, snapshot) in [("第一个", first), ("第二个", second)] {
+            assert_eq!(
+                snapshot.total_restarts, 1,
+                "{name}例程必须看到共享协调器里那次重启"
+            );
+            assert_eq!(
+                snapshot.last_restart_trigger,
+                Some(RecoveryTrigger::ExternalChatDisconnect),
+                "{name}例程必须看到共享的最近重启来源"
+            );
+        }
+
+        let unwired = moderation_routine(&config, GameRecoveryCoordinator::default())
+            .environment()
+            .recovery()
+            .health_snapshot_now();
+        assert_eq!(
+            unwired.total_restarts, 0,
+            "默认构造的协调器不得凭空看到共享实例的重启记录"
+        );
     }
 }

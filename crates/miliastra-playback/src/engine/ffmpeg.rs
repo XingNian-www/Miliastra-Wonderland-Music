@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -20,6 +20,19 @@ const PCM_BUFFER_DEFAULT_DURATION: Duration = Duration::from_secs(3);
 const PCM_WAIT_INTERVAL: Duration = Duration::from_millis(20);
 const PROGRESS_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const MAX_CONSECUTIVE_INVALID_PACKETS: usize = 16;
+/// 回收已结束解码线程的最长等待。
+///
+/// 解码线程可能卡在不可中断的阻塞调用（FFmpeg 读/重采样）里，actor 不能在
+/// `task.await` 上无限等待——否则一次卡死会让后续 Start/Seek 永久排队。
+const WORKER_RETIRE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// 输出设备丢失后，「设备不可用」失败快照必须保持可见的最短窗口。
+///
+/// 上层控制器按 `timing.playback.status_poll_ms`（默认 1000ms）轮询快照，而
+/// `watch` 只保留**最新**值：重建成功后立刻发布 `Idle`，失败信号就几乎不可能
+/// 被采样到，「设备不可用 → 暂停自动出队」的分支与日志永远不可达。窗口取默认
+/// 轮询间隔的 2 倍，保证至少一次观测能读到 `Failed(EngineExited)`。
+const OUTPUT_RECOVERY_HOLD: Duration = Duration::from_secs(2);
 
 static FFMPEG_INITIALIZED: OnceLock<Result<(), ()>> = OnceLock::new();
 
@@ -180,15 +193,36 @@ struct ActiveWorker {
     task: JoinHandle<()>,
 }
 
+/// 正在回收的解码线程：超过 `deadline` 仍不退出即视为孤儿。
+///
+/// 线程可能卡在不可中断的阻塞调用（FFmpeg 读/重采样）里，actor 不能在
+/// `task.await` 上无限等待，也不能让这类线程永久阻塞后续 Start/Seek。
+struct RetiringWorker {
+    worker: ActiveWorker,
+    deadline: Instant,
+}
+
+impl RetiringWorker {
+    fn new(worker: ActiveWorker) -> Self {
+        Self {
+            worker,
+            deadline: Instant::now() + WORKER_RETIRE_TIMEOUT,
+        }
+    }
+}
+
 struct ActorState {
     snapshot: PlaybackSnapshot,
     active: Option<ActivePlayback>,
     active_worker: Option<ActiveWorker>,
-    retiring_workers: Vec<ActiveWorker>,
+    retiring_workers: Vec<RetiringWorker>,
     pending_launch: Option<PendingLaunch>,
     playback_committed: bool,
     position_base_seconds: Option<f64>,
     next_attempt_id: u64,
+    /// 输出流已重建成功、但仍需把「设备不可用」失败快照保留到该时刻之后再
+    /// 发布 `Idle`（见 `OUTPUT_RECOVERY_HOLD`）。`None` 表示无待恢复窗口。
+    output_recovery_deadline: Option<Instant>,
 }
 
 impl ActorState {
@@ -202,6 +236,7 @@ impl ActorState {
             playback_committed: false,
             position_base_seconds: None,
             next_attempt_id: 1,
+            output_recovery_deadline: None,
         }
     }
 
@@ -400,6 +435,12 @@ enum WorkerEvent {
         identity: AttemptIdentity,
         position_seconds: Option<f64>,
     },
+    /// 首帧没有可信 PTS，靠「起点 + 样本数」估了个值；后续帧出现了可信 PTS，
+    /// 用「PTS − 已解码样本数」反推出真正的首帧位置并回传，供上层修正进度基准。
+    Reanchored {
+        identity: AttemptIdentity,
+        position_seconds: Option<f64>,
+    },
     Looping {
         identity: AttemptIdentity,
     },
@@ -482,16 +523,23 @@ async fn run_actor(
                 ).await;
                 if output_failed {
                     // 设备被拔/禁用：先按失败停止，再尝试重建输出流，避免逐首跳歌。
+                    //
+                    // `handle_worker_event` 已经把 `Failed(EngineExited)` 发布出去了。
+                    // `watch` 只保留最新值，所以重建成功后的 `Idle` **不能**在同一个
+                    // 事件轮次里紧接着发布——上层按 `timing.playback.status_poll_ms`
+                    // （默认 1s）轮询快照，否则「设备不可用 → 暂停自动出队」分支
+                    // 与日志永远读不到失败信号。这里只登记恢复截止时间，真正的
+                    // `Idle` 由 `maybe_finish_output_recovery` 在窗口结束后发布。
                     match rebuild_output_stream(&output, &worker_events_tx) {
                         Ok(rebuilt) => match rebuilt.play() {
                             Ok(()) => {
                                 stream = rebuilt;
-                                state.snapshot.state = EngineState::Idle;
-                                state.snapshot.failure = None;
-                                state.snapshot.error = None;
-                                state.snapshot.last_end_cause = None;
-                                state.publish(&snapshots);
-                                tracing::warn!("音频输出设备已重建，播放器恢复可用");
+                                state.output_recovery_deadline =
+                                    Some(Instant::now() + OUTPUT_RECOVERY_HOLD);
+                                tracing::warn!(
+                                    hold_seconds = OUTPUT_RECOVERY_HOLD.as_secs(),
+                                    "音频输出设备已重建，失败信号保留一个可见窗口后恢复可用"
+                                );
                             }
                             Err(error) => {
                                 tracing::warn!(%error, "重建音频输出流后启动失败，播放器保持不可用");
@@ -515,6 +563,15 @@ async fn run_actor(
             }
             _ = progress.tick() => {
                 refresh_progress(&mut state, &snapshots, &output);
+                // 设备恢复窗口到期才发布 `Idle`：保证 `Failed(EngineExited)` 至少
+                // 能被上层轮询采样到一次（见 `OUTPUT_RECOVERY_HOLD`）。
+                maybe_finish_output_recovery(&mut state, &snapshots, Instant::now());
+                // 看门狗：回收超时的解码线程被标记为孤儿后，立即恢复排队中的起播。
+                let before = state.retiring_workers.len();
+                orphan_expired_retiring_workers(&mut state);
+                if state.retiring_workers.len() != before {
+                    maybe_start_pending(&mut state, &output, &worker_events_tx);
+                }
             }
             else => {
                 shutdown_workers(&mut state, &output.audio).await;
@@ -964,8 +1021,27 @@ fn retire_active_worker(state: &mut ActorState, audio: &PcmBuffer) {
     if let Some(worker) = state.active_worker.take() {
         worker.cancel.store(true, Ordering::Release);
         audio.retire(worker.identity.id);
-        state.retiring_workers.push(worker);
+        state.retiring_workers.push(RetiringWorker::new(worker));
     }
+}
+
+/// 丢弃回收超时的 worker，使其不再阻塞后续 Start/Seek。
+///
+/// 丢弃 `JoinHandle` 只是分离线程（`spawn_blocking` 线程继续跑到自然结束），
+/// 取消位已在退休时置位，孤儿线程会在下一次 `is_current` 检查处退出。
+fn orphan_expired_retiring_workers(state: &mut ActorState) {
+    let now = Instant::now();
+    state.retiring_workers.retain(|retiring| {
+        if now < retiring.deadline {
+            return true;
+        }
+        tracing::error!(
+            attempt = retiring.worker.identity.id,
+            timeout_seconds = WORKER_RETIRE_TIMEOUT.as_secs(),
+            "解码线程回收超时，标记为孤儿以解除后续播放阻塞"
+        );
+        false
+    });
 }
 
 fn maybe_start_pending(
@@ -973,6 +1049,10 @@ fn maybe_start_pending(
     output: &OutputRuntime,
     worker_events_tx: &mpsc::UnboundedSender<WorkerEvent>,
 ) {
+    // 回收中的 worker 仍会短暂阻塞新的起播（避免两个解码线程同时向输出写帧），
+    // 但阻塞是有界的：超过 `WORKER_RETIRE_TIMEOUT` 仍不退出的线程被标记为
+    // 孤儿并解除阻塞，保证卡死的解码线程不会让后续 Start/Seek 永久排队。
+    orphan_expired_retiring_workers(state);
     if state.active_worker.is_some() || !state.retiring_workers.is_empty() {
         return;
     }
@@ -1014,6 +1094,57 @@ fn maybe_start_pending(
     });
 }
 
+/// 音频输出设备丢失时的唯一发布口径。
+///
+/// 必须让快照停在 `Failed` + `last_end_cause == EngineExited` + `failure_code ==
+/// engine_unavailable`：controller 的 `engine_unavailable` 分支靠这个失败信号
+/// 「暂停自动出队」，`last_end_cause` 则是它的持久化/诊断依据。清空这两项
+/// （尤其是同一次 select 分支里紧接着发布 `Idle`）等于把恢复依据抹掉。
+fn mark_output_lost(state: &mut ActorState) {
+    state.snapshot.state = EngineState::Failed;
+    state.snapshot.last_end_cause = Some(EndCause::EngineExited);
+    state.snapshot.error = Some("default audio output device failed".to_owned());
+    state.snapshot.failure = Some(Failure::new(
+        "engine_unavailable",
+        "default audio output device failed",
+    ));
+}
+
+/// 输出流重建成功：播放器回到可用（`Idle`），此时才允许清空失败信号。
+///
+/// 上层只在「已看到过 `EngineExited`」之后才会等这次清空来恢复自动续播，
+/// 所以清空必须发生在**重建成功之后**（且已过 `OUTPUT_RECOVERY_HOLD`），
+/// 而不是设备丢失的那一轮。
+fn maybe_finish_output_recovery(
+    state: &mut ActorState,
+    snapshots: &watch::Sender<PlaybackSnapshot>,
+    now: Instant,
+) {
+    let Some(deadline) = state.output_recovery_deadline else {
+        return;
+    };
+    // 期间若已有新的播放会话接管（Start/Seek/Refresh 或设备再次丢失），
+    // 恢复窗口即刻作废，绝不能把活动会话覆盖成 `Idle`。
+    if state.snapshot.state != EngineState::Failed
+        || state.snapshot.last_end_cause != Some(EndCause::EngineExited)
+        || state.active.is_some()
+    {
+        state.output_recovery_deadline = None;
+        return;
+    }
+    if now < deadline {
+        // 保留 `Failed(EngineExited)` 供上层采样：`watch` 没有历史。
+        return;
+    }
+    state.output_recovery_deadline = None;
+    state.snapshot.state = EngineState::Idle;
+    state.snapshot.failure = None;
+    state.snapshot.error = None;
+    state.snapshot.last_end_cause = None;
+    state.publish(snapshots);
+    tracing::warn!("音频输出设备已重建，播放器恢复可用");
+}
+
 async fn handle_worker_event(
     event: WorkerEvent,
     state: &mut ActorState,
@@ -1034,7 +1165,14 @@ async fn handle_worker_event(
             position_seconds,
         } if state.active_attempt_matches(identity) => {
             state.playback_committed = true;
-            state.position_base_seconds = trustworthy_position(position_seconds);
+            // 兜底：worker 正常会用「流起点 + 已解码样本数 / 采样率」补齐缺失 PTS；
+            // 万一仍无证据，也绝不让 position_base_seconds 永久为 None（否则
+            // 进度/歌词永不推进，EOF 还会被误判为 DecodeFailure）。
+            state.position_base_seconds =
+                Some(trustworthy_position(position_seconds).unwrap_or_else(|| {
+                    tracing::warn!(?position_seconds, "首帧缺少可信 PTS，播放进度基准回退为 0");
+                    0.0
+                }));
             state.snapshot.position_seconds = state.position_base_seconds;
             state.snapshot.state = if state.active.as_ref().is_some_and(|active| active.paused) {
                 EngineState::Paused
@@ -1044,6 +1182,32 @@ async fn handle_worker_event(
             state.snapshot.error = None;
             state.snapshot.failure = None;
             state.publish(snapshots);
+        }
+        WorkerEvent::Reanchored {
+            identity,
+            position_seconds,
+        } if state.active_attempt_matches(identity) => {
+            // 首帧曾经没有可信 PTS（用流起点估的），现在拿到了：把进度基准平移到
+            // 真实首帧位置。不做这一步，兜底起点里携带的 `start_time` 偏差会一直
+            // 保留在歌词/进度上（V2）。
+            let Some(reanchored) = trustworthy_position(position_seconds) else {
+                return;
+            };
+            if !matches!(
+                state.snapshot.state,
+                EngineState::Playing | EngineState::Paused
+            ) {
+                return;
+            }
+            let rendered = output.audio.rendered_samples() as f64
+                / output.format.samples_per_second().max(f64::MIN_POSITIVE);
+            state.position_base_seconds = Some(reanchored);
+            state.snapshot.position_seconds = trustworthy_position(Some(reanchored + rendered));
+            state.publish(snapshots);
+            tracing::debug!(
+                reanchored_seconds = reanchored,
+                "首帧兜底起点已用可信 PTS 校准"
+            );
         }
         WorkerEvent::Looping { identity } if state.active_attempt_matches(identity) => {
             // 下一次循环从头开始。保留可信的当前位置，确保可安全刷新已过期 URL。
@@ -1077,7 +1241,19 @@ async fn handle_worker_event(
         }
         WorkerEvent::EofDrained { identity } if state.active_attempt_matches(identity) => {
             refresh_progress(state, snapshots, output);
+            let position = state.snapshot.position_seconds;
+            let duration = state.snapshot.duration_seconds;
             let end_cause = classify_eof(&state.snapshot);
+            if end_cause == EndCause::NaturalEnd && (position.is_none() || duration.is_none()) {
+                // 数据已由解码器正常排空，只是缺位置/时长证据：不足以证明流被
+                // 截断，按正常结束处理，但保留 warn 以便排查时间轴异常。
+                tracing::warn!(
+                    ?position,
+                    ?duration,
+                    generation = state.snapshot.generation,
+                    "流正常结束但缺少位置/时长证据，按正常结束处理"
+                );
+            }
             state.snapshot.state = if end_cause == EndCause::NaturalEnd {
                 EngineState::Stopped
             } else {
@@ -1108,13 +1284,7 @@ async fn handle_worker_event(
             state.active = None;
             state.playback_committed = false;
             state.position_base_seconds = None;
-            state.snapshot.state = EngineState::Failed;
-            state.snapshot.last_end_cause = Some(EndCause::EngineExited);
-            state.snapshot.error = Some("default audio output device failed".to_owned());
-            state.snapshot.failure = Some(Failure::new(
-                "engine_unavailable",
-                "default audio output device failed",
-            ));
+            mark_output_lost(state);
             state.publish(snapshots);
         }
         _ => {}
@@ -1122,23 +1292,45 @@ async fn handle_worker_event(
 }
 
 async fn retire_finished_worker(identity: AttemptIdentity, state: &mut ActorState) {
-    if state
+    let worker = if state
         .active_worker
         .as_ref()
         .is_some_and(|worker| worker.identity == identity)
     {
-        if let Some(worker) = state.active_worker.take() {
-            let _ = worker.task.await;
-        }
-        return;
-    }
-    if let Some(index) = state
+        state.active_worker.take()
+    } else if let Some(index) = state
         .retiring_workers
         .iter()
-        .position(|worker| worker.identity == identity)
+        .position(|retiring| retiring.worker.identity == identity)
     {
-        let worker = state.retiring_workers.swap_remove(index);
-        let _ = worker.task.await;
+        Some(state.retiring_workers.swap_remove(index).worker)
+    } else {
+        None
+    };
+    let Some(worker) = worker else {
+        return;
+    };
+    // 恢复线程应该已经自然结束；仍置取消位，保证孤儿线程下次检查时退出。
+    worker.cancel.store(true, Ordering::Release);
+    match tokio::time::timeout(WORKER_RETIRE_TIMEOUT, worker.task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) if error.is_cancelled() => {}
+        Ok(Err(error)) => {
+            tracing::error!(
+                attempt = identity.id,
+                %error,
+                "解码线程异常结束，回收结果不可用"
+            );
+        }
+        Err(_) => {
+            // 超时：不再等待（也绝不把它留回 `retiring_workers`，否则后续
+            // Start/Seek 仍会被阻塞）。取消位已置位，线程会在下一次检查时退出。
+            tracing::error!(
+                attempt = identity.id,
+                timeout_seconds = WORKER_RETIRE_TIMEOUT.as_secs(),
+                "解码线程回收超时，已标记为孤儿并继续后续播放"
+            );
+        }
     }
 }
 
@@ -1174,11 +1366,31 @@ async fn shutdown_workers(state: &mut ActorState, audio: &PcmBuffer) {
     if let Some(worker) = state.active_worker.take() {
         worker.cancel.store(true, Ordering::Release);
         audio.retire(worker.identity.id);
-        state.retiring_workers.push(worker);
+        state.retiring_workers.push(RetiringWorker::new(worker));
     }
-    for worker in state.retiring_workers.drain(..) {
+    // 停机同样不能无限等：卡死的解码线程只会成为孤儿，不能把 actor 的关闭
+    // 流程（最终会让 `FfmpegEngine::shutdown` 挂住）一起拖死。所有 worker 共享
+    // 同一个截止时间，避免总等待时间随线程数线性增长。
+    let deadline = Instant::now() + WORKER_RETIRE_TIMEOUT;
+    for retiring in state.retiring_workers.drain(..) {
+        let worker = retiring.worker;
         worker.cancel.store(true, Ordering::Release);
-        let _ = worker.task.await;
+        let attempt = worker.identity.id;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            tracing::error!(attempt, "停机时解码线程回收超时，已放弃等待");
+            continue;
+        }
+        match tokio::time::timeout(remaining, worker.task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) if error.is_cancelled() => {}
+            Ok(Err(error)) => tracing::error!(attempt, %error, "停机时解码线程异常结束"),
+            Err(_) => tracing::error!(
+                attempt,
+                timeout_seconds = WORKER_RETIRE_TIMEOUT.as_secs(),
+                "停机时解码线程回收超时，已放弃等待"
+            ),
+        }
     }
     audio.clear();
 }
@@ -1215,7 +1427,10 @@ fn classify_eof(snapshot: &PlaybackSnapshot) -> EndCause {
                 EndCause::DecodeFailure
             }
         }
-        _ => EndCause::DecodeFailure,
+        // 缺少位置或时长证据时，不再仅凭「没有时间轴」判失败：能走到
+        // EofDrained 说明解复用器/解码器已正常排空数据（截断会先触发
+        // PacketRead/Decode 失败），此时按正常结束处理，调用方记 warn。
+        _ => EndCause::NaturalEnd,
     }
 }
 
@@ -1322,12 +1537,13 @@ fn decode_once(
     }
 
     let input_duration = duration_from_input(&input);
-    let (stream_index, stream_time_base, stream_duration, parameters) =
+    let (stream_index, stream_time_base, stream_duration, stream_start_time, parameters) =
         match input.streams().best(ffmpeg::media::Type::Audio) {
             Some(stream) => (
                 stream.index(),
                 stream.time_base(),
                 stream.duration(),
+                stream.start_time(),
                 stream.parameters(),
             ),
             None => return WorkerOutcome::Failed(WorkerFailurePhase::Opening),
@@ -1377,6 +1593,19 @@ fn decode_once(
 
     let mut packet = ffmpeg::Packet::empty();
     let mut started = false;
+    // 首帧无 PTS 时的进度兜底：起点 + 已解码样本数 / 采样率。
+    //
+    // 起点优先级：seek 目标（时间轴确实从目标位置继续）> 首个可信的容器位置
+    // （首帧 PTS，见 `FrameTimeline::frame_position` 的延迟锚定）> 流的
+    // `start_time`。`start_time` 只作最后兜底：它不是「首帧位置」，在带 edit
+    // list 的 MP4 / 部分 TS 上可能非零甚至与首帧相差整段静音，直接采用会让
+    // 歌词整体偏移一个固定量；这里只作为两者都拿不到时的估计。
+    let stream_start_seconds =
+        timestamp_to_seconds(Some(stream_start_time), stream_time_base).unwrap_or(0.0);
+    let fallback_start_seconds = seek_seconds
+        .filter(|seconds| *seconds > 0.0)
+        .unwrap_or(stream_start_seconds);
+    let mut timeline = FrameTimeline::new(fallback_start_seconds, request.output.sample_rate);
     let mut consecutive_invalid_packets = 0_usize;
     loop {
         if !audio.is_current(request.identity.id, cancelled) {
@@ -1403,6 +1632,7 @@ fn decode_once(
                     cancelled,
                     events,
                     &mut started,
+                    &mut timeline,
                     false,
                 ) {
                     FrameDrain::Continue => {}
@@ -1435,6 +1665,7 @@ fn decode_once(
         cancelled,
         events,
         &mut started,
+        &mut timeline,
         true,
     ) {
         FrameDrain::Continue => {}
@@ -1450,6 +1681,7 @@ fn decode_once(
         cancelled,
         events,
         &mut started,
+        &mut timeline,
     ) {
         FrameDrain::Continue => {}
         FrameDrain::Cancelled => return WorkerOutcome::Cancelled,
@@ -1529,6 +1761,7 @@ fn drain_decoder_frames(
     cancelled: &AtomicBool,
     events: &mpsc::UnboundedSender<WorkerEvent>,
     started: &mut bool,
+    timeline: &mut FrameTimeline,
     draining_at_eof: bool,
 ) -> FrameDrain {
     let mut decoded = ffmpeg::frame::Audio::empty();
@@ -1537,6 +1770,7 @@ fn drain_decoder_frames(
         match decoder.receive_frame(&mut decoded) {
             Ok(()) => match resample_and_enqueue(
                 &decoded, time_base, resampler, identity, audio, cancelled, events, started,
+                timeline,
             ) {
                 FrameDrain::Continue => {}
                 result => return result,
@@ -1569,6 +1803,7 @@ fn resample_and_enqueue(
     cancelled: &AtomicBool,
     events: &mpsc::UnboundedSender<WorkerEvent>,
     started: &mut bool,
+    timeline: &mut FrameTimeline,
 ) -> FrameDrain {
     let position_seconds = timestamp_to_seconds(decoded.timestamp(), time_base);
     let mut converted = ffmpeg::frame::Audio::empty();
@@ -1587,6 +1822,7 @@ fn resample_and_enqueue(
         cancelled,
         events,
         started,
+        timeline,
     )
 }
 
@@ -1598,6 +1834,7 @@ fn flush_resampler(
     cancelled: &AtomicBool,
     events: &mpsc::UnboundedSender<WorkerEvent>,
     started: &mut bool,
+    timeline: &mut FrameTimeline,
 ) -> FrameDrain {
     loop {
         if resampler.delay().is_none() {
@@ -1615,7 +1852,7 @@ fn flush_resampler(
             return FrameDrain::Continue;
         }
         match enqueue_resampled_frame(
-            &converted, None, identity, audio, cancelled, events, started,
+            &converted, None, identity, audio, cancelled, events, started, timeline,
         ) {
             FrameDrain::Continue => {}
             result => return result,
@@ -1635,6 +1872,7 @@ fn enqueue_resampled_frame(
     cancelled: &AtomicBool,
     events: &mpsc::UnboundedSender<WorkerEvent>,
     started: &mut bool,
+    timeline: &mut FrameTimeline,
 ) -> FrameDrain {
     if frame.samples() == 0 {
         return FrameDrain::Continue;
@@ -1648,11 +1886,43 @@ fn enqueue_resampled_frame(
     }
     if !*started {
         *started = true;
+        // 首帧无有效 PTS（NOPTS/负值/仅重采样器尾样本）时用时间轴兜底：
+        // 位置取「本帧起始」——记录样本数之前的值，首帧即起点。
+        let trusted = trustworthy_position(position_seconds);
+        if trusted.is_none() {
+            tracing::debug!(
+                fallback_seconds = timeline.position_seconds(),
+                "首帧缺少有效 PTS，使用流起点与已解码样本数推算播放进度"
+            );
+        }
+        let position_seconds = timeline.frame_position(position_seconds);
         let _ = events.send(WorkerEvent::Started {
             identity,
-            position_seconds,
+            position_seconds: Some(position_seconds),
         });
+        // 首帧就有可信 PTS：直接锚定，后续帧的兜底推算与它同一条时间轴。
+        if timeline.anchor_on_pts(trusted) {
+            tracing::trace!(
+                start_seconds = timeline.start_seconds,
+                "首帧 PTS 可信，已锚定时间轴起点"
+            );
+        }
+    } else if timeline.anchor_on_pts(position_seconds) {
+        // 首帧无 PTS、后续帧才出现可信 PTS（很常见）：此时用「本帧 PTS − 已解码
+        // 样本数」反推真正的**首帧**起点，纠正 `stream.start_time()` 带来的固定
+        // 偏移。上层进度基准是首帧发布的值，必须同步修正，否则歌词会整体偏移。
+        let corrected = timeline.start_seconds;
+        let _ = events.send(WorkerEvent::Reanchored {
+            identity,
+            position_seconds: Some(corrected),
+        });
+        tracing::debug!(
+            corrected_seconds = corrected,
+            "用后续可信 PTS 校准了首帧兜底起点"
+        );
     }
+    // 位置兜底只服务首帧；样本计数用于后续帧的推算（当前不发送，保持通用）。
+    timeline.record_frame(frame.samples());
     FrameDrain::Continue
 }
 
@@ -1750,6 +2020,84 @@ fn timestamp_to_seconds(timestamp: Option<i64>, time_base: ffmpeg::Rational) -> 
         .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
 }
 
+/// 首帧缺少有效 PTS 时的时间轴兜底，并允许用后续可信 PTS 回头校准起点。
+///
+/// 部分容器/编码的首帧 `best_effort_timestamp` 是 `AV_NOPTS_VALUE`，seek 后
+/// 也可能是负值，甚至只有重采样器尾样本（PTS 为 `None`）。没有兜底时
+/// `position_base_seconds` 会永久为 `None`，进度与歌词不再推进，EOF 还会因
+/// 「缺位置证据」被误判为 `DecodeFailure`。
+///
+/// 推算口径：`起点 + 已解码样本数 / 采样率`。起点不是一次定死的：
+/// 首个**可信 PTS**（通常是紧接着的那一帧）会把它平移到「本帧起始 == PTS」，
+/// 从而把已解码样本数换算成绝对位置。因此 `stream.start_time()` 只在整条流
+/// 从未给出可信 PTS 时才真正生效——它是「流的起点」，不是「首帧的位置」，
+/// 在带 edit list 的 MP4 / 部分 TS 上二者可能相差一段固定偏移，直接采用会让
+/// 进度与歌词整体偏移。
+struct FrameTimeline {
+    start_seconds: f64,
+    sample_rate: u32,
+    samples: u64,
+    /// 起点是否已由可信 PTS 校准；校准后不再改动，避免后续 PTS 抖动。
+    anchored: bool,
+}
+
+/// 允许用可信 PTS 反推首帧起点的最长窗口（已解码秒数）。
+///
+/// 超窗后不再动时间轴：太晚的修正会被用户感知成进度跳变，也更容易撞上中途的
+/// 时间戳不连续，用它改历史起点反而更危险。
+const REANCHOR_WINDOW_SECONDS: u64 = 2;
+
+impl FrameTimeline {
+    fn new(start_seconds: f64, sample_rate: u32) -> Self {
+        Self {
+            start_seconds: start_seconds.max(0.0),
+            sample_rate,
+            samples: 0,
+            anchored: false,
+        }
+    }
+
+    fn position_seconds(&self) -> f64 {
+        self.start_seconds + self.samples as f64 / f64::from(self.sample_rate.max(1))
+    }
+
+    /// 记录本帧解码出的每声道样本数（在计算完本帧起始位置之后调用）。
+    fn record_frame(&mut self, frame_samples: usize) {
+        self.samples = self.samples.saturating_add(frame_samples as u64);
+    }
+
+    /// 用可信 PTS 校准起点：令「本帧起始（`samples` 处）== `position_seconds`」。
+    ///
+    /// 返回 `true` 表示本次完成了首次校准（起点可能变化），调用方可据此决定是否
+    /// 通知上层修正已发布的进度基准。已校准或 PTS 不可信时返回 `false`。
+    ///
+    /// 只允许在开头很短的窗口内校准：越晚校准，修正量越可能被用户感知为进度
+    /// 跳变，而且越可能撞上中途的时间戳不连续。窗口外的值只用于当前帧位置，
+    /// 不再改动时间轴。
+    fn anchor_on_pts(&mut self, position_seconds: Option<f64>) -> bool {
+        if self.anchored {
+            return false;
+        }
+        let Some(position) = trustworthy_position(position_seconds) else {
+            return false;
+        };
+        let window_samples =
+            u64::from(self.sample_rate.max(1)).saturating_mul(REANCHOR_WINDOW_SECONDS);
+        if self.samples > window_samples {
+            return false;
+        }
+        self.start_seconds =
+            (position - self.samples as f64 / f64::from(self.sample_rate.max(1))).max(0.0);
+        self.anchored = true;
+        true
+    }
+
+    /// 取本帧起始位置：优先用容器给出的 PTS，缺失时用样本数推算。
+    fn frame_position(&self, position_seconds: Option<f64>) -> f64 {
+        trustworthy_position(position_seconds).unwrap_or_else(|| self.position_seconds())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1758,7 +2106,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
     use std::sync::mpsc as std_mpsc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use ffmpeg_next as ffmpeg;
     use tokio::sync::{mpsc, watch};
@@ -1769,11 +2117,14 @@ mod tests {
 
     use super::{
         ActivePlayback, ActiveWorker, ActorState, AttemptIdentity, AudioEngine, DecodeFailureStage,
-        EndBehavior, EndCause, EngineCommand, EngineError, EngineState, FrameDrain,
-        MAX_CONSECUTIVE_INVALID_PACKETS, OutputFormat, OutputRuntime, PacketSubmit, PcmBuffer,
-        PlaybackSnapshot, SessionRef, StreamSource, WorkerEvent, WorkerFailurePhase, WorkerRequest,
-        classify_eof, classify_packet_submit, ffmpeg_http_headers, ffmpeg_input_options,
-        flush_resampler, handle_command, handle_worker_event, initialize_ffmpeg, run_decode_worker,
+        EndBehavior, EndCause, EngineCommand, EngineError, EngineState, FrameDrain, FrameTimeline,
+        MAX_CONSECUTIVE_INVALID_PACKETS, OUTPUT_RECOVERY_HOLD, OutputFormat, OutputRuntime,
+        PacketSubmit, PcmBuffer, PlaybackSnapshot, REANCHOR_WINDOW_SECONDS, RetiringWorker,
+        SessionRef, StreamSource, WORKER_RETIRE_TIMEOUT, WorkerEvent, WorkerFailurePhase,
+        WorkerRequest, classify_eof, classify_packet_submit, ffmpeg_http_headers,
+        ffmpeg_input_options, flush_resampler, handle_command, handle_worker_event,
+        initialize_ffmpeg, maybe_finish_output_recovery, maybe_start_pending,
+        orphan_expired_retiring_workers, run_decode_worker,
     };
 
     fn stream() -> StreamSource {
@@ -1957,6 +2308,7 @@ mod tests {
             playback_committed: false,
             position_base_seconds: Some(0.0),
             next_attempt_id: 2,
+            output_recovery_deadline: None,
         }
     }
 
@@ -2066,6 +2418,125 @@ mod tests {
         );
     }
 
+    /// 回归（B19-P1-3 / V3）：设备丢失必须留下可观测的恢复依据。
+    ///
+    /// 基线缺陷：设备丢失分支先 `publish(Failed + EngineExited)`，再在**同一轮**
+    /// 里 `publish(Idle)` 并清 `last_end_cause`；`watch` 只保留最新值，订阅者
+    /// 因此永远读不到 `EngineExited`，「设备不可用 → 暂停自动出队」与它对应的
+    /// 日志实际不可达。这里直接驱动发布序列，断言 watch 的**最终**快照仍是
+    /// `Failed` + `EngineExited` + `engine_unavailable`。
+    #[tokio::test]
+    async fn losing_the_output_device_keeps_the_engine_exited_evidence_observable() {
+        let session = SessionRef {
+            session_id: Uuid::new_v4(),
+            generation: 1,
+        };
+        let mut state = active_state(session, EngineState::Playing);
+        let output = output();
+        output.audio.activate(1, false);
+        state.active_worker = Some(ActiveWorker {
+            identity: AttemptIdentity { id: 1, session },
+            cancel: Arc::new(AtomicBool::new(false)),
+            task: tokio::spawn(async {}),
+        });
+        let (snapshots, mut receiver) = watch::channel(PlaybackSnapshot::default());
+        let (events, _) = mpsc::unbounded_channel();
+
+        handle_worker_event(
+            WorkerEvent::OutputFailed,
+            &mut state,
+            &snapshots,
+            &output,
+            &events,
+        )
+        .await;
+
+        // 设备丢失这一轮发布的快照：必须能区分「设备走了」与普通解码失败。
+        let published = receiver.borrow_and_update().clone();
+        assert_eq!(published.state, EngineState::Failed);
+        assert_eq!(published.last_end_cause, Some(EndCause::EngineExited));
+        assert_eq!(
+            published
+                .failure
+                .as_ref()
+                .map(|failure| failure.code.as_str()),
+            Some("engine_unavailable")
+        );
+
+        // 复刻重建成功后的时序：actor 只登记恢复截止时间，**不**在本轮发 `Idle`。
+        // 只要恢复窗口未到期，后续 tick 不得覆盖失败快照。
+        state.output_recovery_deadline = Some(Instant::now() + OUTPUT_RECOVERY_HOLD);
+        maybe_finish_output_recovery(&mut state, &snapshots, Instant::now());
+        assert!(
+            !receiver.has_changed().unwrap_or(false),
+            "恢复窗口内不得发布新快照（Idle 会覆盖唯一可见的 EngineExited）"
+        );
+        let observed = receiver.borrow_and_update().clone();
+        assert_eq!(observed.state, EngineState::Failed);
+        assert_eq!(observed.last_end_cause, Some(EndCause::EngineExited));
+
+        // 窗口到期后才允许回到 `Idle` 并清空失败信号（上层据此恢复自动续播）。
+        maybe_finish_output_recovery(
+            &mut state,
+            &snapshots,
+            Instant::now() + OUTPUT_RECOVERY_HOLD + Duration::from_millis(1),
+        );
+        let recovered = receiver.borrow_and_update().clone();
+        assert_eq!(recovered.state, EngineState::Idle);
+        assert_eq!(recovered.last_end_cause, None);
+        assert!(recovered.failure.is_none());
+        assert!(state.output_recovery_deadline.is_none());
+    }
+
+    /// 回归（V3 续）：恢复窗口内新的播放会话接管时，`Idle` 不得把它覆盖掉。
+    #[tokio::test]
+    async fn output_recovery_window_yields_to_a_new_session() {
+        let session = SessionRef {
+            session_id: Uuid::new_v4(),
+            generation: 1,
+        };
+        let mut state = active_state(session, EngineState::Playing);
+        let output = output();
+        let (snapshots, _) = watch::channel(PlaybackSnapshot::default());
+        let (events, _) = mpsc::unbounded_channel();
+
+        handle_worker_event(
+            WorkerEvent::OutputFailed,
+            &mut state,
+            &snapshots,
+            &output,
+            &events,
+        )
+        .await;
+        state.output_recovery_deadline = Some(Instant::now() + OUTPUT_RECOVERY_HOLD);
+
+        // 用户在设备恢复前点了新歌：`active` 已被重建，窗口必须失效。
+        handle_command(
+            EngineCommand::Start {
+                session_id: Uuid::new_v4(),
+                generation: 2,
+                song_key: SongKey::new("bilibili", "BV1us411d75p").unwrap(),
+                stream: stream(),
+                end_behavior: EndBehavior::NotifyController,
+                seek_seconds: None,
+            },
+            &mut state,
+            &snapshots,
+            &output,
+            &events,
+        )
+        .unwrap();
+
+        maybe_finish_output_recovery(
+            &mut state,
+            &snapshots,
+            Instant::now() + OUTPUT_RECOVERY_HOLD + Duration::from_millis(1),
+        );
+        assert_eq!(state.snapshot.state, EngineState::Loading);
+        assert_eq!(state.snapshot.generation, 2);
+        assert!(state.output_recovery_deadline.is_none());
+    }
+
     #[tokio::test]
     async fn cancelling_a_stalled_http_open_finishes_within_the_io_deadline() {
         initialize_ffmpeg().unwrap();
@@ -2148,6 +2619,7 @@ mod tests {
             },
         };
         let mut started = false;
+        let mut timeline = FrameTimeline::new(0.0, 48_000);
         let result = flush_resampler(
             &mut resampler,
             identity,
@@ -2155,10 +2627,29 @@ mod tests {
             &AtomicBool::new(false),
             &events,
             &mut started,
+            &mut timeline,
         );
 
         assert!(matches!(result, FrameDrain::Continue));
         assert!(started);
+    }
+
+    /// 首帧无 PTS（`None`）或负 PTS 时必须回退到「起点 + 已解码样本数 / 采样率」，
+    /// 否则 `position_base_seconds` 永久为 None，进度/歌词永不推进。
+    #[test]
+    fn frame_position_falls_back_when_pts_is_missing_or_negative() {
+        let timeline = FrameTimeline::new(30.5, 48_000);
+
+        assert!((timeline.frame_position(None) - 30.5).abs() < 1e-9);
+        // seek 后的负 PTS 不可信，同样走兜底。
+        assert!((timeline.frame_position(Some(-0.4)) - 30.5).abs() < 1e-9);
+        assert!((timeline.frame_position(Some(f64::NAN)) - 30.5).abs() < 1e-9);
+        // 有效 PTS 优先，不能被兜底覆盖。
+        assert!((timeline.frame_position(Some(12.0)) - 12.0).abs() < 1e-9);
+
+        // 兜底起点本身也必须是非负有限值。
+        let negative_start = FrameTimeline::new(-5.0, 48_000);
+        assert!(negative_start.position_seconds() >= 0.0);
     }
 
     #[test]
@@ -2224,11 +2715,13 @@ mod tests {
             generation: 1,
         };
         let mut state = active_state(session, EngineState::Playing);
-        state.retiring_workers.push(ActiveWorker {
-            identity: AttemptIdentity { id: 1, session },
-            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            task: tokio::spawn(async {}),
-        });
+        state
+            .retiring_workers
+            .push(RetiringWorker::new(ActiveWorker {
+                identity: AttemptIdentity { id: 1, session },
+                cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                task: tokio::spawn(async {}),
+            }));
         let output = output();
         let (snapshots, _) = watch::channel(PlaybackSnapshot::default());
         let (events, _) = mpsc::unbounded_channel();
@@ -2272,14 +2765,16 @@ mod tests {
             },
             EngineState::Playing,
         );
-        state.retiring_workers.push(ActiveWorker {
-            identity: AttemptIdentity {
-                id: 1,
-                session: new_session,
-            },
-            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            task: tokio::spawn(async {}),
-        });
+        state
+            .retiring_workers
+            .push(RetiringWorker::new(ActiveWorker {
+                identity: AttemptIdentity {
+                    id: 1,
+                    session: new_session,
+                },
+                cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                task: tokio::spawn(async {}),
+            }));
         let output = output();
         let (snapshots, _) = watch::channel(PlaybackSnapshot::default());
         let (events, _) = mpsc::unbounded_channel();
@@ -2606,10 +3101,28 @@ mod tests {
     }
 
     #[test]
-    fn eof_requires_position_and_duration_evidence() {
+    fn eof_without_position_or_duration_evidence_is_a_normal_end() {
+        // 解码器已正常排空（EofDrained）时，缺时间轴证据不足以判失败：
+        // 严格检查只保留给「有证据但与时长矛盾」的情形。
         assert_eq!(
             classify_eof(&PlaybackSnapshot::default()),
-            EndCause::DecodeFailure
+            EndCause::NaturalEnd
+        );
+        assert_eq!(
+            classify_eof(&PlaybackSnapshot {
+                position_seconds: Some(12.0),
+                duration_seconds: None,
+                ..PlaybackSnapshot::default()
+            }),
+            EndCause::NaturalEnd
+        );
+        assert_eq!(
+            classify_eof(&PlaybackSnapshot {
+                position_seconds: None,
+                duration_seconds: Some(180.0),
+                ..PlaybackSnapshot::default()
+            }),
+            EndCause::NaturalEnd
         );
 
         let snapshot = PlaybackSnapshot {
@@ -2618,5 +3131,287 @@ mod tests {
             ..PlaybackSnapshot::default()
         };
         assert_eq!(classify_eof(&snapshot), EndCause::NaturalEnd);
+    }
+
+    #[test]
+    fn eof_with_position_far_before_duration_is_a_decode_failure() {
+        // 有可信证据但明显提前结束：截断/源站异常，仍然判失败。
+        let snapshot = PlaybackSnapshot {
+            position_seconds: Some(10.0),
+            duration_seconds: Some(180.0),
+            ..PlaybackSnapshot::default()
+        };
+        assert_eq!(classify_eof(&snapshot), EndCause::DecodeFailure);
+    }
+
+    #[tokio::test]
+    async fn started_without_pts_still_establishes_a_progress_base() {
+        let session = SessionRef {
+            session_id: Uuid::new_v4(),
+            generation: 1,
+        };
+        let mut state = active_state(session, EngineState::Loading);
+        state.active_worker = Some(ActiveWorker {
+            identity: AttemptIdentity { id: 1, session },
+            cancel: Arc::new(AtomicBool::new(false)),
+            task: tokio::spawn(async {}),
+        });
+        let output = output();
+        output.audio.activate(1, false);
+        let (snapshots, _) = watch::channel(PlaybackSnapshot::default());
+        let (events, _) = mpsc::unbounded_channel();
+
+        handle_worker_event(
+            WorkerEvent::Started {
+                identity: AttemptIdentity { id: 1, session },
+                position_seconds: None,
+            },
+            &mut state,
+            &snapshots,
+            &output,
+            &events,
+        )
+        .await;
+
+        // 进度基准必须建立（否则进度/歌词永不推进，EOF 还会误判失败）。
+        assert_eq!(state.position_base_seconds, Some(0.0));
+        assert_eq!(state.snapshot.position_seconds, Some(0.0));
+        assert_eq!(state.snapshot.state, EngineState::Playing);
+    }
+
+    #[test]
+    fn frame_timeline_extrapolates_position_from_decoded_samples() {
+        let mut timeline = FrameTimeline::new(30.5, 48_000);
+        assert!((timeline.position_seconds() - 30.5).abs() < 1e-9);
+        // 48_000 个每声道样本 = 1 秒。
+        timeline.record_frame(48_000);
+        assert!((timeline.position_seconds() - 31.5).abs() < 1e-9);
+        // 采样率为 0 时按 1 处理，不能产生 inf/NaN。
+        let mut degenerate = FrameTimeline::new(0.0, 0);
+        degenerate.record_frame(1_000);
+        assert!(degenerate.position_seconds().is_finite());
+    }
+
+    /// 回归（V2）：首帧无 PTS 时用 `stream.start_time()` 兜底，后续出现可信 PTS
+    /// 必须把起点**反过来校准**到真实首帧位置。
+    ///
+    /// `start_time` 是「流的起点」而不是「首帧的位置」：在带 edit list 的 MP4 /
+    /// 部分 TS 上二者相差一段固定偏移，只信 `start_time` 会让进度与歌词整体偏移。
+    #[test]
+    fn timeline_reanchors_the_fallback_start_on_the_first_trusted_pts() {
+        // 容器 `start_time = 1.4s`，首帧却没有 PTS：兜底从 1.4 起算（错误起点）。
+        let mut timeline = FrameTimeline::new(1.4, 1_000);
+        assert!(!timeline.anchored);
+        assert!(!timeline.anchor_on_pts(None), "None 不能锚定");
+        assert_eq!(timeline.start_seconds, 1.4);
+
+        // 首帧 1_000 个样本 = 1s（这里是 1kHz 便于计数）。
+        timeline.record_frame(1_000);
+        assert!((timeline.position_seconds() - 2.4).abs() < 1e-9);
+
+        // 第二帧带来可信 PTS 2.0s：本帧起始即 2.0，反推首帧起点 = 2.0 - 1.0 = 1.0。
+        assert!(timeline.anchor_on_pts(Some(2.0)));
+        assert!(timeline.anchored);
+        assert!((timeline.start_seconds - 1.0).abs() < 1e-9);
+        assert!((timeline.position_seconds() - 2.0).abs() < 1e-9);
+
+        // 只校准一次：后续 PTS 抖动不得再移动起点。
+        timeline.record_frame(1_000);
+        assert!(!timeline.anchor_on_pts(Some(9.9)));
+        assert!((timeline.start_seconds - 1.0).abs() < 1e-9);
+
+        // 负起点被钳到 0，不能把进度推到负值（1kHz 下 1s 样本仍在校准窗口内）。
+        let mut negative = FrameTimeline::new(0.0, 1_000);
+        negative.record_frame(1_000);
+        assert!(negative.anchor_on_pts(Some(1.0)));
+        assert_eq!(negative.start_seconds, 0.0);
+
+        // 窗口外不再校准：太晚纠正会变成可见的进度跳变。
+        let mut late = FrameTimeline::new(0.0, 1_000);
+        late.record_frame((REANCHOR_WINDOW_SECONDS as usize) * 1_000 + 1);
+        assert!(!late.anchor_on_pts(Some(30.0)));
+        assert!(!late.anchored);
+        assert_eq!(late.start_seconds, 0.0);
+    }
+
+    /// 回归（V2）：校准事件必须真的到达上层并改写进度基准，而不只是内部状态。
+    #[tokio::test]
+    async fn reanchored_event_moves_the_published_progress_base() {
+        let session = SessionRef {
+            session_id: Uuid::new_v4(),
+            generation: 1,
+        };
+        let mut state = active_state(session, EngineState::Playing);
+        let output = output();
+        output.audio.activate(1, false);
+        state.active_worker = Some(ActiveWorker {
+            identity: AttemptIdentity { id: 1, session },
+            cancel: Arc::new(AtomicBool::new(false)),
+            task: tokio::spawn(async {}),
+        });
+        // 首帧兜底用了错误的流起点。
+        state.position_base_seconds = Some(1.4);
+        state.snapshot.position_seconds = Some(1.4);
+        let (snapshots, mut receiver) = watch::channel(PlaybackSnapshot::default());
+        let (events, _) = mpsc::unbounded_channel();
+
+        handle_worker_event(
+            WorkerEvent::Reanchored {
+                identity: AttemptIdentity { id: 1, session },
+                position_seconds: Some(1.0),
+            },
+            &mut state,
+            &snapshots,
+            &output,
+            &events,
+        )
+        .await;
+
+        assert_eq!(state.position_base_seconds, Some(1.0));
+        let published = receiver.borrow_and_update().clone();
+        assert_eq!(published.state, EngineState::Playing);
+        // 尚未渲染任何样本，位置就等于校准后的起点（不能残留 1.4）。
+        assert_eq!(published.position_seconds, Some(1.0));
+
+        // 不可信值不得改动基准（否则会把歌词甩到任意位置）。
+        handle_worker_event(
+            WorkerEvent::Reanchored {
+                identity: AttemptIdentity { id: 1, session },
+                position_seconds: Some(f64::NAN),
+            },
+            &mut state,
+            &snapshots,
+            &output,
+            &events,
+        )
+        .await;
+        assert_eq!(state.position_base_seconds, Some(1.0));
+    }
+
+    /// 回归：回收中的 worker 只做**有界**阻塞；超时后必须解除，不得让后续
+    /// Start/Seek 永久排队。
+    #[tokio::test]
+    async fn stalled_retiring_worker_blocks_the_next_launch_only_until_the_deadline() {
+        let session = SessionRef {
+            session_id: Uuid::new_v4(),
+            generation: 1,
+        };
+        let mut state = active_state(session, EngineState::Playing);
+        // 模拟卡在不可中断阻塞调用里的解码线程：远长于回收超时的阻塞任务。
+        let (block_tx, block_rx) = std::sync::mpsc::channel::<()>();
+        let stuck = tokio::task::spawn_blocking(move || {
+            let _ = block_rx.recv_timeout(WORKER_RETIRE_TIMEOUT * 4);
+        });
+        state
+            .retiring_workers
+            .push(RetiringWorker::new(ActiveWorker {
+                identity: AttemptIdentity { id: 1, session },
+                cancel: Arc::new(AtomicBool::new(false)),
+                task: stuck,
+            }));
+        let output = output();
+        let (snapshots, _) = watch::channel(PlaybackSnapshot::default());
+        let (events, _) = mpsc::unbounded_channel();
+        // 新会话的 Start：进入 pending，等待旧 worker 回收完成后再起播。
+        handle_command(
+            EngineCommand::Start {
+                session_id: Uuid::new_v4(),
+                generation: 2,
+                song_key: SongKey::new("bilibili", "BV1us411d75p").unwrap(),
+                stream: stream(),
+                end_behavior: EndBehavior::NotifyController,
+                seek_seconds: None,
+            },
+            &mut state,
+            &snapshots,
+            &output,
+            &events,
+        )
+        .unwrap();
+        assert!(state.pending_launch.is_some());
+
+        // 回收窗口内仍保持原语义：先等旧线程退出，避免两个解码线程同时写帧。
+        assert!(
+            state.active_worker.is_none(),
+            "回收窗口内不应启动第二个解码线程"
+        );
+
+        // 超过回收超时后，卡死的 worker 被标记为孤儿，起播必须继续。
+        {
+            let mut entries = state.retiring_workers.iter_mut();
+            let retiring = entries.next().expect("retiring worker should exist");
+            retiring.deadline = Instant::now() - Duration::from_millis(1);
+        }
+        maybe_start_pending(&mut state, &output, &events);
+        assert!(
+            state.retiring_workers.is_empty(),
+            "回收超时的 worker 必须被标记为孤儿并从列表移除"
+        );
+        assert!(
+            state.active_worker.is_some(),
+            "回收超时后必须继续起播（否则播放永久排队）"
+        );
+        let _ = block_tx.send(());
+    }
+
+    /// 回归：回收超时的孤儿 worker 也必须能被进度看门狗清理。
+    #[tokio::test]
+    async fn orphan_sweep_drops_only_expired_retiring_workers() {
+        let session = SessionRef {
+            session_id: Uuid::new_v4(),
+            generation: 1,
+        };
+        let mut state = active_state(session, EngineState::Playing);
+        let fresh = ActiveWorker {
+            identity: AttemptIdentity { id: 1, session },
+            cancel: Arc::new(AtomicBool::new(false)),
+            task: tokio::spawn(async {}),
+        };
+        let expired = ActiveWorker {
+            identity: AttemptIdentity { id: 2, session },
+            cancel: Arc::new(AtomicBool::new(false)),
+            task: tokio::spawn(async {}),
+        };
+        state.retiring_workers.push(RetiringWorker::new(fresh));
+        let mut expired = RetiringWorker::new(expired);
+        expired.deadline = Instant::now() - Duration::from_millis(1);
+        state.retiring_workers.push(expired);
+
+        orphan_expired_retiring_workers(&mut state);
+
+        assert_eq!(state.retiring_workers.len(), 1);
+        assert_eq!(state.retiring_workers[0].worker.identity.id, 1);
+    }
+
+    /// 回归：回收等待必须有超时，超时后不再保留 worker 阻塞后续起播。
+    #[tokio::test]
+    async fn retiring_a_stalled_worker_times_out_and_releases_the_slot() {
+        let session = SessionRef {
+            session_id: Uuid::new_v4(),
+            generation: 1,
+        };
+        let mut state = active_state(session, EngineState::Playing);
+        let (block_tx, block_rx) = std::sync::mpsc::channel::<()>();
+        let stuck = tokio::task::spawn_blocking(move || {
+            let _ = block_rx.recv_timeout(WORKER_RETIRE_TIMEOUT * 4);
+        });
+        let identity = AttemptIdentity { id: 1, session };
+        state.active_worker = Some(ActiveWorker {
+            identity,
+            cancel: Arc::new(AtomicBool::new(false)),
+            task: stuck,
+        });
+
+        let started = std::time::Instant::now();
+        super::retire_finished_worker(identity, &mut state).await;
+
+        assert!(
+            started.elapsed() < WORKER_RETIRE_TIMEOUT * 3,
+            "回收不得无限等待（实际 {:?}）",
+            started.elapsed()
+        );
+        assert!(state.active_worker.is_none());
+        assert!(state.retiring_workers.is_empty());
+        let _ = block_tx.send(());
     }
 }

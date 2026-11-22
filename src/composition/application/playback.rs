@@ -192,30 +192,29 @@ impl AppServices {
                 // 消费成功即确认 business：独占窗口回放时主链路不再把它当成新增追加，
                 // 避免对已被决策读者正常消费的命令误报“未执行”。
                 self.ui.chat_timeline.acknowledge_business(&message_id)?;
+                // 先判这条决策是否被当前窗口采纳，**再**决定关不关 Web 决策。
+                // 未开放的决策（例如没开换源时发「@换源」）必须被忽略并继续等，
+                // 提前关掉通道会让面板上的确认/跳过直接失败——大厅里任何人误发
+                // 一条未开放指令就能毁掉这个窗口。
+                if !song_request_decision_is_open(
+                    decision,
+                    allow_switch_source,
+                    allow_ai,
+                    allow_local,
+                ) {
+                    log::info!(
+                        "命令未执行：点歌决策「{}」当前未开放（换源可用：{}，AI 可用：{}，本地曲库可用：{}），忽略「{}」",
+                        decision.log_label(),
+                        allow_switch_source,
+                        allow_ai,
+                        allow_local,
+                        redacted_chat_text(&message.text)
+                    );
+                    continue;
+                }
                 // 聊天侧已作出决定：立即关闭 Web 决策，后续 submit 直接失败而不是假成功。
                 web_decision.close();
-                match decision {
-                    SongRequestDecision::Confirm => return Ok(SongRequestDecision::Confirm),
-                    SongRequestDecision::Skip => return Ok(SongRequestDecision::Skip),
-                    SongRequestDecision::SwitchSource if allow_switch_source => {
-                        return Ok(SongRequestDecision::SwitchSource);
-                    }
-                    SongRequestDecision::Ai if allow_ai => return Ok(SongRequestDecision::Ai),
-                    SongRequestDecision::LocalLibrary if allow_local => return Ok(decision),
-                    SongRequestDecision::Select | SongRequestDecision::SelectIndex(_) => {
-                        return Ok(decision);
-                    }
-                    _ => {
-                        log::info!(
-                            "命令未执行：点歌决策「{}」当前未开放（换源可用：{}，AI 可用：{}，本地曲库可用：{}），忽略「{}」",
-                            decision.log_label(),
-                            allow_switch_source,
-                            allow_ai,
-                            allow_local,
-                            redacted_chat_text(&message.text)
-                        );
-                    }
-                }
+                return Ok(decision);
             }
         }
         if let Some(decision) = web_decision.wait(Duration::from_millis(0))? {
@@ -228,6 +227,31 @@ impl AppServices {
         } else {
             Ok(SongRequestDecision::Cancelled)
         }
+    }
+}
+
+/// 当前点歌确认窗口是否采纳这条聊天决策。
+///
+/// 未开放的决策不是错误：窗口继续等待其他输入。它的唯一后果是**不能**提前
+/// 关闭 Web 决策通道，所以判定必须与「关通道」分成两步。
+fn song_request_decision_is_open(
+    decision: SongRequestDecision,
+    allow_switch_source: bool,
+    allow_ai: bool,
+    allow_local: bool,
+) -> bool {
+    match decision {
+        SongRequestDecision::Confirm
+        | SongRequestDecision::Skip
+        | SongRequestDecision::Select
+        | SongRequestDecision::SelectIndex(_) => true,
+        SongRequestDecision::SwitchSource => allow_switch_source,
+        SongRequestDecision::Ai => allow_ai,
+        SongRequestDecision::LocalLibrary => allow_local,
+        // Timeout/Stopped/Cancelled 不是聊天输入能产生的决策，防御性拒绝。
+        SongRequestDecision::Timeout
+        | SongRequestDecision::Stopped
+        | SongRequestDecision::Cancelled => false,
     }
 }
 
@@ -529,6 +553,90 @@ mod tests {
     use super::{automatic_advance_allowed, immediate_playback_evidence};
     use crate::config::LiveConfigs;
     use crate::features::playback::PlaybackCommand;
+
+    /// 回归：未开放的决策不算采纳，必须继续等——也**不能**关掉 Web 决策通道。
+    ///
+    /// 旧实现先无条件 `web_decision.close()` 再判 `allow_*`，于是大厅里任何
+    /// 人误发一条未开放指令（如没开换源时发「@换源」），面板上的确认/跳过
+    /// 就会直接失败。这里钉住判定口径；关通道的时机由下一条源码守卫断言。
+    #[test]
+    fn an_unopened_song_request_decision_is_not_accepted() {
+        use super::song_request_decision_is_open;
+        use crate::features::song_request::SongRequestDecision;
+
+        // 常规决策永远开放。
+        for decision in [
+            SongRequestDecision::Confirm,
+            SongRequestDecision::Skip,
+            SongRequestDecision::Select,
+            SongRequestDecision::SelectIndex(2),
+        ] {
+            assert!(
+                song_request_decision_is_open(decision, false, false, false),
+                "「{}」必须始终可以采纳",
+                decision.log_label()
+            );
+        }
+        // 可选决策跟随本次窗口的开放项。
+        assert!(!song_request_decision_is_open(
+            SongRequestDecision::SwitchSource,
+            false,
+            true,
+            true
+        ));
+        assert!(song_request_decision_is_open(
+            SongRequestDecision::SwitchSource,
+            true,
+            false,
+            false
+        ));
+        assert!(!song_request_decision_is_open(
+            SongRequestDecision::Ai,
+            true,
+            false,
+            true
+        ));
+        assert!(!song_request_decision_is_open(
+            SongRequestDecision::LocalLibrary,
+            true,
+            true,
+            false
+        ));
+        // 非聊天输入产生的终态决策不在此采纳。
+        for decision in [
+            SongRequestDecision::Timeout,
+            SongRequestDecision::Stopped,
+            SongRequestDecision::Cancelled,
+        ] {
+            assert!(!song_request_decision_is_open(decision, true, true, true));
+        }
+    }
+
+    /// 接线锁定：Web 决策通道只能在确认采纳之后关闭。
+    ///
+    /// 顺序反了不会报错：聊天窗口继续等，但面板侧的确认/跳过从此全部失败，
+    /// 而日志里只有一句「当前未开放」，看不出通道已经被关掉。
+    #[test]
+    fn web_decision_is_closed_only_after_the_decision_is_accepted() {
+        const SOURCE: &str = include_str!("playback.rs");
+        let body = SOURCE
+            .split("fn wait_for_decision_with_reader(")
+            .nth(1)
+            .expect("必须保留 wait_for_decision_with_reader");
+        let body = &body[..body
+            .find("fn song_request_decision_is_open(")
+            .unwrap_or(body.len())];
+        let accept = body
+            .find("song_request_decision_is_open(")
+            .expect("必须先判定决策是否开放");
+        let close = body
+            .find("web_decision.close();")
+            .expect("采纳后必须关闭 Web 决策通道");
+        assert!(
+            accept < close,
+            "必须先判定决策是否开放，再关闭 Web 决策通道；否则未开放指令会提前毁掉面板出口"
+        );
+    }
 
     #[test]
     fn partial_playback_error_is_distinguished_from_completed_command() {

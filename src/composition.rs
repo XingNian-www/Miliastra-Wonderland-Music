@@ -100,14 +100,14 @@ pub(crate) fn run(config_path: &Path) -> Result<RunOutcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::AppConfig;
 
     #[test]
     fn bundled_configuration_resolves_before_runtime_construction() {
-        // 完整配置模板（tests/fixtures/config.full.yaml）作为 AppConfig 完整
-        // YAML 的测试源；仓库根 config.yaml 已是最小启动配置（仅 bootstrap 字段）。
-        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml"))
-            .expect("load bundled config");
+        // 完整配置来自 `crate::config::bundled_config()`（编译进二进制的
+        // `src/config/test.full.yaml`）；仓库根 config.yaml 已是最小启动配置
+        // （仅 bootstrap 字段），而 `tests/` 不入库，干净检出时
+        // `tests/fixtures/config.full.yaml` 并不存在。
+        let config = crate::config::bundled_config();
 
         let resolved = ResolvedApplicationConfig::resolve(config)
             .expect("resolve all module configuration before runtime construction");

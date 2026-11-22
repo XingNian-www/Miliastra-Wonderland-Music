@@ -843,6 +843,11 @@ impl AppServices {
             UiResidencyOutcome::Failed(failure) => {
                 Err(anyhow!("{context}: 未能建立 UI 驻留：{failure}"))
             }
+            // 建立驻留任务的唯一目的就是确认落到目标界面；收尾回答「不产生聊天
+            // 驻留」说明任务根本没确认目标，必须报错而不是当成功（B16-P1-4）。
+            UiResidencyOutcome::NotApplicable => Err(anyhow!(
+                "{context}: UI 驻留任务未声明聊天驻留，未能确认 expected={target:?}"
+            )),
         }
     }
 }

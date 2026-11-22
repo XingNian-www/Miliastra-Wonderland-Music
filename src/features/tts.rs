@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 use std::fmt;
 
 use thiserror::Error;
+use tokio::sync::watch;
 
 use miliastra_playback::{PlaybackHandle, SpeechAudio, SpeechHealth, SpeechPlayer};
 
@@ -731,19 +732,114 @@ enum TtsMessage {
     Shutdown,
 }
 
+/// 设备/线程初始化失败后的冷却时长。
+///
+/// 冷却期内 `available()` 返回 false，避免每条 AI 回复都去重开一次音频设备；
+/// 冷却到期后允许再试一次。**不做永久判定**：一次瞬态的设备错误不应该让 TTS
+/// 一直不可用直到重启进程。
+const TTS_RECOVERY_COOLDOWN: Duration = Duration::from_secs(30);
+
 /// TTS 编排线程句柄。SpeechPlayer 懒加载；未启用/未配置 key 时不打开音频设备。
 pub struct TtsRuntime {
     playback: Option<PlaybackHandle>,
     worker: Mutex<Option<TtsWorker>>,
     pending: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
+    /// 硬关闭（`disabled()` 构造）：永远不可用，也不做恢复尝试。
     unavailable: AtomicBool,
-    health: Arc<Mutex<Option<SpeechHealth>>>,
+    availability: Arc<TtsAvailability>,
+}
+
+/// 语音可用性：最近一次观测到的播放器健康状态 + 失败后的恢复冷却。
+///
+/// 由 `TtsRuntime` 与 `tts-worker` 线程共享：任一侧观测到不健康都写进来，
+/// 冷却到期后 `available()` 重新放行一次尝试，避免把设备降级永久锁死。
+struct TtsAvailability {
+    health: Mutex<Option<SpeechHealth>>,
+    /// 允许下一次重试的最早时刻；`None` 表示当前没有未恢复的失败。
+    retry_after: Mutex<Option<Instant>>,
+}
+
+impl TtsAvailability {
+    fn new() -> Self {
+        Self {
+            health: Mutex::new(None),
+            retry_after: Mutex::new(None),
+        }
+    }
+
+    fn health(&self) -> Option<SpeechHealth> {
+        self.health
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// 记录一次健康状态；不健康时开启冷却，恢复健康时清除冷却。
+    fn record(&self, health: SpeechHealth) {
+        let healthy = health.is_healthy();
+        *self
+            .health
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(health);
+        if healthy {
+            self.clear_cooldown();
+        } else {
+            self.schedule_recovery();
+        }
+    }
+
+    fn schedule_recovery(&self) {
+        self.schedule_recovery_at(Instant::now() + TTS_RECOVERY_COOLDOWN);
+    }
+
+    fn schedule_recovery_at(&self, retry_after: Instant) {
+        *self
+            .retry_after
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(retry_after);
+    }
+
+    fn clear_cooldown(&self) {
+        *self
+            .retry_after
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    /// 现在是否允许发起一次新的尝试。
+    fn allows_attempt(&self) -> bool {
+        if self.health().as_ref().is_none_or(SpeechHealth::is_healthy) {
+            return true;
+        }
+        let retry_after = *self
+            .retry_after
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        retry_after.is_none_or(|deadline| Instant::now() >= deadline)
+    }
 }
 
 struct TtsWorker {
     sender: SyncSender<TtsMessage>,
     thread: JoinHandle<()>,
+}
+
+/// 线程已自行退出（panic 或播放器彻底关闭）时，旧句柄的 `try_send` 只会返回断连，
+/// 必须重建而不是继续复用。
+fn worker_is_reusable(worker: &TtsWorker) -> bool {
+    !worker.thread.is_finished()
+}
+
+/// 扣减待处理计数；饱和到 0，绝不回绕。
+///
+/// 重建线程时计数会被清零，而并发入队的失败回滚仍可能扣减它自己的那一份。
+/// 用 `fetch_sub` 直接相减会从 0 回绕成天文数字，之后所有入队永久 `QueueFull`，
+/// 与计数泄漏同样致命。
+fn release_pending(pending: &AtomicUsize, count: usize) {
+    let _ = pending.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(current.saturating_sub(count))
+    });
 }
 
 impl TtsRuntime {
@@ -754,7 +850,7 @@ impl TtsRuntime {
             pending: Arc::new(AtomicUsize::new(0)),
             stop: Arc::new(AtomicBool::new(false)),
             unavailable: AtomicBool::new(false),
-            health: Arc::new(Mutex::new(None)),
+            availability: Arc::new(TtsAvailability::new()),
         }
     }
 
@@ -765,20 +861,19 @@ impl TtsRuntime {
             pending: Arc::new(AtomicUsize::new(0)),
             stop: Arc::new(AtomicBool::new(true)),
             unavailable: AtomicBool::new(true),
-            health: Arc::new(Mutex::new(Some(SpeechHealth::Closed))),
+            availability: Arc::new(TtsAvailability::new()),
         }
     }
 
-    /// 播放器是否仍可能可用（懒加载前为 true；启动失败后为 false）。
+    /// 播放器是否仍可能可用（懒加载前为 true）。
+    ///
+    /// 设备降级/关闭期间为 false 以退避，但冷却到期后会重新放行一次尝试——
+    /// 拔插耳机、蓝牙重连这类瞬态故障必须能自愈，不能永久判定不可用。
     pub fn available(&self) -> bool {
         if self.unavailable.load(Ordering::Acquire) || self.stop.load(Ordering::Acquire) {
             return false;
         }
-        let health = self
-            .health
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        health.as_ref().is_none_or(SpeechHealth::is_healthy)
+        self.availability.allows_attempt()
     }
 
     fn ensure_worker(&self) -> Result<(), TtsError> {
@@ -786,14 +881,39 @@ impl TtsRuntime {
             .worker
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if guard.is_some() {
-            return Ok(());
+        if let Some(worker) = guard.as_ref() {
+            if worker_is_reusable(worker) {
+                return Ok(());
+            }
+            // 线程已自行退出：旧句柄的 `try_send` 只会一直返回断连，
+            // 不清掉就再也发不出任务，而 `available()` 还会误报可用。
+            log::warn!(
+                "TTS 语音线程已自行退出（步骤：懒加载语音线程），重建线程后再处理本次语音请求"
+            );
+            if let Some(worker) = guard.take() {
+                let _ = worker.sender.try_send(TtsMessage::Shutdown);
+                let _ = worker.thread.join();
+            }
+            // 线程退出（尤其 panic）时通道里还没被 worker 取走的 Job 永远不会走到
+            // `release_pending`，这些计数会永久偏高。旧通道已随句柄一起丢弃，
+            // 计数清零是安全的；不重置的话 `pending` 达到 `queue_max` 之后，
+            // 重建出来的新线程也再也收不到任务（全部 `QueueFull`），正好抵消
+            // 「线程可重建」这项修复。
+            let discarded = self.pending.swap(0, Ordering::AcqRel);
+            if discarded > 0 {
+                log::warn!(
+                    "TTS 语音线程重建时丢弃了 {discarded} 条未处理的语音请求（步骤：重建语音线程），待处理计数已清零，后续语音可以继续入队"
+                );
+            }
         }
         if self.unavailable.load(Ordering::Acquire) {
             return Err(TtsError::Player("speech player unavailable".to_string()));
         }
         let player = SpeechPlayer::spawn().map_err(|error| {
-            self.unavailable.store(true, Ordering::Release);
+            // 只进入冷却，不永久锁死：设备重新接上后冷却到期即可再试。
+            self.availability.record(SpeechHealth::Degraded {
+                reason: format!("语音设备初始化失败：{error}"),
+            });
             TtsError::Player(error.to_string())
         })?;
         let playback = self
@@ -803,7 +923,7 @@ impl TtsRuntime {
         let (sender, receiver) = mpsc::sync_channel(256);
         let worker_pending = Arc::clone(&self.pending);
         let worker_stop = Arc::clone(&self.stop);
-        let worker_health = Arc::clone(&self.health);
+        let worker_availability = Arc::clone(&self.availability);
         let thread = thread::Builder::new()
             .name("tts-worker".to_string())
             .spawn(move || {
@@ -813,11 +933,13 @@ impl TtsRuntime {
                     player,
                     worker_pending,
                     worker_stop,
-                    worker_health,
+                    worker_availability,
                 )
             })
             .map_err(|error| {
-                self.unavailable.store(true, Ordering::Release);
+                self.availability.record(SpeechHealth::Degraded {
+                    reason: format!("语音线程启动失败：{error}"),
+                });
                 TtsError::Player(format!("spawn tts-worker: {error}"))
             })?;
         *guard = Some(TtsWorker { sender, thread });
@@ -862,7 +984,7 @@ impl TtsRuntime {
         self.ensure_worker()?;
         let max = config.queue_max.max(1);
         if self.pending.fetch_add(1, Ordering::AcqRel) >= max {
-            self.pending.fetch_sub(1, Ordering::AcqRel);
+            release_pending(&self.pending, 1);
             return Err(TtsError::QueueFull);
         }
         let sender = self
@@ -872,7 +994,7 @@ impl TtsRuntime {
             .as_ref()
             .map(|worker| worker.sender.clone());
         let Some(sender) = sender else {
-            self.pending.fetch_sub(1, Ordering::AcqRel);
+            release_pending(&self.pending, 1);
             return Err(TtsError::Disabled);
         };
         match sender.try_send(TtsMessage::Job(TtsJob {
@@ -883,11 +1005,11 @@ impl TtsRuntime {
         })) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => {
-                self.pending.fetch_sub(1, Ordering::AcqRel);
+                release_pending(&self.pending, 1);
                 Err(TtsError::QueueFull)
             }
             Err(TrySendError::Disconnected(_)) => {
-                self.pending.fetch_sub(1, Ordering::AcqRel);
+                release_pending(&self.pending, 1);
                 Err(TtsError::Disabled)
             }
         }
@@ -925,25 +1047,31 @@ fn run_tts_worker(
     mut player: SpeechPlayer,
     pending: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
-    health: Arc<Mutex<Option<SpeechHealth>>>,
+    availability: Arc<TtsAvailability>,
 ) {
     while let Ok(message) = receiver.recv() {
         match message {
             TtsMessage::Shutdown => break,
             TtsMessage::Job(job) => {
-                pending.fetch_sub(1, Ordering::AcqRel);
+                release_pending(&pending, 1);
                 if stop.load(Ordering::Acquire) {
                     break;
                 }
-                if !player.is_alive() {
-                    log::warn!("TTS SpeechPlayer 失活，尝试 restart 后再处理队列");
-                    if let Err(error) = player.restart() {
-                        log::warn!("TTS SpeechPlayer restart 失败：{error}");
+                // 线程已退出或输出流降级（拔耳机、独占冲突）都要重开输出流：
+                // 只判 `is_alive()` 会漏掉「线程还活着但流已坏」的降级状态，
+                // 那样每条语音都只会被丢进一个不再回调的缓冲。
+                if !player.is_alive() || !player.health().is_healthy() {
+                    log::warn!(
+                        "TTS 语音播放器不可用，重启后再处理队列（步骤：重开语音输出流，线程存活或输出流降级）"
+                    );
+                    match player.restart() {
+                        Ok(()) => log::info!("TTS 语音输出已恢复（步骤：重开语音输出流）"),
+                        Err(error) => log::warn!(
+                            "TTS 语音输出重启失败，本条语音将被跳过（步骤：重开语音输出流）：{error}"
+                        ),
                     }
                 }
-                if let Ok(mut health) = health.lock() {
-                    *health = Some(player.health());
-                }
+                availability.record(player.health());
                 if job.queued_at.elapsed() > tts_job_ttl(&job.config) {
                     log::debug!("TTS 队列条目已过期，跳过");
                     continue;
@@ -952,9 +1080,7 @@ fn run_tts_worker(
                 if let Err(error) = &result {
                     log::warn!("TTS 语音跳过（文本回复不受影响）：{error}");
                 }
-                if let Ok(mut health) = health.lock() {
-                    *health = Some(player.health());
-                }
+                availability.record(player.health());
             }
         }
     }
@@ -999,6 +1125,9 @@ fn synthesize_and_speak(
     let wait_limit = tts_play_wait_limit(audio_duration);
     let mut duck = DuckGuard::new(playback.clone());
     duck.engage(job.config.duck_volume, job.config.duck_fade_ms);
+    // 先订阅再投递：极短语音可能在第一次采样之前就播完，订阅晚于投递会连
+    // 「发生过播放」这条线索都拿不到。
+    let mut active = player.subscribe_active();
     if let Err(error) = player.speak(SpeechAudio::Pcm {
         sample_rate: pcm.sample_rate,
         channels: pcm.channels,
@@ -1017,11 +1146,13 @@ fn synthesize_and_speak(
     let deadline = Instant::now() + wait_limit;
     let mut started_playing = false;
     loop {
+        let (observed_started, speaking) = sample_playback(&mut active, started_playing);
+        started_playing = observed_started;
         let state = TtsWaitState {
             now: Instant::now(),
             deadline,
             started_playing,
-            speaking: player.is_speaking(),
+            speaking,
             stop_requested: stop.load(Ordering::Acquire),
             health: health.borrow_and_update().clone(),
         };
@@ -1042,13 +1173,27 @@ fn synthesize_and_speak(
                 let _ = player.restart();
                 break;
             }
+            TtsWaitStep::RestartBeforeStart => {
+                // 设备降级但本条语音还没开播：重开输出流，让下一条语音有机会播出，
+                // 而不是把 Degraded 原样写回健康状态、让 `available()` 永久为 false。
+                let _ = player.stop();
+                match player.restart() {
+                    Ok(()) => log::info!(
+                        "TTS 语音输出已恢复，本段语音已放弃（步骤：设备降级后重开输出流）"
+                    ),
+                    Err(error) => log::warn!(
+                        "TTS 语音输出重启失败，本段语音已放弃，待冷却结束后重试（步骤：设备降级后重开输出流）：{error}"
+                    ),
+                }
+                duck.restore();
+                return Ok(());
+            }
             TtsWaitStep::AbandonBeforeStart => {
                 // 播放器已关闭且从未开始播放：没有 duck 需要恢复以外的事情要做。
                 duck.restore();
                 return Ok(());
             }
             TtsWaitStep::Poll { interval } => {
-                started_playing |= state.speaking;
                 thread::sleep(interval);
             }
         }
@@ -1059,6 +1204,18 @@ fn synthesize_and_speak(
         audio_duration.as_secs_f64()
     );
     Ok(())
+}
+
+/// 采样一次播放状态，并把 watch 通道的「发生过变化」并入「已确认开播」。
+///
+/// `SpeechPlayer` 的 active 通道记录的是真实的 true→false 迁移：极短语音
+/// （例如「嗯」「收到」）或 OS 调度抖动会让它在两次采样之间就播完，此时瞬时
+/// 布尔已经是 false。只看瞬时布尔会永远确认不到「已经开始播放」，只能一路等到
+/// `tts_play_wait_limit`（至少 3 秒）超时，音乐就被无故压低了整整 3 秒。
+fn sample_playback(active: &mut watch::Receiver<bool>, started_playing: bool) -> (bool, bool) {
+    let changed = active.has_changed().unwrap_or(false);
+    let speaking = *active.borrow_and_update();
+    (started_playing || changed || speaking, speaking)
 }
 
 /// 语音等待的轮询步长：刚提交时密、之后稀。
@@ -1089,6 +1246,8 @@ enum TtsWaitStep {
     StopBeforeStart,
     /// 播放器降级：停掉、尝试 restart，然后收尾。
     RestartPlayer,
+    /// 还没开始播放播放器就降级了：重开输出流，放弃本段并恢复 duck。
+    RestartBeforeStart,
     /// 还没开始播放播放器就关闭了：放弃本段并恢复 duck。
     AbandonBeforeStart,
     /// 继续等，`interval` 之后再查一次。
@@ -1115,8 +1274,9 @@ impl TtsWaitState {
                 return if self.started_playing {
                     TtsWaitStep::RestartPlayer
                 } else {
-                    // 从未开始播放：没有「播到一半」需要打断，直接放弃。
-                    TtsWaitStep::AbandonBeforeStart
+                    // 从未开始播放：没有「播到一半」需要打断，但设备降级必须
+                    // 尝试重开输出流，否则降级状态会一直被写回健康状态。
+                    TtsWaitStep::RestartBeforeStart
                 };
             }
             SpeechHealth::Closed => {
@@ -1638,9 +1798,11 @@ mod tests {
             state(true, true, false, degraded.clone()).next(),
             TtsWaitStep::RestartPlayer
         );
+        // 降级但还没开播：必须重开输出流（只放弃不重启会把 Degraded 永久写回
+        // 健康状态，让 available() 一直为 false，直到重启进程）。
         assert_eq!(
             state(false, false, false, degraded).next(),
-            TtsWaitStep::AbandonBeforeStart
+            TtsWaitStep::RestartBeforeStart
         );
         // 播放器关闭：同样不等超时。
         assert_eq!(
@@ -1682,6 +1844,189 @@ mod tests {
             health: SpeechHealth::Healthy,
         };
         assert_eq!(past_deadline.next(), TtsWaitStep::Stop);
+    }
+
+    /// 极短语音可能在两次采样之间就播完：只有「发生过变化」这一条线索。
+    #[test]
+    fn a_short_utterance_that_finishes_between_two_polls_still_counts_as_played() {
+        let (sender, mut receiver) = watch::channel(false);
+        // 投递后立刻 true→false：采样时瞬时状态已经回落。
+        sender.send_replace(true);
+        sender.send_replace(false);
+
+        let (started_playing, speaking) = sample_playback(&mut receiver, false);
+
+        assert!(!speaking, "采样时瞬时状态已经是「没在播」");
+        assert!(
+            started_playing,
+            "通道版本变化说明它确实播过；只看瞬时布尔会一路等到 ≥3 秒超时，音乐被无故压低"
+        );
+        let state = TtsWaitState {
+            now: Instant::now(),
+            deadline: Instant::now() + tts_play_wait_limit(Duration::from_millis(120)),
+            started_playing,
+            speaking,
+            stop_requested: false,
+            health: SpeechHealth::Healthy,
+        };
+        assert_eq!(state.next(), TtsWaitStep::Finished);
+    }
+
+    /// 瞬态设备失败只进入冷却，冷却到期后必须重新允许尝试。
+    #[test]
+    fn tts_stays_retryable_after_a_transient_device_failure_instead_of_permanently_unavailable() {
+        let availability = TtsAvailability::new();
+        assert!(availability.allows_attempt(), "懒加载前必须允许首次尝试");
+
+        availability.record(SpeechHealth::Degraded {
+            reason: "device busy".to_string(),
+        });
+        assert!(
+            !availability.allows_attempt(),
+            "刚失败时必须退避，避免每条 AI 回复都重开一次音频设备"
+        );
+
+        // 模拟冷却到期（不真的等 30 秒）。
+        availability.schedule_recovery_at(Instant::now() - Duration::from_millis(1));
+        assert!(
+            availability.allows_attempt(),
+            "冷却到期必须允许再试一次，不能像旧实现那样永久判定不可用"
+        );
+
+        availability.record(SpeechHealth::Healthy);
+        assert!(availability.allows_attempt());
+        assert!(matches!(availability.health(), Some(SpeechHealth::Healthy)));
+
+        availability.record(SpeechHealth::Closed);
+        assert!(!availability.allows_attempt());
+    }
+
+    /// 语音线程自行退出后，旧句柄必须被丢弃重建。
+    #[test]
+    fn ensure_worker_rebuilds_a_thread_that_already_exited() {
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        let (started_tx, started_rx) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            let _ = started_tx.send(());
+        });
+        let _ = started_rx.recv();
+        for _ in 0..1_000 {
+            if thread.is_finished() {
+                break;
+            }
+            thread::yield_now();
+        }
+        assert!(thread.is_finished(), "测试线程必须已经结束");
+
+        let runtime = TtsRuntime {
+            playback: None,
+            worker: Mutex::new(Some(TtsWorker { sender, thread })),
+            pending: Arc::new(AtomicUsize::new(0)),
+            stop: Arc::new(AtomicBool::new(false)),
+            unavailable: AtomicBool::new(false),
+            availability: Arc::new(TtsAvailability::new()),
+        };
+
+        // 没有 playback，重建必然返回 Err；关键是旧句柄必须先被丢弃。
+        assert!(runtime.ensure_worker().is_err());
+        assert!(
+            runtime
+                .worker
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_none(),
+            "已退出的语音线程必须被丢弃，否则后续 try_send 永远返回断连而 available() 仍报可用"
+        );
+    }
+
+    /// 排队中的一条假 Job：只为占住通道与计数，不会真的合成语音。
+    fn queued_job() -> TtsJob {
+        TtsJob {
+            text: "排队中的语音".to_string(),
+            config: TtsConfig::default(),
+            options: TtsSpeakOptions::default(),
+            queued_at: Instant::now(),
+        }
+    }
+
+    fn wait_until_finished(handle: &JoinHandle<()>) {
+        for _ in 0..1_000 {
+            if handle.is_finished() {
+                return;
+            }
+            thread::yield_now();
+        }
+        panic!("测试线程必须已经结束");
+    }
+
+    /// 回归（A4-P2）：线程 panic 退出后重建必须清零泄漏的待处理计数。
+    ///
+    /// 旧实现只丢弃旧句柄、不重置 `pending`：通道里没被 worker 消费的 Job 永远
+    /// 不会执行扣减，计数永久偏高；达到 `queue_max` 后，重建出来的新线程也收不到
+    /// 任何任务——所有入队永久 `QueueFull`，正好抵消「线程可重建」这项修复。
+    #[test]
+    fn rebuilding_an_exited_worker_clears_the_leaked_pending_count() {
+        let (old_sender, old_receiver) = mpsc::sync_channel(8);
+        // 模拟 worker panic 前没来得及消费的 Job：留在旧通道里，计数没人扣。
+        old_sender
+            .try_send(TtsMessage::Job(queued_job()))
+            .expect("测试通道容量足够");
+        let (started_tx, started_rx) = mpsc::channel();
+        let dead_thread = thread::spawn(move || {
+            let _ = started_tx.send(());
+        });
+        let _ = started_rx.recv();
+        wait_until_finished(&dead_thread);
+
+        let runtime = TtsRuntime {
+            playback: None,
+            worker: Mutex::new(Some(TtsWorker {
+                sender: old_sender,
+                thread: dead_thread,
+            })),
+            pending: Arc::new(AtomicUsize::new(1)),
+            stop: Arc::new(AtomicBool::new(false)),
+            unavailable: AtomicBool::new(false),
+            availability: Arc::new(TtsAvailability::new()),
+        };
+
+        // 没有 playback，重建必然返回 Err；关键是旧句柄被丢弃且计数清零。
+        assert!(runtime.ensure_worker().is_err());
+        assert_eq!(
+            runtime.pending.load(Ordering::Acquire),
+            0,
+            "重建已退出的语音线程时必须清零待处理计数，否则达到 queue_max 后永久 QueueFull"
+        );
+        drop(old_receiver);
+
+        // 换上一个活着的假 worker：队列上限 1，清零后第一次入队必须成功。
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let live_thread = thread::spawn(move || while receiver.recv().is_ok() {});
+        *runtime
+            .worker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TtsWorker {
+            sender,
+            thread: live_thread,
+        });
+
+        let config = TtsConfig {
+            enabled: true,
+            api_key: "测试用 key".to_string(),
+            queue_max: 1,
+            ..TtsConfig::default()
+        };
+        assert!(
+            runtime.enqueue(&config, "你好").is_ok(),
+            "重建清零后必须能继续入队，不能因为泄漏的计数永久 QueueFull"
+        );
+        assert!(
+            matches!(
+                runtime.enqueue(&config, "再说一次"),
+                Err(TtsError::QueueFull)
+            ),
+            "计数清零后仍要按 queue_max 正常限流"
+        );
     }
 
     #[test]

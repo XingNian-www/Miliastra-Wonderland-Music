@@ -95,6 +95,15 @@ fn volume_smooth_sequence(current: u8, target: u8) -> Vec<u8> {
     sequence
 }
 
+/// 播放器上报的秒数转 [`Duration`]。
+///
+/// 位置/时长来自播放引擎的浮点字段，一次异常计算就可能带出 NaN、负数或无穷大；
+/// `Duration::from_secs_f64` 遇到这些输入会 panic，而这条路径在播放采样线程上，
+/// panic 等于整个采样停摆。转换失败时这一项留空（位置/时长未知），不影响其余字段。
+fn seconds_to_duration(seconds: f64) -> Option<Duration> {
+    Duration::try_from_secs_f64(seconds).ok()
+}
+
 impl PlayerObservationPort for NativePlaybackAdapter {
     fn read_sample(&mut self) -> Result<RawPlayerSample, PlayerObservationReadError> {
         let snapshot = self
@@ -111,10 +120,10 @@ impl PlayerObservationPort for NativePlaybackAdapter {
             artist: metadata.map(|metadata| metadata.artists.join(" / ")),
             album_name: metadata.and_then(|metadata| metadata.album.clone()),
             lyric_line_text: snapshot.lyric_line_text,
-            progress: snapshot.position_seconds.map(Duration::from_secs_f64),
+            progress: snapshot.position_seconds.and_then(seconds_to_duration),
             duration: snapshot
                 .duration_seconds
-                .map(Duration::from_secs_f64)
+                .and_then(seconds_to_duration)
                 .or_else(|| {
                     metadata
                         .and_then(|metadata| metadata.duration_ms)
@@ -385,7 +394,9 @@ fn dispatch_error(error: PlaybackError) -> ControlDispatchOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::{pick_playable_candidate, providers, volume_smooth_sequence};
+    use std::time::Duration;
+
+    use super::{pick_playable_candidate, providers, seconds_to_duration, volume_smooth_sequence};
     use crate::features::playback::test_candidate;
     use miliastra_playback::{PlaybackEligibility, ProviderId};
 
@@ -449,6 +460,24 @@ mod tests {
         );
         assert!(providers("qqmusic,unknown").is_err());
         assert!(providers("qqmusic,,netease").is_err());
+    }
+
+    /// B01-P0-4 回归：播放器上报的秒数一旦是 NaN/负数/无穷大，必须退化为
+    /// 「位置未知」，而不是让 `Duration::from_secs_f64` panic 打断播放采样线程。
+    #[test]
+    fn invalid_seconds_degrade_to_unknown_instead_of_panicking() {
+        assert_eq!(seconds_to_duration(0.0), Some(Duration::ZERO));
+        assert_eq!(
+            seconds_to_duration(12.5),
+            Some(Duration::from_millis(12_500))
+        );
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, f64::MAX] {
+            assert_eq!(
+                seconds_to_duration(invalid),
+                None,
+                "非法秒数 {invalid} 必须退化为缺失，不得 panic"
+            );
+        }
     }
 
     #[test]

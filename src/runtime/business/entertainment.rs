@@ -192,7 +192,7 @@ impl EntertainmentRuntimeState {
     ) -> Result<IdiomChainOutcome, BusinessRuntimeError> {
         let outcome = self
             .idiom_chain
-            .explain_at(player, command, observed_at)
+            .explain_at(&mut self.entertainment, player, command, observed_at)
             .map_err(idiom_chain_operation_failed)?;
         self.sync_idiom(timer)?;
         Ok(outcome)
@@ -294,7 +294,11 @@ impl EntertainmentRuntimeState {
                 clock_active,
                 response,
             } => {
-                let _ = response.send(Ok(self.number_bomb.tick(now, clock_active)));
+                let _ = response.send(Ok(self.number_bomb.tick(
+                    &mut self.entertainment,
+                    now,
+                    clock_active,
+                )));
             }
             NumberBombRuntimeMessage::Abort(response) => {
                 let _ = response.send(Ok(self.number_bomb.abort(&mut self.entertainment)));

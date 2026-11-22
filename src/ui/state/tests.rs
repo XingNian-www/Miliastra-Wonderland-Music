@@ -54,7 +54,7 @@ fn dump_ui_state_evidence_for_gallery() {
         return;
     };
     let out_path = std::env::var("MILIASTRA_GALLERY_OUT").expect("MILIASTRA_GALLERY_OUT 必须给出");
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    let config = crate::config::bundled_config();
     let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
     let panels = panel_regions_from(&config);
     let canvas = Canvas {
@@ -702,7 +702,12 @@ fn game_gate_ocr_accepts_spaced_exact_text_and_offsets_its_center() {
 
 #[test]
 fn world_wish_fixture_matches_both_backgrounds_and_shifted_icon() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "world_wish_fixture_matches_both_backgrounds_and_shifted_icon",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     for (fixture, wish_x) in [
         ("tests/fixtures/ui/world-wish-top-bar.png", 266),
         ("tests/fixtures/ui/world-wish-overworld-top-bar.png", 348),
@@ -747,7 +752,12 @@ fn world_wish_fixture_matches_both_backgrounds_and_shifted_icon() {
 /// 那会让 final_rule 变成回退规则，测不到我们真正要测的东西。
 #[test]
 fn main_menu_is_classified_before_secondary_back() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "main_menu_is_classified_before_secondary_back",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     // 6 张是稳定帧，按钮完全不透明；step-5 / step-last 是菜单淡出过程中的
     // 过渡帧，按钮只剩约两成不透明度，任何模板都不该去追这种帧（单独特判它们
     // 就是拿观测凑结果）。过渡帧由应用自身的稳定性闸门挡掉：它们不会被标成
@@ -865,7 +875,7 @@ fn main_menu_is_classified_before_secondary_back() {
 #[test]
 #[ignore = "requires the local real screenshot corpus under technical-docs/ui-state-evidence or dist/sandbox-run"]
 fn teyvat_world_chat_is_not_the_hall() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    let config = crate::config::bundled_config();
     // 语料跨两个目录：证据目录与运行目录，两边都要找。
     let classify = |name: &str| {
         let path =
@@ -927,7 +937,11 @@ fn teyvat_world_chat_is_not_the_hall() {
 /// 两者不重叠。谁改坏了量法或阈值，这条测试都会直接失败，而不是靠"结果刚好对"。
 #[test]
 fn loading_screens_are_classified_as_loading() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus("loading_screens_are_classified_as_loading")
+    {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let classify_with_rule = |path: &str| {
         let image = image::open(path).unwrap_or_else(|e| panic!("打不开 {path}: {e}"));
         let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
@@ -1090,6 +1104,9 @@ fn dark_but_colorful_scene_is_not_loading() {
 /// 所以对位移与轻度缩放都不敏感。
 #[test]
 fn world_is_separated_by_cyan_band_count() {
+    if crate::test_support::corpus::skip_without_corpus("world_is_separated_by_cyan_band_count") {
+        return;
+    }
     let count_of = |path: &str| {
         let image = image::open(path).unwrap_or_else(|e| panic!("打不开 {path}: {e}"));
         world_cyan_band_count(&image, 1.0)
@@ -1188,7 +1205,12 @@ fn world_is_separated_by_cyan_band_count() {
 /// 于是改成 HUD 在场检测 —— 见下面两条正面测试。
 #[test]
 fn world_probe_never_guesses_a_world_outside_hud_states() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "world_probe_never_guesses_a_world_outside_hud_states",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let mut checked = 0_usize;
     for name in [
         "sweep-49/01-paimon-menu.jpg",
@@ -1239,7 +1261,12 @@ fn world_probe_never_guesses_a_world_outside_hud_states() {
 /// 提瓦特的大世界帧（app 单帧只会判成 unknown）也必须拿到 teyvat。
 #[test]
 fn world_probe_decides_both_worlds_when_hud_is_present() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "world_probe_decides_both_worlds_when_hud_is_present",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let world_of = |path: &str| {
         let image = image::open(path).unwrap_or_else(|e| panic!("打不开 {path}: {e}"));
         let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
@@ -1288,6 +1315,11 @@ fn world_probe_decides_both_worlds_when_hud_is_present() {
 /// HUD 在场检测本身的分离度自证：在场与不在场两组必须**不重叠**。
 #[test]
 fn hud_presence_is_separated_by_reference_distance() {
+    if crate::test_support::corpus::skip_without_corpus(
+        "hud_presence_is_separated_by_reference_distance",
+    ) {
+        return;
+    }
     let distance_of = |path: &str| {
         let image = image::open(path).unwrap_or_else(|e| panic!("打不开 {path}: {e}"));
         let (teyvat, qianxing, _scale) =
@@ -1339,6 +1371,11 @@ fn hud_presence_is_separated_by_reference_distance() {
 /// 第 58 节就是因为拿 n=1 的候选直接上线，才在菜单上自信判错。
 #[test]
 fn qianxing_map_is_separated_by_dark_and_dark_teal_ratios() {
+    if crate::test_support::corpus::skip_without_corpus(
+        "qianxing_map_is_separated_by_dark_and_dark_teal_ratios",
+    ) {
+        return;
+    }
     let tone_of = |path: &str| {
         let image = image::open(path).unwrap_or_else(|e| panic!("打不开 {path}: {e}"));
         qianxing_map_tone(&image).unwrap_or_else(|| panic!("{path} 应能算出统计量"))
@@ -1432,7 +1469,12 @@ fn qianxing_map_is_separated_by_dark_and_dark_teal_ratios() {
 /// 都能命中；反过来，任何“整屏恰好偏暗青但没有这块标签”的页面也不会被它收进来。
 #[test]
 fn qianxing_map_anchor_separates_real_maps_from_every_other_screen() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "qianxing_map_anchor_separates_real_maps_from_every_other_screen",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
     let score_of = |path: &str| -> f32 {
         let image = image::open(path).unwrap_or_else(|e| panic!("打不开 {path}: {e}"));
@@ -1522,7 +1564,12 @@ fn qianxing_map_anchor_separates_real_maps_from_every_other_screen() {
 /// 右下角锚点命中 → `Secondary(secondary:qianxing_map)`，且证据里带的是锚点探针。
 #[test]
 fn qianxing_map_anchor_classifies_as_secondary_hall_map() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "qianxing_map_anchor_classifies_as_secondary_hall_map",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
     for name in [
         "qianxing-entry-56/07-qianxing-map.jpg",
@@ -1588,7 +1635,12 @@ fn qianxing_map_anchor_classifies_as_secondary_hall_map() {
 /// 这条测试防的是"把 1920×1080 的绝对坐标当成所有画面的坐标"。
 #[test]
 fn qianxing_map_anchor_survives_frame_scaling() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "qianxing_map_anchor_survives_frame_scaling",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
     let source =
         image::open("technical-docs/ui-state-evidence/qianxing-entry-56/07-qianxing-map.jpg")
@@ -1631,7 +1683,12 @@ fn qianxing_map_label_text_requires_both_words() {
 /// 离线可测——OCR 设备是桩，不依赖模型文件；模板路径本身也不需要 OCR。
 #[test]
 fn qianxing_map_label_ocr_backup_reads_the_bottom_right_label() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "qianxing_map_label_ocr_backup_reads_the_bottom_right_label",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let image =
         image::open("technical-docs/ui-state-evidence/qianxing-entry-56/07-qianxing-map.jpg")
             .unwrap();
@@ -1661,7 +1718,10 @@ fn qianxing_map_label_ocr_backup_reads_the_bottom_right_label() {
 /// 反向保证：把上面那批真实画面逐帧过一遍分类器，**一个都不许**被判成 loading。
 #[test]
 fn no_real_screen_is_classified_as_loading() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus("no_real_screen_is_classified_as_loading") {
+        return;
+    }
+    let config = crate::config::bundled_config();
     for name in [
         "loading-screens/teyvat-map-with-wp-panel.jpg",
         "loading-screens/after-teleport-new-scene.jpg",
@@ -1710,7 +1770,12 @@ fn no_real_screen_is_classified_as_loading() {
 
 #[test]
 fn chat_markers_need_the_hall_bottom_bar_to_mean_the_hall() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "chat_markers_need_the_hall_bottom_bar_to_mean_the_hall",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     // 提瓦特（世界聊天带气泡）与大世界：不许判成 primary
     for name in [
         "cold-start/enter-2.jpg",
@@ -1750,7 +1815,12 @@ fn chat_markers_need_the_hall_bottom_bar_to_mean_the_hall() {
 
 #[test]
 fn hub_menu_never_falls_through_to_overworld_after_unknown_grace() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "hub_menu_never_falls_through_to_overworld_after_unknown_grace",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     for name in [
         "wonderland-menu.png",
         "wonderland-menu-escape.png",
@@ -1786,7 +1856,12 @@ fn hub_menu_never_falls_through_to_overworld_after_unknown_grace() {
 /// 祈愿顶栏命中**并且**「有 HUD 且判为提瓦特」才算大世界。
 #[test]
 fn probe_game_state_rejects_world_wish_hits_outside_teyvat() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "probe_game_state_rejects_world_wish_hits_outside_teyvat",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
     // 负样本：千星大厅的多人面板与聊天框三帧。
     for name in [
@@ -1833,6 +1908,11 @@ fn probe_game_state_rejects_world_wish_hits_outside_teyvat() {
 /// 所以这条判据证明的是"界面骨架"而不是"某一次的内容"。
 #[test]
 fn qianxing_player_panel_is_separated_by_reference_distance() {
+    if crate::test_support::corpus::skip_without_corpus(
+        "qianxing_player_panel_is_separated_by_reference_distance",
+    ) {
+        return;
+    }
     let distance_of = |path: &str| {
         let image = image::open(path).unwrap_or_else(|e| panic!("打不开 {path}: {e}"));
         qianxing_player_panel_distance(&image).unwrap_or_else(|| panic!("{path} 应能量出距离"))
@@ -1911,6 +1991,11 @@ fn qianxing_player_panel_is_separated_by_reference_distance() {
 /// 距离掉回 ≈±1 的水平。**阈值本身一个字没动**——这是原理性修法，不是调阈值。
 #[test]
 fn qianxing_player_panel_survives_small_pixel_shifts() {
+    if crate::test_support::corpus::skip_without_corpus(
+        "qianxing_player_panel_survives_small_pixel_shifts",
+    ) {
+        return;
+    }
     let base = image::open("technical-docs/ui-state-evidence/qianxing-ui-59/r10-now.jpg").unwrap();
     let (width, height) = (base.width(), base.height());
     for (dx, dy) in [(1, 0), (-1, 0), (2, 0), (-2, 0), (3, 0), (-3, 0)] {
@@ -1950,7 +2035,12 @@ fn qianxing_player_panel_survives_small_pixel_shifts() {
 ///   锚点分数都低于 0.95，分类不得是 F2 多人面板。
 #[test]
 fn f2_hall_page_bottom_buttons_classify_secondary_multiplayer_panel() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "f2_hall_page_bottom_buttons_classify_secondary_multiplayer_panel",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
     let threshold = templates
         .chat_templates
@@ -2090,7 +2180,12 @@ fn f2_hall_page_bottom_buttons_classify_secondary_multiplayer_panel() {
 
 #[test]
 fn classifier_keeps_chat_priority_and_probes_game_states_only_after_unknown_grace() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "classifier_keeps_chat_priority_and_probes_game_states_only_after_unknown_grace",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
     let calls = Arc::new(AtomicUsize::new(0));
     let text = Arc::new(Mutex::new("点击进入".to_string()));
@@ -2209,7 +2304,12 @@ fn classifier_keeps_chat_priority_and_probes_game_states_only_after_unknown_grac
 
 #[test]
 fn pixel_identical_unknown_cache_hit_advances_fallback_time() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "pixel_identical_unknown_cache_hit_advances_fallback_time",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
     let calls = Arc::new(AtomicUsize::new(0));
     let ocr = OcrRuntime::start(
@@ -2251,8 +2351,12 @@ fn friend_anchor_uses_primary_friend_status() {
 
 #[test]
 fn fixed_scrolled_friend_list_uses_the_back_anchor_for_secondary_state() {
-    let config =
-        AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).expect("load default config");
+    if crate::test_support::corpus::skip_without_corpus(
+        "fixed_scrolled_friend_list_uses_the_back_anchor_for_secondary_state",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let image = image::open("tests/fixtures/ui/secondary-chat-scrolled-1920x1080.jpg")
         .expect("open fixed secondary-chat screenshot");
     assert_eq!((image.width(), image.height()), (1920, 1080));
@@ -2366,7 +2470,7 @@ fn hall_bar_white_threshold_prefers_exact_white_and_falls_back_when_scaled() {
 /// 255 与 225 签名完全一致（7 块 / 高 26 / 极差 0）。
 #[test]
 fn hall_bar_structure_separates_hall_from_menu_and_teyvat() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    let config = crate::config::bundled_config();
     let rect: Rect = config.screen.hall_bar_rect.into();
     let (origin_x, origin_y) = (rect.x, rect.y);
 
@@ -2431,7 +2535,7 @@ fn hall_bar_structure_separates_hall_from_menu_and_teyvat() {
 /// 旧上限 14 把更宽的白色结构也算了进来。合成帧钉住边界 7/8 通过、6/9/10/14 拒绝。
 #[test]
 fn hall_bottom_bar_accepts_seven_or_eight_keys_only() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    let config = crate::config::bundled_config();
     let rect: Rect = config.screen.hall_bar_rect.into();
     let (origin_x, origin_y) = (rect.x, rect.y);
     let keys = |count: i32| {
@@ -2471,7 +2575,12 @@ fn hall_bottom_bar_accepts_seven_or_eight_keys_only() {
 /// 先用 `snap_near_white_to_pure_white` 把白色还原成纯白（等价于线上的无损抓图）再跑判据。
 #[test]
 fn overworld_requires_hud_and_one_to_four_bottom_keys() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "overworld_requires_hud_and_one_to_four_bottom_keys",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let hall_rect: Rect = config.screen.hall_bar_rect.into();
 
     // ── 边界样本：真实提瓦特帧（HUD 在场）上清空底栏后精确画 0..=8 个白键。
@@ -2616,7 +2725,10 @@ fn overworld_requires_hud_and_one_to_four_bottom_keys() {
 /// 与好友会话仍然判 Secondary。
 #[test]
 fn secondary_chat_requires_the_send_anchor() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus("secondary_chat_requires_the_send_anchor") {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let secondary = [
         "technical-docs/ui-state-evidence/round78-live.png",
         "technical-docs/ui-state-evidence/secondary-full.png",
@@ -2678,7 +2790,12 @@ fn panel_regions_from(config: &AppConfig) -> PanelRegions {
 /// 排序，避免大厅卡被档案卡那条暗按钮误命中。
 #[test]
 fn panel_fixtures_are_labelled_by_their_own_anchor() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "panel_fixtures_are_labelled_by_their_own_anchor",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
     let panels = panel_regions_from(&config);
     for (name, label) in [
@@ -2721,7 +2838,12 @@ fn panel_fixtures_are_labelled_by_their_own_anchor() {
 /// 确认弹窗的正样本：按钮 + 对应关键词文案必须判成对应子类型。
 #[test]
 fn confirm_dialogs_are_classified_by_button_and_message() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "confirm_dialogs_are_classified_by_button_and_message",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
     let panels = panel_regions_from(&config);
     for (path, label) in [
@@ -2789,7 +2911,12 @@ fn fill_rgb_rect(image: &mut image::RgbImage, rect: Rect, color: image::Rgb<u8>)
 /// 文案在但确认按钮被去掉 → 同样不判。文案换成「屏蔽聊天」也不得判确认。
 #[test]
 fn confirm_dialog_requires_both_button_and_message_anchors() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "confirm_dialog_requires_both_button_and_message_anchors",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
     let panels = panel_regions_from(&config);
     let source = image::open("tests/fixtures/ui/panel-confirm-dialog-1920x1080.jpg")
@@ -2846,7 +2973,12 @@ fn confirm_dialog_requires_both_button_and_message_anchors() {
 /// 固定坐标、固定列距、商城图标或 OCR。
 #[test]
 fn paimon_menu_is_detected_by_layout_independent_grid() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "paimon_menu_is_detected_by_layout_independent_grid",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     for path in [
         "tests/fixtures/ui/menu-paimon-1920x1080.jpg",
         "technical-docs/ui-state-evidence/sweep-49/01-paimon-menu.jpg",
@@ -2918,6 +3050,11 @@ fn paimon_menu_is_detected_by_layout_independent_grid() {
 /// 旧方案（固定「队伍配置/成就」坐标 + 列距 325）在这些变换下会失效。
 #[test]
 fn paimon_grid_survives_translation_and_item_changes() {
+    if crate::test_support::corpus::skip_without_corpus(
+        "paimon_grid_survives_translation_and_item_changes",
+    ) {
+        return;
+    }
     let base = image::open("tests/fixtures/ui/menu-paimon-1920x1080.jpg")
         .unwrap()
         .to_rgb8();
@@ -2974,6 +3111,9 @@ fn paimon_grid_survives_translation_and_item_changes() {
 /// debug 构建给宽松上限（CI 的 debug 几倍慢），release 断言目标 <5ms。
 #[test]
 fn paimon_grid_detection_is_fast() {
+    if crate::test_support::corpus::skip_without_corpus("paimon_grid_detection_is_fast") {
+        return;
+    }
     let rgb = image::open("tests/fixtures/ui/menu-paimon-1920x1080.jpg")
         .unwrap()
         .to_rgb8();
@@ -2996,7 +3136,12 @@ fn paimon_grid_detection_is_fast() {
 /// 旧版式（互动按钮）继续靠 friend_panel 模板命中；hall 页/主菜单/加载/大厅不得误判。
 #[test]
 fn friend_list_new_variant_is_panel_and_old_layout_still_works() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "friend_list_new_variant_is_panel_and_old_layout_still_works",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
     let classify = |path: &str| {
         let image = image::open(path).unwrap_or_else(|e| panic!("打不开 {path}: {e}"));
@@ -3299,8 +3444,8 @@ fn corpus_manifest_confirmed_classification_gate() {
             manifest_path.display()
         )
     });
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml"))
-        .expect("不可提交：门禁失败：测试配置加载失败");
+    // 不可提交：门禁失败：测试配置加载失败
+    let config = crate::config::bundled_config();
     let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
     // 与生产同一条构造路径（composition/application.rs）：面板判据必须注入区域，否则
     // 覆盖层会全部落回 Unknown，门禁会把"没接线"误报成"分类错误"。
@@ -3510,7 +3655,12 @@ fn corpus_manifest_confirmed_classification_gate() {
 /// task-121：21 张非 OCR mismatch 的回归（千星覆盖页/亮底加载/亮底千星地图/派蒙误标）。
 #[test]
 fn task121_overlay_loading_and_bright_map_regressions() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "task121_overlay_loading_and_bright_map_regressions",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
     let classify = |path: &str| {
         let image = image::open(path).unwrap_or_else(|e| panic!("打不开 {path}: {e}"));
@@ -3828,7 +3978,7 @@ fn gallery_panel_probe_scores(
 /// - `MILIASTRA_REPORT_IMAGE`：输入截图（必填）
 /// - `MILIASTRA_REPORT_OUT`：输出 JSON（必填）
 /// - `MILIASTRA_REPORT_EXPECT`：可选期望标签，仅原样记录
-/// - `MILIASTRA_REPORT_CONFIG`：可选配置，默认 `tests/fixtures/config.full.yaml`
+/// - `MILIASTRA_REPORT_CONFIG`：可选配置；未给出时用内置完整配置（`bundled_config`）
 #[test]
 #[ignore = "单帧 UI 检测报告导出：需要 MILIASTRA_REPORT_IMAGE / MILIASTRA_REPORT_OUT"]
 #[cfg(test)]
@@ -3837,10 +3987,12 @@ fn dump_ui_detect_report() {
         return;
     };
     let out_path = std::env::var("MILIASTRA_REPORT_OUT").expect("MILIASTRA_REPORT_OUT 必须给出");
-    let config_path = std::env::var("MILIASTRA_REPORT_CONFIG")
-        .unwrap_or_else(|_| "tests/fixtures/config.full.yaml".to_string());
+    let config_path = std::env::var("MILIASTRA_REPORT_CONFIG").ok();
     let expect = std::env::var("MILIASTRA_REPORT_EXPECT").ok();
-    let config = AppConfig::load(Path::new(&config_path)).unwrap();
+    let config = match config_path.as_deref() {
+        Some(path) => AppConfig::load(Path::new(path)).unwrap(),
+        None => crate::config::bundled_config(),
+    };
     let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
     let panels = panel_regions_from(&config);
     let canvas = Canvas {
@@ -3999,7 +4151,7 @@ fn dump_ui_detect_report() {
             "scale_x": image.width() as f64 / source_width as f64,
             "scale_y": image.height() as f64 / source_height as f64,
         },
-        "config": config_path,
+        "config": config_path.as_deref().unwrap_or("<bundled>"),
         "expect": expect,
         "kind": classification.kind().name(),
         "label": classification.label(),
@@ -4084,7 +4236,10 @@ fn dump_ui_detect_report() {
 /// task-126 验证集：每个 surface 正/负样本，先验证再改模板。
 #[test]
 fn task126_surface_validation_sets() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus("task126_surface_validation_sets") {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
     let classify = |path: &str| {
         let image = image::open(path).unwrap_or_else(|e| panic!("打不开 {path}: {e}"));
@@ -4308,7 +4463,7 @@ fn profile_page_scan_paths(root: &Path, out: &mut Vec<PathBuf>) {
 #[test]
 #[ignore = "诊断：个人资料页双模板在证据帧上的分数分布；MILIASTRA_PROFILE_PAGE_SCAN=1 扫描全量"]
 fn profile_page_button_score_diagnostic() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    let config = crate::config::bundled_config();
     let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
     let mut paths: Vec<PathBuf> = Vec::new();
     if std::env::var_os("MILIASTRA_PROFILE_PAGE_SCAN").is_some() {
@@ -4369,7 +4524,11 @@ const PROFILE_PAGE_FRAME: &str = "technical-docs/ui-state-evidence/qianxing-prof
 
 #[test]
 fn profile_page_frame_is_panel_profile_page() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus("profile_page_frame_is_panel_profile_page")
+    {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let mut classifier = profile_page_classifier(&config);
     let image = image::open(PROFILE_PAGE_FRAME)
         .unwrap_or_else(|error| panic!("打不开 {PROFILE_PAGE_FRAME}: {error}"));
@@ -4428,7 +4587,12 @@ fn profile_page_frame_is_panel_profile_page() {
 /// 负样本：现有面板/二级/主菜单不得被个人资料页双按钮判据抢走。
 #[test]
 fn profile_page_does_not_steal_existing_panels() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "profile_page_does_not_steal_existing_panels",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let mut classifier = profile_page_classifier(&config);
     let cases = [
         // 档案卡 / 大厅卡 / 更多设置 / 好友面板 / 搜索页 / 头像弹窗（提瓦特面板）
@@ -4543,7 +4707,10 @@ fn profile_page_does_not_steal_existing_panels() {
 /// 另一个模板仍达到阈值（证明是「双命中」要求把它拦下来的，不是分数掉下去）。
 #[test]
 fn profile_page_requires_both_buttons() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus("profile_page_requires_both_buttons") {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let mut classifier = profile_page_classifier(&config);
     let templates = UiTemplateArgs::default().resolve(&config.templates, &config.ocr);
     let base = image::open(PROFILE_PAGE_FRAME)
@@ -4586,7 +4753,10 @@ fn profile_page_requires_both_buttons() {
 /// 四张用户实拍帧 + 三张旧档案卡帧必须逐帧判出具体四分类。
 #[test]
 fn profile_card_four_way_classification() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus("profile_card_four_way_classification") {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let mut classifier = profile_page_classifier(&config);
     for (path, label) in [
         (
@@ -4667,7 +4837,12 @@ fn paste_rect(
 /// 好友/非好友只差「添加好友」：抹掉按钮后必须从非好友翻成好友。
 #[test]
 fn profile_card_friend_flag_flips_when_add_friend_is_erased() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "profile_card_friend_flag_flips_when_add_friend_is_erased",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let mut classifier = profile_page_classifier(&config);
     // 负样本背景来自同版式的好友/空白帧，只覆盖按钮本身，不手绘内容。
     let teyvat_blank =
@@ -4719,7 +4894,12 @@ fn profile_card_friend_flag_flips_when_add_friend_is_erased() {
 /// 千星好友帧：没有「添加好友」，但「查看资料」必须命中。
 #[test]
 fn qianxing_profile_friend_uses_view_profile_without_add_friend() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "qianxing_profile_friend_uses_view_profile_without_add_friend",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let mut classifier = profile_page_classifier(&config);
     for path in [
         "technical-docs/ui-state-evidence/qianxing-profile-card-friend.png",

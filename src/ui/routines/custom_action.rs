@@ -10,6 +10,7 @@ use crate::adapters::input::parse_key;
 use crate::change_detection::{change_stats, rect_chat_change_fingerprint};
 use crate::geometry::{Point, Rect, crop_canvas};
 use crate::runtime::ocr::{OcrPriority, OcrRuntimeHandle};
+use crate::runtime::recovery::GameRecoveryCoordinator;
 use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure,
     UiRoutineProgressStage, UiRuntimeHandle, UiSubmitError, sealed,
@@ -64,6 +65,8 @@ pub(crate) struct CustomActionUi {
     running: Arc<AtomicBool>,
     canvas: CustomActionCanvas,
     residency: FriendDeliveryRoutineConfig,
+    /// 进程级共享的恢复协调器（见 [`SettleEnvironment::with_recovery`]）。
+    recovery: GameRecoveryCoordinator,
 }
 
 impl CustomActionUi {
@@ -84,7 +87,14 @@ impl CustomActionUi {
                 height: canvas_height,
             },
             residency,
+            recovery: GameRecoveryCoordinator::default(),
         }
+    }
+
+    /// 用进程级共享的恢复协调器替换默认实例（装配层只 `default()` 一次）。
+    pub(crate) fn with_recovery(mut self, recovery: GameRecoveryCoordinator) -> Self {
+        self.recovery = recovery;
+        self
     }
 
     pub(crate) fn submit(
@@ -97,6 +107,7 @@ impl CustomActionUi {
             running: Arc::clone(&self.running),
             canvas: self.canvas,
             residency: self.residency.clone(),
+            recovery: self.recovery.clone(),
         })
     }
 }
@@ -113,6 +124,15 @@ struct CustomActionRoutine {
     running: Arc<AtomicBool>,
     canvas: CustomActionCanvas,
     residency: FriendDeliveryRoutineConfig,
+    recovery: GameRecoveryCoordinator,
+}
+
+impl CustomActionRoutine {
+    /// 脚本里 `EnsureResidency` 的收尾环境：同样挂进程级协调器。
+    fn environment(&self) -> SettleEnvironment {
+        SettleEnvironment::new(self.ocr.clone(), self.residency.clone())
+            .with_recovery(self.recovery.clone())
+    }
 }
 
 impl sealed::UiRoutineSealed for CustomActionRoutine {}
@@ -122,6 +142,7 @@ impl UiRoutine for CustomActionRoutine {
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
         let operation_count = self.request.operations.len();
+        let environment = self.environment();
         let mut completed = 0;
         let mut input_performed = false;
         for (index, operation) in self.request.operations.into_iter().enumerate() {
@@ -131,6 +152,7 @@ impl UiRoutine for CustomActionRoutine {
             });
             match execute_operation(
                 context,
+                &environment,
                 &self.ocr,
                 &self.running,
                 self.canvas,
@@ -196,6 +218,15 @@ struct CustomActionTask {
     running: Arc<AtomicBool>,
     canvas: CustomActionCanvas,
     residency: FriendDeliveryRoutineConfig,
+    recovery: GameRecoveryCoordinator,
+}
+
+impl CustomActionTask {
+    /// 收尾环境必须挂着进程级共享的协调器，否则本次恢复记账只活在本任务里。
+    fn environment(&self) -> SettleEnvironment {
+        SettleEnvironment::new(self.ocr.clone(), self.residency.clone())
+            .with_recovery(self.recovery.clone())
+    }
 }
 
 impl sealed::UiRoutineSealed for CustomActionTask {}
@@ -204,7 +235,7 @@ impl UiRoutine for CustomActionTask {
     type Output = CustomActionOutcome;
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
-        let environment = SettleEnvironment::new(self.ocr.clone(), self.residency.clone());
+        let environment = self.environment();
         let outcome = UiTask::new(
             custom_action_task_spec(environment),
             CustomActionRoutine {
@@ -213,6 +244,7 @@ impl UiRoutine for CustomActionTask {
                 running: self.running,
                 canvas: self.canvas,
                 residency: self.residency,
+                recovery: self.recovery,
             },
         )
         .execute(context);
@@ -228,6 +260,7 @@ impl UiRoutine for CustomActionTask {
 
 fn execute_operation(
     context: &mut UiRoutineContext<'_>,
+    environment: &SettleEnvironment,
     ocr: &OcrRuntimeHandle,
     running: &Arc<AtomicBool>,
     canvas: CustomActionCanvas,
@@ -302,12 +335,8 @@ fn execute_operation(
                     ResidencyTarget::Secondary(ConversationRef::CurrentHall)
                 }
             };
-            super::residency::settle_to(
-                context,
-                &SettleEnvironment::new(ocr.clone(), residency.clone()),
-                target,
-            )
-            .map_err(|failure| preserve_input_certainty(input_performed, failure))?;
+            super::residency::settle_to(context, environment, target)
+                .map_err(|failure| preserve_input_certainty(input_performed, failure))?;
             Ok(true)
         }
         WorkflowOperation::ReturnListenerResidency => Err(observation_reason(
@@ -908,7 +937,7 @@ mod tests {
         let keys = Arc::new(Mutex::new(Vec::new()));
         let ui_runtime = UiRuntime::start(RecordingDevice { keys: keys.clone() }, 4).unwrap();
         let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
-        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let config = crate::config::bundled_config();
         let action_ui = CustomActionUi::new(
             ui_runtime.handle(),
             ocr_runtime.handle(),
@@ -952,7 +981,7 @@ mod tests {
         let keys = Arc::new(Mutex::new(Vec::new()));
         let ui_runtime = UiRuntime::start(RecordingDevice { keys: keys.clone() }, 2).unwrap();
         let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
-        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let config = crate::config::bundled_config();
         let action_ui = CustomActionUi::new(
             ui_runtime.handle(),
             ocr_runtime.handle(),
@@ -999,7 +1028,7 @@ mod tests {
         )
         .unwrap();
         let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
-        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let config = crate::config::bundled_config();
         let action_ui = CustomActionUi::new(
             ui_runtime.handle(),
             ocr_runtime.handle(),
@@ -1041,7 +1070,7 @@ mod tests {
         )
         .unwrap();
         let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
-        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let config = crate::config::bundled_config();
         let action_ui = CustomActionUi::new(
             ui_runtime.handle(),
             ocr_runtime.handle(),
@@ -1092,7 +1121,7 @@ mod tests {
     /// P1 迁移批次 3：自定义脚本自己声明收尾；包装器不得在脚本结束后补动作。
     #[test]
     fn custom_action_task_spec_is_script_declared() {
-        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let config = crate::config::bundled_config();
         let spec = custom_action_task_spec(SettleEnvironment::without_ocr(
             FriendDeliveryRoutineConfig::from_app(&config),
         ));
@@ -1106,7 +1135,7 @@ mod tests {
         let keys = Arc::new(Mutex::new(Vec::new()));
         let ui_runtime = UiRuntime::start(RecordingDevice { keys: keys.clone() }, 4).unwrap();
         let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
-        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let config = crate::config::bundled_config();
         let action_ui = CustomActionUi::new(
             ui_runtime.handle(),
             ocr_runtime.handle(),
@@ -1150,7 +1179,7 @@ mod tests {
         let keys = Arc::new(Mutex::new(Vec::new()));
         let ui_runtime = UiRuntime::start(RecordingDevice { keys: keys.clone() }, 4).unwrap();
         let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
-        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let config = crate::config::bundled_config();
         let action_ui = CustomActionUi::new(
             ui_runtime.handle(),
             ocr_runtime.handle(),
@@ -1187,5 +1216,78 @@ mod tests {
         );
         ocr_runtime.shutdown().unwrap();
         ui_runtime.shutdown().unwrap();
+    }
+
+    /// B15-P2-4 回归：自定义脚本任务与 `EnsureResidency` 步骤都必须共享注入的协调器。
+    #[test]
+    fn custom_action_paths_share_the_injected_recovery_coordinator() {
+        let config = crate::config::bundled_config();
+        let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
+        let shared = GameRecoveryCoordinator::default();
+        shared.record_restart_completed(
+            std::time::Instant::now(),
+            crate::runtime::recovery::RecoveryTrigger::ExternalChatDisconnect,
+        );
+        let residency = FriendDeliveryRoutineConfig::from_app(&config);
+        let canvas = CustomActionCanvas {
+            width: config.screen.expected_width,
+            height: config.screen.expected_height,
+        };
+        let plan = || CustomActionPlan::new("共享协调器", Vec::new());
+        let running = || Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+        let task = CustomActionTask {
+            request: plan(),
+            ocr: ocr_runtime.handle(),
+            running: running(),
+            canvas,
+            residency: residency.clone(),
+            recovery: shared.clone(),
+        };
+        assert_eq!(
+            task.environment()
+                .recovery()
+                .health_snapshot_now()
+                .total_restarts,
+            1,
+            "脚本任务的收尾环境必须共享注入的协调器"
+        );
+
+        let routine = CustomActionRoutine {
+            request: plan(),
+            ocr: ocr_runtime.handle(),
+            running: running(),
+            canvas,
+            residency: residency.clone(),
+            recovery: shared.clone(),
+        };
+        assert_eq!(
+            routine
+                .environment()
+                .recovery()
+                .health_snapshot_now()
+                .total_restarts,
+            1,
+            "EnsureResidency 步骤的环境也必须共享注入的协调器"
+        );
+
+        let unwired = CustomActionTask {
+            request: plan(),
+            ocr: ocr_runtime.handle(),
+            running: running(),
+            canvas,
+            residency,
+            recovery: GameRecoveryCoordinator::default(),
+        };
+        assert_eq!(
+            unwired
+                .environment()
+                .recovery()
+                .health_snapshot_now()
+                .total_restarts,
+            0,
+            "默认构造的协调器不得看到共享实例的重启记录"
+        );
+        ocr_runtime.shutdown().unwrap();
     }
 }

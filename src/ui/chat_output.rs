@@ -521,6 +521,9 @@ impl ChatOutput {
         let residency_failure = match outcome.residency() {
             UiResidencyOutcome::Confirmed(_) => None,
             UiResidencyOutcome::Failed(failure) => Some(anyhow!(failure.to_string())),
+            // 大厅批量回复收尾固定为 `Fixed(Primary)`，正常不会出现「不产生聊天
+            // 驻留」；真出现时也没有可报告的恢复失败。
+            UiResidencyOutcome::NotApplicable => None,
         };
         match outcome.status() {
             HallBatchStatus::Failed(failure) => {
@@ -551,17 +554,29 @@ impl ChatOutput {
 /// 未超宽时返回**原样一条**（保留内部换行，调用方走单条发送路径）；
 /// 超宽时用 `split_numbered_chat_message("", …)`：80 宽、标点优先断行、
 /// 不劈开全角字符、不加「1/2：」编号。
+///
+/// 纯表情标签是**原子消息**（`{表情包:…}` 由下游表情面板解析后点击发送），
+/// 不能被宽度切分：多候选标签的显示宽度可以超过 80，但硬切只会留下半截
+/// 标签文本（B14-P1-2）。标签形态原样交出，真正的分段在表情面板里做。
 fn wrap_chat_message(message: &str) -> Vec<String> {
-    if display_width(message) <= MAX_CHAT_WIDTH {
+    if display_width(message) <= MAX_CHAT_WIDTH || is_emoji_tag_message(message) {
         vec![message.to_string()]
     } else {
         split_numbered_chat_message("", message)
     }
 }
 
+/// 一条待发消息是否只由表情标签组成。
+///
+/// 展开后的发送段就是「一个标签一条消息」（`expand_reply_for_sending`），
+/// 所以这里只关心纯标签形态；混排文本仍按普通文本排版。
+fn is_emoji_tag_message(message: &str) -> bool {
+    crate::text::emoji::is_tag_only_message(message)
+}
+
 pub(crate) fn fit_chat_message(message: &str) -> String {
     let message = message.trim();
-    if display_width(message) <= MAX_CHAT_WIDTH {
+    if display_width(message) <= MAX_CHAT_WIDTH || is_emoji_tag_message(message) {
         return message.to_string();
     }
 
@@ -583,10 +598,18 @@ fn fit_invite_message(message: &str) -> Option<String> {
     Some(fit_parts("", &message[..index], &message[index..]))
 }
 
+/// 麦克风切换回执的保尾压缩：`{玩家} 执行了切换麦克风状态！`。
+///
+/// 模板刻意**不带前导 `@`**（`cmd-freshness-FINAL.md` §6 自回显修正），所以这里
+/// 不能再要求 `starts_with('@')`——那会让规则永不触发。改为按 marker 的结构判断：
+/// 玩家名必须非空（marker 不在开头），marker 之后必须有正文（不是半句话），
+/// 避免把普通聊天里的「 执行了」误当成回执。
 fn fit_microphone_message(message: &str) -> Option<String> {
     let marker = " 执行了";
     let index = message.find(marker)?;
-    if !message.starts_with('@') {
+    let name = message[..index].trim();
+    let tail = &message[index + marker.len()..];
+    if name.is_empty() || tail.trim().is_empty() {
         return None;
     }
     Some(fit_parts("", &message[..index], &message[index..]))
@@ -796,6 +819,38 @@ mod tests {
         );
     }
 
+    /// B14-P1-2：纯表情标签是原子消息，适配阶段既不能按宽度切段，也不能截断。
+    ///
+    /// 单条多候选标签的显示宽度可以超过 80；一旦被切/截，下游只能拿到半截
+    /// `{表情包:`，表情发送必然失败，还会把控制文本当普通聊天发出去。
+    #[test]
+    fn tag_only_messages_are_never_width_split_or_truncated() {
+        let candidates = (0..8).map(|_| "a".repeat(10)).collect::<Vec<_>>().join("|");
+        let tag = format!("{{表情包:2:{candidates}}}");
+        assert!(
+            display_width(&tag) > MAX_CHAT_WIDTH,
+            "夹具必须超过单条宽度，否则测不到切分/截断路径：{}",
+            display_width(&tag)
+        );
+        assert!(
+            crate::text::emoji::is_tag_only_message(&tag),
+            "夹具必须是合法纯表情标签"
+        );
+
+        let fitted = fit_chat_message(&tag);
+        assert_eq!(fitted, tag, "适配阶段不得截断或改写表情标签");
+        assert!(
+            crate::text::emoji::parse_reply(&fitted).is_ok_and(|parsed| parsed.has_emoji()),
+            "适配后的文本必须仍能解析出表情标签"
+        );
+
+        assert_eq!(
+            wrap_chat_message(&tag),
+            vec![tag.clone()],
+            "标签只能原样一条（⇒ 走单条发送），不能被宽度切段"
+        );
+    }
+
     #[test]
     fn numbered_split_counts_ascii_as_half_width() {
         let source = "A".repeat(160);
@@ -967,6 +1022,51 @@ mod tests {
         assert_eq!(
             redacted_chat_text("请存活玩家好友私聊 #A"),
             "请存活玩家好友私聊 #A"
+        );
+    }
+
+    /// B14-P1-3：麦克风回执的自回显模板刻意不带前导 `@`
+    /// （`cmd-freshness-FINAL.md` §6），保尾压缩不能再用 `starts_with('@')` 当前置，
+    /// 否则规则永不触发、长昵称会把「 执行了切换麦克风状态！」截掉。
+    #[test]
+    fn microphone_receipt_is_fitted_without_a_leading_at() {
+        assert_eq!(
+            fit_microphone_message("甲 执行了切换麦克风状态！"),
+            Some("甲 执行了切换麦克风状态！".to_string()),
+            "模板不以 @ 开头也必须命中保尾压缩"
+        );
+
+        let name = "青柠气泡水".repeat(12);
+        let message = format!("{name} 执行了切换麦克风状态！");
+        assert!(display_width(&message) > MAX_CHAT_WIDTH);
+        let fitted = fit_chat_message(&message);
+        assert!(
+            fitted.ends_with(" 执行了切换麦克风状态！"),
+            "保尾压缩必须保住回执正文：{fitted}"
+        );
+        assert!(display_width(&fitted) <= MAX_CHAT_WIDTH, "{fitted}");
+        assert!(
+            display_width(&fitted) < display_width(&message),
+            "超宽回执必须被缩短：{fitted}"
+        );
+    }
+
+    /// 非回执文本不能被这条规则吞掉：没有 marker、marker 在开头（玩家名为空）、
+    /// marker 后没有正文，都返回 None，交回通用截断。
+    #[test]
+    fn microphone_fit_ignores_non_receipt_text() {
+        assert!(fit_microphone_message("今天完成任务之后大家一起去吃饭吧").is_none());
+        assert!(
+            fit_microphone_message("他执行了任务").is_none(),
+            "marker 带前导空格才算回执分隔符"
+        );
+        assert!(
+            fit_microphone_message(" 执行了切换麦克风状态！").is_none(),
+            "玩家名为空不是回执"
+        );
+        assert!(
+            fit_microphone_message("甲 执行了").is_none(),
+            "marker 后无正文"
         );
     }
 }

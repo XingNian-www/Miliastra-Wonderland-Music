@@ -87,6 +87,28 @@ const CARD_GAME_DEADLINE_TOKEN_ID: u64 = 1;
 const UNDERCOVER_DEADLINE_TOKEN_ID: u64 = 1;
 const TURTLE_SOUP_DEADLINE_TOKEN_ID: u64 = 1;
 
+/// 关停时等待 worker 退出（回包 + 线程收敛）的上限。
+///
+/// 演员可能正阻塞在某个同步端口调用里（SQLite 写、`player_io` 的 `sync_channel`
+/// 满、AI 调用……），这些阻塞没有取消点。`join()` 无超时会把退出流程和配置重载
+/// 一起挂死，进程只能强杀；超过这个期限就记 error 并放弃 join（detach），
+/// 让主流程继续关停其它子系统。见 `technical-docs/archive/.../concurrency.md`（P2-12）。
+const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// 从 `catch_unwind` 的载荷里取可读的 panic 文案。
+fn panic_detail(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("unknown panic")
+}
+
+/// `deadline` 之前的剩余时间；已过期则返回零（`recv_timeout(0)` 立即超时）。
+fn remaining_until(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub enum BusinessEvent {
     CompletionAdvance(CompletionAdvance),
@@ -340,6 +362,11 @@ pub enum BusinessRuntimeError {
     Quiescing,
     RuntimeStopped,
     WorkerPanicked,
+    /// 停机超时：worker 在 [`WORKER_SHUTDOWN_TIMEOUT`] 内没有退出，已被脱管。
+    ///
+    /// 与 [`Self::WorkerPanicked`] 分开，因为处置方式相反——panic 是线程已经没了，
+    /// 超时是线程还活着（可能仍持有玩法租约），调用方/日志需要能区分。
+    WorkerShutdownTimedOut,
     IdiomChainOperationFailed(String),
     CardGameOperationFailed(String),
     UndercoverOperationFailed(String),
@@ -361,6 +388,8 @@ impl Display for BusinessRuntimeError {
             Self::Quiescing => formatter.write_str("business runtime is quiescing"),
             Self::RuntimeStopped => formatter.write_str("business runtime is stopped"),
             Self::WorkerPanicked => formatter.write_str("business runtime worker panicked"),
+            Self::WorkerShutdownTimedOut => formatter
+                .write_str("business runtime worker did not stop before the shutdown deadline"),
             Self::IdiomChainOperationFailed(message) => {
                 write!(formatter, "idiom chain operation failed: {message}")
             }
@@ -2220,6 +2249,8 @@ impl TurtleSoupAiCompletionPort for TurtleSoupBusinessEventPort {
 pub struct BusinessRuntime {
     handle: BusinessRuntimeHandle,
     worker: Option<JoinHandle<()>>,
+    /// worker 线程跑完主循环后投递的回执；`stop_worker` 用它做有界等待。
+    finished: Receiver<()>,
     turtle_soup_workers: Option<TurtleSoupWorkerRuntime>,
 }
 
@@ -2236,9 +2267,30 @@ pub(crate) struct BusinessRuntimeWorker {
     timer: Option<TimerRuntimeHandle<BusinessDeadlineToken>>,
     state_sink: Option<Arc<dyn BusinessStateSink>>,
     clock: Arc<dyn Clock>,
+    /// 仅测试：本条运行时关停时，在 `abort_all` 之前注入一次 panic。
+    ///
+    /// 停机顺序（`should_stop` 必须先于清理置位）没法从外部观察——它只在
+    /// 「清理 panic 且被吞掉」时才有可观测差异，所以用注入点把它钉死。
+    #[cfg(test)]
+    abort_all_probe: Option<Arc<AbortAllPanicProbe>>,
 }
 
 impl BusinessRuntimeWorker {
+    /// 仅测试：让本条运行时在关停清理时 panic 一次。
+    #[cfg(test)]
+    pub(crate) fn with_abort_all_panic_injection(mut self) -> Self {
+        self.abort_all_probe = Some(AbortAllPanicProbe::armed());
+        self
+    }
+
+    /// 仅测试：拿一份注入探针的句柄，用于断言「panic 真的发生过」。
+    ///
+    /// 刻意用 clone 而不是 take：探针必须**留在 worker 里**才会被关停路径消费，
+    /// 取走之后注入就永远不会触发（测试会退化成真空）。
+    #[cfg(test)]
+    pub(crate) fn abort_all_probe(&self) -> Option<Arc<AbortAllPanicProbe>> {
+        self.abort_all_probe.clone()
+    }
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_parts(
         idiom_chain: IdiomChainService,
@@ -2267,6 +2319,8 @@ impl BusinessRuntimeWorker {
             timer: Some(timer),
             state_sink: Some(state_sink),
             clock,
+            #[cfg(test)]
+            abort_all_probe: None,
         }
     }
 
@@ -2347,6 +2401,8 @@ impl BusinessRuntime {
                 timer: None,
                 state_sink: None,
                 clock: Arc::new(SystemClock),
+                #[cfg(test)]
+                abort_all_probe: None,
             }
             .with_clock(clock),
         )
@@ -2375,6 +2431,8 @@ impl BusinessRuntime {
                 timer: None,
                 state_sink: None,
                 clock: Arc::new(SystemClock),
+                #[cfg(test)]
+                abort_all_probe: None,
             },
         )
     }
@@ -2407,9 +2465,15 @@ impl BusinessRuntime {
         } else {
             None
         };
+        let (finished_sender, finished) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name("business-runtime".to_string())
-            .spawn(move || run_business_runtime(receiver, worker_config))
+            .spawn(move || {
+                run_business_runtime(receiver, worker_config);
+                // 只为「线程真的跑完了」这一件事服务：`join()` 没有超时，
+                // 关停侧靠这条回执判断能否安全 join（见 `stop_worker`）。
+                let _ = finished_sender.send(());
+            })
             .map_err(|_| {
                 if let Some(workers) = turtle_soup_workers.as_mut() {
                     workers.shutdown();
@@ -2419,6 +2483,7 @@ impl BusinessRuntime {
         Ok(Self {
             handle: BusinessRuntimeHandle { channel },
             worker: Some(worker),
+            finished,
             turtle_soup_workers,
         })
     }
@@ -2498,19 +2563,74 @@ impl BusinessRuntime {
             }
             *state = RuntimeChannelState::Stopped;
         }
-        let sent = self
-            .handle
-            .channel
-            .sender
-            .send(RuntimeMessage::Shutdown(response))
-            .is_ok();
-        let snapshot = sent.then(|| receiver.recv().ok()).flatten();
-        let worker_result = worker
-            .join()
-            .map_err(|_| BusinessRuntimeError::WorkerPanicked);
+        // 整段关停共用**一个**期限：三段各自等满 3s 会让退出最多挂 9s，
+        // 而验收要求是「worker 卡住时 ~3s 内返回」。剩余时间逐段递减。
+        let deadline = Instant::now() + WORKER_SHUTDOWN_TIMEOUT;
+        // 入队也可能无限阻塞：队列满时 `send` 会一直等，而卡住的正是消费者。
+        // 用 `try_send` + 期限重试，把「投递关停指令」也纳入有界等待。
+        let sent = self.send_shutdown_bounded(RuntimeMessage::Shutdown(response), deadline);
+        let snapshot = if sent {
+            match receiver.recv_timeout(remaining_until(deadline)) {
+                Ok(snapshot) => Some(snapshot),
+                Err(RecvTimeoutError::Timeout) => {
+                    log::error!(
+                        "业务运行时在 {WORKER_SHUTDOWN_TIMEOUT:?} 内没有回应关停（步骤：等待停机快照），本次放弃等待并脱管该线程"
+                    );
+                    None
+                }
+                Err(RecvTimeoutError::Disconnected) => None,
+            }
+        } else {
+            None
+        };
+        // 有界收敛：先用 `finished` 回执判断线程是否真的跑完，再决定能否 `join()`。
+        // `join()` 本身没有期限，直接调它会把关停流程和配置重载一起挂死
+        // （`concurrency.md` P2-12）；超时就记 error 并脱管线程，让主流程继续。
+        let worker_result = match self.finished.recv_timeout(remaining_until(deadline)) {
+            Ok(()) => worker
+                .join()
+                .map_err(|_| BusinessRuntimeError::WorkerPanicked),
+            Err(RecvTimeoutError::Disconnected) => {
+                // 回执通道断了说明线程已经结束（只是没走到最后一行），`join` 会立刻返回。
+                worker
+                    .join()
+                    .map_err(|_| BusinessRuntimeError::WorkerPanicked)
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                log::error!(
+                    "业务运行时在 {WORKER_SHUTDOWN_TIMEOUT:?} 内没有退出（步骤：等待业务线程收敛），本次放弃 join 并脱管该线程；停机流程继续，残留的玩法租约由下次启动自检收拾"
+                );
+                drop(worker);
+                Err(BusinessRuntimeError::WorkerShutdownTimedOut)
+            }
+        };
         self.stop_external_workers();
         worker_result?;
         snapshot.ok_or(BusinessRuntimeError::RuntimeStopped)
+    }
+
+    /// 在 `deadline` 之前把停机指令投进队列。
+    ///
+    /// 队列满说明消费者没在取消息（正是我们要兜的卡死场景），
+    /// 所以这里不能用会阻塞的 `send`。
+    fn send_shutdown_bounded(&self, message: RuntimeMessage, deadline: Instant) -> bool {
+        let mut pending = message;
+        loop {
+            match self.handle.channel.sender.try_send(pending) {
+                Ok(()) => return true,
+                Err(mpsc::TrySendError::Disconnected(_)) => return false,
+                Err(mpsc::TrySendError::Full(returned)) => {
+                    pending = returned;
+                    if Instant::now() >= deadline {
+                        log::error!(
+                            "业务运行时队列在 {WORKER_SHUTDOWN_TIMEOUT:?} 内一直满（步骤：投递关停指令），消费者未在取消息；本次放弃投递并脱管该线程"
+                        );
+                        return false;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
     }
 }
 
@@ -2661,23 +2781,31 @@ fn sync_card_game_deadline(
             return Ok(());
         }
         if previous.token == token {
-            let Some(previous) = active.take() else {
-                return Err(BusinessRuntimeError::TimerOperationFailed(
-                    "card deadline state inconsistent".to_owned(),
-                ));
-            };
-            let cancellation = DeadlineCancellation::new(
-                previous.token.clone(),
-                previous.operation_id,
-                previous.session_generation,
-            );
-            if let Err(error) = timer.cancel(cancellation) {
-                *active = Some(previous);
-                return Err(BusinessRuntimeError::TimerOperationFailed(
-                    error.to_string(),
-                ));
-            }
-            pending_cancellations.push(previous);
+            // 同一 Token 只是改期：用 `reschedule` 原地更新。
+            //
+            // 不能走「`active.take()` + 异步 `Cancel`」：`Cancel` 只是把命令压进有界队列就
+            // 返回，从 take 到 `CommandCompleted(Cancel)` 回来之间 `active` 是 `None`，
+            // 并发消息看到 `None` 会立刻 `schedule` 同一个 Token —— 要么撞上
+            // `TokenAlreadyScheduled`（这次同步报错），要么在取消真正落地后连日程一起被删，
+            // 与 `pending_cancellations` 里的那份记录彻底错位。`reschedule` 换成
+            // 「先查 token 是否存在、存在就整条替换」，没有这个窗口。
+            let operation_id = operation_ids
+                .allocate()
+                .map_err(|error| BusinessRuntimeError::TimerOperationFailed(error.to_string()))?;
+            timer
+                .reschedule(DeadlineSchedule::new(
+                    previous.token.clone(),
+                    operation_id,
+                    previous.session_generation,
+                    deadline,
+                ))
+                .map_err(|error| BusinessRuntimeError::TimerOperationFailed(error.to_string()))?;
+            *active = Some(ActiveCardGameDeadline {
+                token: previous.token.clone(),
+                operation_id,
+                session_generation: previous.session_generation,
+                deadline,
+            });
             return Ok(());
         }
         let Some(previous) = active.take() else {
@@ -2797,23 +2925,25 @@ fn sync_turtle_soup_deadline(
             return Ok(());
         }
         if previous.token == token {
-            let Some(previous) = active.take() else {
-                return Err(BusinessRuntimeError::TimerOperationFailed(
-                    "turtle soup deadline state inconsistent".to_owned(),
-                ));
-            };
-            let cancellation = DeadlineCancellation::new(
-                previous.token.clone(),
-                previous.operation_id,
-                previous.session_generation,
-            );
-            if let Err(error) = timer.cancel(cancellation) {
-                *active = Some(previous);
-                return Err(BusinessRuntimeError::TimerOperationFailed(
-                    error.to_string(),
-                ));
-            }
-            pending_cancellations.push(previous);
+            // 同一 Token 只是改期：`reschedule` 原地替换，不留「active 为空」的飞行窗口。
+            // 细节见 `sync_card_game_deadline` 中同构分支的注释。
+            let operation_id = operation_ids
+                .allocate()
+                .map_err(|error| BusinessRuntimeError::TimerOperationFailed(error.to_string()))?;
+            timer
+                .reschedule(DeadlineSchedule::new(
+                    previous.token.clone(),
+                    operation_id,
+                    previous.session_generation,
+                    deadline,
+                ))
+                .map_err(|error| BusinessRuntimeError::TimerOperationFailed(error.to_string()))?;
+            *active = Some(ActiveTurtleSoupDeadline {
+                token: previous.token.clone(),
+                operation_id,
+                session_generation: previous.session_generation,
+                deadline,
+            });
             return Ok(());
         }
         let Some(previous) = active.take() else {
@@ -2896,23 +3026,25 @@ fn sync_undercover_deadline(
             return Ok(());
         }
         if previous.token == token {
-            let Some(previous) = active.take() else {
-                return Err(BusinessRuntimeError::TimerOperationFailed(
-                    "undercover deadline state inconsistent".to_owned(),
-                ));
-            };
-            let cancellation = DeadlineCancellation::new(
-                previous.token.clone(),
-                previous.operation_id,
-                previous.session_generation,
-            );
-            if let Err(error) = timer.cancel(cancellation) {
-                *active = Some(previous);
-                return Err(BusinessRuntimeError::TimerOperationFailed(
-                    error.to_string(),
-                ));
-            }
-            pending_cancellations.push(previous);
+            // 同一 Token 只是改期：`reschedule` 原地替换，不留「active 为空」的飞行窗口。
+            // 细节见 `sync_card_game_deadline` 中同构分支的注释。
+            let operation_id = operation_ids
+                .allocate()
+                .map_err(|error| BusinessRuntimeError::TimerOperationFailed(error.to_string()))?;
+            timer
+                .reschedule(DeadlineSchedule::new(
+                    previous.token.clone(),
+                    operation_id,
+                    previous.session_generation,
+                    deadline,
+                ))
+                .map_err(|error| BusinessRuntimeError::TimerOperationFailed(error.to_string()))?;
+            *active = Some(ActiveUndercoverDeadline {
+                token: previous.token.clone(),
+                operation_id,
+                session_generation: previous.session_generation,
+                deadline,
+            });
             return Ok(());
         }
         let Some(previous) = active.take() else {
@@ -3301,13 +3433,17 @@ fn handle_business_timer(
     {
         log::info!("成语接龙已到期结束，占用已释放，可以开始下一局玩法");
     }
-    sync_idiom_deadline(
+    // 到期结算已经落地，同步失败不该再把整条计时事件判为失败。
+    if let Err(error) = sync_idiom_deadline(
         idiom_chain,
         timer,
         active_idiom_deadline,
         operation_ids,
         generation,
-    )
+    ) {
+        report_deadline_sync_failure("成语接龙", &error);
+    }
+    Ok(())
 }
 
 fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: BusinessRuntimeWorker) {
@@ -3324,6 +3460,8 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
         timer,
         state_sink,
         clock,
+        #[cfg(test)]
+        abort_all_probe,
     } = worker_config;
     let mut snapshot = BusinessRuntimeSnapshot::default();
     let mut entertainment = EntertainmentComponent::new(
@@ -3522,27 +3660,103 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
                 let _ = response.send(snapshot);
             }
             RuntimeMessage::PrepareShutdown(response) => {
-                entertainment.abort_all(timer.as_ref(), clock.as_ref());
                 snapshot.quiescing = true;
+                abort_all_safely(&mut entertainment, timer.as_ref(), clock.as_ref());
                 let _ = response.send(snapshot);
             }
             RuntimeMessage::Shutdown(response) => {
-                entertainment.abort_all(timer.as_ref(), clock.as_ref());
-                let _ = response.send(snapshot);
+                // 停机决定必须**先**置位，再做任何可能 panic 的清理：
+                // `abort_all` 的 panic 由 `catch_unwind` 吞掉后流程会继续往下走，
+                // 若置位晚于它（或晚于 `response.send`），worker 会重新回到
+                // `recv()` 继续收消息，`stop_worker` 只能超时脱管一个仍然活着的线程。
                 should_stop = true;
+                // 注入点在 `abort_all_safely` **之外**：它模拟的是「清理 panic
+                // 逃出了本地 catch_unwind」这一形状（原始缺陷里正是外层
+                // `catch_unwind` 吞掉 panic、连带跳过 `should_stop` 与回包）。
+                // 放在 `abort_all_safely` 内部会被它的 catch 吞掉，测试就没法
+                // 区分置位顺序了。
+                #[cfg(test)]
+                if let Some(probe) = abort_all_probe.as_deref() {
+                    probe.take_for_abort_all();
+                }
+                abort_all_safely(&mut entertainment, timer.as_ref(), clock.as_ref());
+                let _ = response.send(snapshot);
             }
         }));
         if let Err(payload) = result {
-            let detail = payload
-                .downcast_ref::<&str>()
-                .copied()
-                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-                .unwrap_or("unknown panic");
             log::error!(
-                "业务运行时处理消息时崩溃（步骤：分发一条聊天消息），该条消息已跳过且不会重试，后续消息继续处理：{detail}"
+                "业务运行时处理消息时崩溃（步骤：分发一条聊天消息），该条消息已跳过且不会重试，后续消息继续处理：{}",
+                panic_detail(payload.as_ref())
             );
         }
-        entertainment.publish(clock.as_ref());
+        publish_safely(&entertainment, clock.as_ref());
+    }
+}
+
+/// 停机清理：`abort_all` 的 panic 不能把停机流程一起带走。
+fn abort_all_safely(
+    entertainment: &mut EntertainmentComponent,
+    timer: Option<&TimerRuntimeHandle<BusinessDeadlineToken>>,
+    clock: &dyn Clock,
+) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        entertainment.abort_all(timer, clock);
+    }));
+    if let Err(payload) = result {
+        log::error!(
+            "业务运行时停机清理时崩溃（步骤：中止各玩法并注销定时器），停机流程继续，残留的玩法租约由下次启动的自检收拾：{}",
+            panic_detail(payload.as_ref())
+        );
+    }
+}
+
+/// 广播停机后的业务状态：sink 实现里的 panic 同样不能带走 worker。
+fn publish_safely(entertainment: &EntertainmentComponent, clock: &dyn Clock) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        entertainment.publish(clock)
+    }));
+    if let Err(payload) = result {
+        log::error!(
+            "业务运行时广播状态时崩溃（步骤：推送玩法快照），本拍广播已跳过：{}",
+            panic_detail(payload.as_ref())
+        );
+    }
+}
+
+/// 只在回归测试里用的停机故障注入点。
+///
+/// 每个运行时各持一份，**不共用全局标记**：测试并行执行，用全局/线程局部标记
+/// 都会被别的用例的关停流程提前消费掉，注入变成假绿。探针挂在会被 worker
+/// 搬走的那份配置里，天然与「这一条运行时」一一对应。
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct AbortAllPanicProbe {
+    /// 关停时在 `abort_all` 清理路径上抛一次 panic（模拟清理崩溃逃出本地捕获）。
+    armed: std::sync::atomic::AtomicBool,
+    /// 注入是否真的触发过。测试必须先断言它，否则「停机顺序正确」可能只是因为
+    /// 注入根本没生效——那样测试是真空的。
+    triggered: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+impl AbortAllPanicProbe {
+    pub(crate) fn armed() -> Arc<Self> {
+        let probe = Self::default();
+        probe.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        Arc::new(probe)
+    }
+
+    fn take_for_abort_all(&self) {
+        if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.triggered
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            // `resume_unwind` 不触发 panic hook，测试输出不会被这层注入噪音淹没。
+            std::panic::resume_unwind(Box::new("注入的 abort_all panic（回归测试）"));
+        }
+    }
+
+    pub(crate) fn triggered(&self) -> bool {
+        self.triggered.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -3656,6 +3870,29 @@ fn abort_business_modules(
     pending_turtle_soup_cancellations.clear();
 }
 
+/// 领域状态已提交后，定时器同步失败**不得**回滚、也不得丢弃领域结果。
+///
+/// 玩法状态机（牌局/卧底/海龟汤）一旦推进，`EntertainmentState` 的互斥槽就已经易主，
+/// 而 `Suspended(CardGameEffectRequest)` 这类效果句柄也已经在 `result` 里产生了。
+/// 如果这时把 `sync_*_deadline` 的 `Err` 用 `?`/`.and_then` 往上抛，整个 `result`
+/// 会跟着被丢掉 —— 调用方永远等不到那一步效果，玩法自己也不会再释放娱乐槽，
+/// 结果是玩法状态机与 `EntertainmentState` **双向永久死锁**。
+///
+/// 正确语义是降级：这一局可能没有可用的超时定时器（不会自动超时/自动推进），
+/// 但领域结果必须原样返回给调用方。失败分支对 `active_*_deadline` 的处理分两种：
+/// `cancel` 失败时把原记录回填（旧定时器仍按旧 Token 在跑）；而 Token 变化路径上
+/// `cancel` 已成功、随后的 `schedule` 失败时，`active` 会留在 `None`（旧定时器已撤销、
+/// 新定时器没排上，本局此刻没有超时定时器）。
+///
+/// 两种退化都不需要补偿队列：下一次 `sync_*` 调用（下一条命令、`Tick`/`Poll`、
+/// 计时器完成回调、退出时的 `abort_all`）会按同一套对比逻辑重新对齐——`active`
+/// 为空时会重新 `schedule`，非空且 Token 一致时走 `reschedule`。
+fn report_deadline_sync_failure(module: &str, error: &BusinessRuntimeError) {
+    log::error!(
+        "{module}的领域状态已提交，但同步超时期限失败（步骤：写回阶段截止时间）；本次没有安排超时定时器，下一次同步会重新对齐：{error}"
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_card_game_message(
     card_games: &mut CardGameService,
@@ -3679,37 +3916,40 @@ fn handle_card_game_message(
         } => {
             let result = card_games
                 .begin_command_with_display(entertainment, &player, &player_display, &command, now)
-                .map_err(card_game_operation_failed)
-                .and_then(|result| {
-                    sync_card_game_deadline(
-                        card_games,
-                        timer,
-                        active_deadline,
-                        pending_cancellations,
-                        operation_ids,
-                        now,
-                        *clock_active,
-                    )?;
-                    Ok(result)
-                });
+                .map_err(card_game_operation_failed);
+            // 领域状态已提交就不能再回滚：同步失败只降级为「本局没有超时定时器」。
+            let result = result.map(|result| {
+                if let Err(error) = sync_card_game_deadline(
+                    card_games,
+                    timer,
+                    active_deadline,
+                    pending_cancellations,
+                    operation_ids,
+                    now,
+                    *clock_active,
+                ) {
+                    report_deadline_sync_failure("牌局", &error);
+                }
+                result
+            });
             let _ = response.send(result);
         }
         CardGameRuntimeMessage::Claim { key, response } => {
-            let result = card_games
-                .claim(key)
-                .map_err(card_game_operation_failed)
-                .and_then(|result| {
-                    sync_card_game_deadline(
-                        card_games,
-                        timer,
-                        active_deadline,
-                        pending_cancellations,
-                        operation_ids,
-                        clock.now(),
-                        *clock_active,
-                    )?;
-                    Ok(result)
-                });
+            let result = card_games.claim(key).map_err(card_game_operation_failed);
+            let result = result.map(|result| {
+                if let Err(error) = sync_card_game_deadline(
+                    card_games,
+                    timer,
+                    active_deadline,
+                    pending_cancellations,
+                    operation_ids,
+                    clock.now(),
+                    *clock_active,
+                ) {
+                    report_deadline_sync_failure("牌局", &error);
+                }
+                result
+            });
             let _ = response.send(result);
         }
         CardGameRuntimeMessage::Resume {
@@ -3719,37 +3959,43 @@ fn handle_card_game_message(
         } => {
             let response_result = card_games
                 .resume(entertainment, key, result)
-                .map_err(card_game_operation_failed)
-                .and_then(|result| {
-                    sync_card_game_deadline(
-                        card_games,
-                        timer,
-                        active_deadline,
-                        pending_cancellations,
-                        operation_ids,
-                        clock.now(),
-                        *clock_active,
-                    )?;
-                    Ok(result)
-                });
+                .map_err(card_game_operation_failed);
+            // `Resume` 的返回值里就带着下一个待执行的效果句柄（例如 `Suspended` 大厅投递）。
+            // 同步失败绝不能把句柄吞掉，否则调用方与娱乐槽一起停在此处。
+            let response_result = response_result.map(|result| {
+                if let Err(error) = sync_card_game_deadline(
+                    card_games,
+                    timer,
+                    active_deadline,
+                    pending_cancellations,
+                    operation_ids,
+                    clock.now(),
+                    *clock_active,
+                ) {
+                    report_deadline_sync_failure("牌局", &error);
+                }
+                result
+            });
             let _ = response.send(response_result);
         }
         CardGameRuntimeMessage::Cancel { key, response } => {
             let result = card_games
                 .cancel(entertainment, key)
-                .map_err(card_game_operation_failed)
-                .and_then(|result| {
-                    sync_card_game_deadline(
-                        card_games,
-                        timer,
-                        active_deadline,
-                        pending_cancellations,
-                        operation_ids,
-                        clock.now(),
-                        *clock_active,
-                    )?;
-                    Ok(result)
-                });
+                .map_err(card_game_operation_failed);
+            let result = result.map(|result| {
+                if let Err(error) = sync_card_game_deadline(
+                    card_games,
+                    timer,
+                    active_deadline,
+                    pending_cancellations,
+                    operation_ids,
+                    clock.now(),
+                    *clock_active,
+                ) {
+                    report_deadline_sync_failure("牌局", &error);
+                }
+                result
+            });
             let _ = response.send(result);
         }
         CardGameRuntimeMessage::Tick {
@@ -3761,7 +4007,11 @@ fn handle_card_game_message(
             let result = match timer {
                 Some(timer) => {
                     card_games.sync_clock(now, requested_clock_active);
-                    sync_card_game_deadline(
+                    // 轮询本身**不提交新的领域状态**，所以同步失败可以照实上行；
+                    // 但仍然只记一次错误并继续把已到期结果交出去，避免超时的
+                    // 玩家在这一次轮询里什么都拿不到。
+                    let timed_out = pending_outcomes.pop_front();
+                    match sync_card_game_deadline(
                         card_games,
                         Some(timer),
                         active_deadline,
@@ -3769,8 +4019,13 @@ fn handle_card_game_message(
                         operation_ids,
                         now,
                         requested_clock_active,
-                    )
-                    .map(|()| pending_outcomes.pop_front())
+                    ) {
+                        Ok(()) => Ok(timed_out),
+                        Err(error) => {
+                            report_deadline_sync_failure("牌局", &error);
+                            Ok(timed_out)
+                        }
+                    }
                 }
                 None => {
                     #[cfg(test)]
@@ -3792,19 +4047,21 @@ fn handle_card_game_message(
         CardGameRuntimeMessage::Abort(response) => {
             let result = card_games
                 .abort(entertainment)
-                .map_err(card_game_operation_failed)
-                .and_then(|result| {
-                    sync_card_game_deadline(
-                        card_games,
-                        timer,
-                        active_deadline,
-                        pending_cancellations,
-                        operation_ids,
-                        clock.now(),
-                        *clock_active,
-                    )?;
-                    Ok(result)
-                });
+                .map_err(card_game_operation_failed);
+            let result = result.map(|result| {
+                if let Err(error) = sync_card_game_deadline(
+                    card_games,
+                    timer,
+                    active_deadline,
+                    pending_cancellations,
+                    operation_ids,
+                    clock.now(),
+                    *clock_active,
+                ) {
+                    report_deadline_sync_failure("牌局", &error);
+                }
+                result
+            });
             let _ = response.send(result);
         }
     }
@@ -3930,53 +4187,60 @@ fn handle_turtle_soup_message(
         TurtleSoupRuntimeMessage::StartRandom { response } => {
             let result = service
                 .start_random_from_web(entertainment, task_port)
-                .map_err(turtle_soup_operation_failed)
-                .and_then(|()| {
-                    sync_turtle_soup_deadline(
-                        Some(&*service),
-                        timer,
-                        active_deadline,
-                        pending_cancellations,
-                        operation_ids,
-                        clock.now(),
-                        clock_active,
-                    )
-                });
+                .map_err(turtle_soup_operation_failed);
+            // 开局已经提交（题目已占用娱乐槽）。同步失败只降级为「本局没有超时定时器」。
+            let result = result.map(|()| {
+                if let Err(error) = sync_turtle_soup_deadline(
+                    Some(&*service),
+                    timer,
+                    active_deadline,
+                    pending_cancellations,
+                    operation_ids,
+                    clock.now(),
+                    clock_active,
+                ) {
+                    report_deadline_sync_failure("海龟汤", &error);
+                }
+            });
             let _ = response.send(result);
         }
         TurtleSoupRuntimeMessage::StartById { id, response } => {
             let result = service
                 .start_by_id_from_web(entertainment, &id, task_port)
-                .map_err(turtle_soup_operation_failed)
-                .and_then(|()| {
-                    sync_turtle_soup_deadline(
-                        Some(&*service),
-                        timer,
-                        active_deadline,
-                        pending_cancellations,
-                        operation_ids,
-                        clock.now(),
-                        clock_active,
-                    )
-                });
+                .map_err(turtle_soup_operation_failed);
+            let result = result.map(|()| {
+                if let Err(error) = sync_turtle_soup_deadline(
+                    Some(&*service),
+                    timer,
+                    active_deadline,
+                    pending_cancellations,
+                    operation_ids,
+                    clock.now(),
+                    clock_active,
+                ) {
+                    report_deadline_sync_failure("海龟汤", &error);
+                }
+            });
             let _ = response.send(result);
         }
         TurtleSoupRuntimeMessage::End { response } => {
             let result = service
                 .end_from_web(entertainment, task_port)
-                .map_err(turtle_soup_operation_failed)
-                .and_then(|ended| {
-                    sync_turtle_soup_deadline(
-                        Some(&*service),
-                        timer,
-                        active_deadline,
-                        pending_cancellations,
-                        operation_ids,
-                        clock.now(),
-                        clock_active,
-                    )?;
-                    Ok(ended)
-                });
+                .map_err(turtle_soup_operation_failed);
+            let result = result.map(|ended| {
+                if let Err(error) = sync_turtle_soup_deadline(
+                    Some(&*service),
+                    timer,
+                    active_deadline,
+                    pending_cancellations,
+                    operation_ids,
+                    clock.now(),
+                    clock_active,
+                ) {
+                    report_deadline_sync_failure("海龟汤", &error);
+                }
+                ended
+            });
             let _ = response.send(result);
         }
         TurtleSoupRuntimeMessage::FilterPrimary {
@@ -4003,24 +4267,28 @@ fn handle_turtle_soup_message(
         } => {
             let result = service
                 .submit_question_at(question, observed_at)
-                .map_err(turtle_soup_operation_failed)
-                .and_then(|outcome| {
-                    sync_turtle_soup_deadline(
-                        Some(&*service),
-                        timer,
-                        active_deadline,
-                        pending_cancellations,
-                        operation_ids,
-                        clock.now(),
-                        clock_active,
-                    )?;
-                    Ok(outcome)
-                });
+                .map_err(turtle_soup_operation_failed);
+            let result = result.map(|outcome| {
+                if let Err(error) = sync_turtle_soup_deadline(
+                    Some(&*service),
+                    timer,
+                    active_deadline,
+                    pending_cancellations,
+                    operation_ids,
+                    clock.now(),
+                    clock_active,
+                ) {
+                    report_deadline_sync_failure("海龟汤", &error);
+                }
+                outcome
+            });
             let _ = response.send(result);
         }
         TurtleSoupRuntimeMessage::Abort { reason } => {
+            // 这条路径上没有调用方在等返回值，但仍不能把同步失败往上抛：`Err` 会冒泡到
+            // `run_business_runtime`，让整条消息分发记一次「处理失败」，而中止本身已经生效。
             service.abort_for_context_loss(entertainment, &reason);
-            sync_turtle_soup_deadline(
+            if let Err(error) = sync_turtle_soup_deadline(
                 Some(&*service),
                 timer,
                 active_deadline,
@@ -4028,14 +4296,17 @@ fn handle_turtle_soup_message(
                 operation_ids,
                 clock.now(),
                 clock_active,
-            )?;
+            ) {
+                report_deadline_sync_failure("海龟汤", &error);
+            }
         }
         TurtleSoupRuntimeMessage::DeliveryCurrent { delivery, response } => {
             let _ = response.send(service.delivery_is_current(delivery));
         }
         TurtleSoupRuntimeMessage::DeliverySuccess { delivery } => {
             service.handle_delivery_success(entertainment, delivery);
-            sync_turtle_soup_deadline(
+            // 投递结果已经记进领域状态，同步失败不能再上行成「消息处理失败」。
+            if let Err(error) = sync_turtle_soup_deadline(
                 Some(&*service),
                 timer,
                 active_deadline,
@@ -4043,12 +4314,14 @@ fn handle_turtle_soup_message(
                 operation_ids,
                 clock.now(),
                 clock_active,
-            )?;
+            ) {
+                report_deadline_sync_failure("海龟汤", &error);
+            }
         }
         TurtleSoupRuntimeMessage::DeliveryFailure { delivery, error } => {
             let error = anyhow::anyhow!(error);
             service.handle_delivery_failure(entertainment, delivery, &error);
-            sync_turtle_soup_deadline(
+            if let Err(error) = sync_turtle_soup_deadline(
                 Some(&*service),
                 timer,
                 active_deadline,
@@ -4056,7 +4329,9 @@ fn handle_turtle_soup_message(
                 operation_ids,
                 clock.now(),
                 clock_active,
-            )?;
+            ) {
+                report_deadline_sync_failure("海龟汤", &error);
+            }
         }
         TurtleSoupRuntimeMessage::AppendPuzzle {
             submission,
@@ -4106,37 +4381,40 @@ fn handle_undercover_message(
                     now,
                     operation_id,
                 )
-                .map_err(undercover_operation_failed)
-                .and_then(|result| {
-                    sync_undercover_deadline(
-                        undercover,
-                        timer,
-                        active_deadline,
-                        pending_cancellations,
-                        operation_ids,
-                        now,
-                        *clock_active,
-                    )?;
-                    Ok(result)
-                });
+                .map_err(undercover_operation_failed);
+            // 领域状态已提交就不能再回滚：同步失败只降级为「本局没有超时定时器」。
+            let result = result.map(|result| {
+                if let Err(error) = sync_undercover_deadline(
+                    undercover,
+                    timer,
+                    active_deadline,
+                    pending_cancellations,
+                    operation_ids,
+                    now,
+                    *clock_active,
+                ) {
+                    report_deadline_sync_failure("谁是卧底", &error);
+                }
+                result
+            });
             let _ = response.send(result);
         }
         UndercoverRuntimeMessage::Claim { key, response } => {
-            let result = undercover
-                .claim(key)
-                .map_err(undercover_operation_failed)
-                .and_then(|result| {
-                    sync_undercover_deadline(
-                        undercover,
-                        timer,
-                        active_deadline,
-                        pending_cancellations,
-                        operation_ids,
-                        clock.now(),
-                        *clock_active,
-                    )?;
-                    Ok(result)
-                });
+            let result = undercover.claim(key).map_err(undercover_operation_failed);
+            let result = result.map(|result| {
+                if let Err(error) = sync_undercover_deadline(
+                    undercover,
+                    timer,
+                    active_deadline,
+                    pending_cancellations,
+                    operation_ids,
+                    clock.now(),
+                    *clock_active,
+                ) {
+                    report_deadline_sync_failure("谁是卧底", &error);
+                }
+                result
+            });
             let _ = response.send(result);
         }
         UndercoverRuntimeMessage::Resume {
@@ -4146,37 +4424,41 @@ fn handle_undercover_message(
         } => {
             let result = undercover
                 .resume(entertainment, key, effect_result)
-                .map_err(undercover_operation_failed)
-                .and_then(|result| {
-                    sync_undercover_deadline(
-                        undercover,
-                        timer,
-                        active_deadline,
-                        pending_cancellations,
-                        operation_ids,
-                        clock.now(),
-                        *clock_active,
-                    )?;
-                    Ok(result)
-                });
+                .map_err(undercover_operation_failed);
+            let result = result.map(|result| {
+                if let Err(error) = sync_undercover_deadline(
+                    undercover,
+                    timer,
+                    active_deadline,
+                    pending_cancellations,
+                    operation_ids,
+                    clock.now(),
+                    *clock_active,
+                ) {
+                    report_deadline_sync_failure("谁是卧底", &error);
+                }
+                result
+            });
             let _ = response.send(result);
         }
         UndercoverRuntimeMessage::Cancel { key, response } => {
             let result = undercover
                 .cancel(entertainment, key)
-                .map_err(undercover_operation_failed)
-                .and_then(|result| {
-                    sync_undercover_deadline(
-                        undercover,
-                        timer,
-                        active_deadline,
-                        pending_cancellations,
-                        operation_ids,
-                        clock.now(),
-                        *clock_active,
-                    )?;
-                    Ok(result)
-                });
+                .map_err(undercover_operation_failed);
+            let result = result.map(|result| {
+                if let Err(error) = sync_undercover_deadline(
+                    undercover,
+                    timer,
+                    active_deadline,
+                    pending_cancellations,
+                    operation_ids,
+                    clock.now(),
+                    *clock_active,
+                ) {
+                    report_deadline_sync_failure("谁是卧底", &error);
+                }
+                result
+            });
             let _ = response.send(result);
         }
         UndercoverRuntimeMessage::Poll {
@@ -4185,7 +4467,8 @@ fn handle_undercover_message(
             response,
         } => {
             *clock_active = requested_clock_active;
-            let result = sync_undercover_deadline(
+            let timed_out = pending_outcomes.pop_front();
+            if let Err(error) = sync_undercover_deadline(
                 undercover,
                 timer,
                 active_deadline,
@@ -4193,13 +4476,14 @@ fn handle_undercover_message(
                 operation_ids,
                 now,
                 requested_clock_active,
-            )
-            .map(|()| pending_outcomes.pop_front());
-            let _ = response.send(result);
+            ) {
+                report_deadline_sync_failure("谁是卧底", &error);
+            }
+            let _ = response.send(Ok(timed_out));
         }
         UndercoverRuntimeMessage::Abort(response) => {
             let aborted = undercover.abort(entertainment);
-            let result = sync_undercover_deadline(
+            if let Err(error) = sync_undercover_deadline(
                 undercover,
                 timer,
                 active_deadline,
@@ -4207,9 +4491,10 @@ fn handle_undercover_message(
                 operation_ids,
                 clock.now(),
                 *clock_active,
-            )
-            .map(|()| aborted);
-            let _ = response.send(result);
+            ) {
+                report_deadline_sync_failure("谁是卧底", &error);
+            }
+            let _ = response.send(Ok(aborted));
         }
     }
     Ok(())
@@ -4444,6 +4729,13 @@ impl ChatListenerRuntimeState {
 struct DecisionRuntimeState {
     state: DecisionState,
     state_sink: Option<Arc<dyn BusinessStateSink>>,
+    /// 上一次真正广播出去的快照。
+    ///
+    /// `handle` 每条消息末尾都会尝试发布，但**只有待裁决状态真的变了才值得广播**：
+    /// 提交一次决策、被已提交规则拒绝一次、`Snapshot` 查询……都不改变「有没有待裁决项」，
+    /// 无条件下发会把同一个 `decision.pending` 反复推给事件流与 /monitor，
+    /// 外部控制器要为此重复决策。这里保存最后广播值做等值比较。
+    last_published: Option<DecisionSnapshot>,
 }
 
 impl DecisionRuntimeState {
@@ -4451,13 +4743,24 @@ impl DecisionRuntimeState {
         Self {
             state: DecisionState::new(),
             state_sink,
+            last_published: None,
         }
     }
 
+    /// 只在待裁决状态真的变化时广播。
+    ///
+    /// 首次调用也走这里：`last_published` 与「当前无待裁决项」等价，因此启动时不会凭空
+    /// 发一条 `decision.cleared`。`state_sink` 缺席时仍然推进 `last_published`，
+    /// 语义保持「最近一次广播值」不变，便于日后接入 sink 时行为一致。
     fn publish(&mut self) {
-        if let Some(state_sink) = &self.state_sink {
-            state_sink.publish_decision(self.state.snapshot());
+        let snapshot = self.state.snapshot();
+        if snapshot == self.last_published {
+            return;
         }
+        if let Some(state_sink) = &self.state_sink {
+            state_sink.publish_decision(snapshot.clone());
+        }
+        self.last_published = snapshot;
     }
 
     fn handle(&mut self, message: DecisionRuntimeMessage) {
@@ -5166,6 +5469,129 @@ mod tests {
         );
     }
 
+    /// 构造一份只有默认模块的 worker 配置，供停机回归用例共享。
+    fn plain_worker() -> BusinessRuntimeWorker {
+        BusinessRuntimeWorker {
+            idiom_chain: idiom_service(Some(Duration::from_secs(300))),
+            card_games: CardGameService::new(LandlordConfig::default()),
+            undercover: default_undercover_service(),
+            number_bomb: NumberBombService::new(NumberBombConfig::default()),
+            turtle_soup: None,
+            hall: None,
+            playback: None,
+            invite: InviteService::new(),
+            task_port: TaskEngineHandle::new(None).business_port(),
+            timer: None,
+            state_sink: None,
+            clock: Arc::new(SystemClock),
+            abort_all_probe: None,
+        }
+    }
+
+    /// B13-P1-1（回归）：`should_stop` 必须在 `abort_all` **之前**置位。
+    ///
+    /// 旧实现是 `abort_all(...)` → `response.send(...)` → `should_stop = true`，
+    /// 而整段在 `catch_unwind` 里：`abort_all` panic 被吞掉后 `should_stop` 永远
+    /// 不会被置位，worker 回到 `recv()` 继续收消息，`stop_worker` 只能超时脱管
+    /// 一个仍然活着的线程（退出流程与配置重载一起挂住）。
+    ///
+    /// 注入点在 `abort_all` 之前抛 panic，所以「停机正常收敛 + 注入确实触发」
+    /// 同时成立，才说明置位发生在清理之前。`triggered` 断言防真空：没有它，
+    /// 注入没生效时这条测试会假绿。
+    #[test]
+    fn shutdown_keeps_stopping_even_when_abort_all_panics() {
+        let worker = plain_worker().with_abort_all_panic_injection();
+        let probe = worker
+            .abort_all_probe()
+            .expect("注入探针必须随 worker 一起创建");
+        let runtime =
+            BusinessRuntime::start_with_timer_and_modules_and_state_sink(4, worker).unwrap();
+
+        let started_at = Instant::now();
+        let result = runtime.shutdown();
+        let elapsed = started_at.elapsed();
+
+        assert!(
+            probe.triggered(),
+            "注入必须真的触发，否则这条测试覆盖不到停机顺序"
+        );
+        // panic 发生在回包之前，所以拿不到快照（`RuntimeStopped`）是预期结果；
+        // 真正的判据是 **worker 自己退出了**：旧的置位顺序下 `should_stop` 漏置，
+        // worker 回到 `recv()` 继续等消息，关停只能落在超时分支。
+        assert_eq!(
+            result,
+            Err(BusinessRuntimeError::RuntimeStopped),
+            "清理 panic 之后必须按正常路径收敛，不能落到超时脱管"
+        );
+        assert!(
+            elapsed < WORKER_SHUTDOWN_TIMEOUT,
+            "停机必须走正常收敛路径，不能靠超时脱管兜底：{elapsed:?}"
+        );
+    }
+
+    /// B13-P1-1（回归）：业务线程卡住时，关停必须在有界时间内返回。
+    ///
+    /// 用真的卡住的 worker，而不是 mock：`start_internal` 起线程后，worker 先跑
+    /// 启动广播（`chat_listener.publish()` → 我们的 sink 在这里永久阻塞），
+    /// 于是它一条消息都不取，关停指令只能在队列里等到超时——正是
+    /// `concurrency.md` P2-12 的场景（演员阻塞在端口调用里）。
+    ///
+    /// 断言：在约 3 秒内返回 `WorkerShutdownTimedOut`，而不是挂死到测试超时。
+    #[test]
+    fn shutdown_gives_up_on_a_wedged_worker_within_the_deadline() {
+        struct WedgingSink {
+            entered: mpsc::SyncSender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+
+        impl BusinessStateSink for WedgingSink {
+            fn publish_turtle_soup(&self, _snapshot: TurtleSoupSnapshot) {}
+            fn publish_undercover(&self, _snapshot: UndercoverSnapshot) {}
+            fn publish_chat_listener(&self, _snapshot: ChatListenerSnapshot) {
+                // 只在第一次广播时卡住；关停路径自己也会广播，卡那里会把
+                // 「超时脱管」伪装成「正常慢」。
+                let _ = self.entered.try_send(());
+                let _ = self
+                    .release
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .recv_timeout(Duration::from_secs(30));
+            }
+        }
+
+        let (entered_sender, entered) = mpsc::sync_channel(1);
+        let (release_sender, release) = mpsc::sync_channel(1);
+        let sink = Arc::new(WedgingSink {
+            entered: entered_sender,
+            release: Mutex::new(release),
+        });
+
+        let mut worker = plain_worker();
+        worker.state_sink = Some(sink);
+        let runtime =
+            BusinessRuntime::start_with_timer_and_modules_and_state_sink(4, worker).unwrap();
+        // 等到 worker 真的进到广播里（此后它不会再取任何消息）。
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker 必须在启动广播处卡住");
+
+        let started_at = Instant::now();
+        let result = runtime.shutdown();
+        let elapsed = started_at.elapsed();
+
+        // 先放行卡住的线程，避免它在测试结束后仍占着运行时资源。
+        let _ = release_sender.send(());
+        assert_eq!(
+            result,
+            Err(BusinessRuntimeError::WorkerShutdownTimedOut),
+            "卡死时必须以超时收场（而不是 panic 或无限阻塞）"
+        );
+        assert!(
+            elapsed < WORKER_SHUTDOWN_TIMEOUT + Duration::from_secs(2),
+            "关停必须在期限附近返回，实际 {elapsed:?}"
+        );
+    }
+
     #[test]
     fn shutdown_aborts_active_idiom_chain_and_releases_entertainment() {
         let runtime = BusinessRuntime::start(
@@ -5428,6 +5854,345 @@ mod tests {
         ));
         assert_eq!(active, Some(previous));
         assert!(pending.is_empty());
+    }
+
+    /// 在可用定时器上跑一次「开局 → 验证通过 → 大厅成立」，返回建好的大厅服务。
+    ///
+    /// 抽出来是因为 `next_deadline` 只有在 `GameState::Lobby`/`Playing` 时才返回
+    /// `Some`，而这两条用例都必须先到这个状态，否则 `sync_card_game_deadline`
+    /// 会走「没有待调度期限」的早退分支，压根不碰定时器。
+    fn card_game_in_lobby(
+        now: Instant,
+        extra_players: &[&str],
+    ) -> (
+        TimerRuntime<BusinessDeadlineToken>,
+        CardGameService,
+        EntertainmentState,
+        Option<ActiveCardGameDeadline>,
+    ) {
+        let (event_sender, _event_receiver) = mpsc::sync_channel(4);
+        let timer_runtime = TimerRuntime::start(4, event_sender).unwrap();
+        let timer = timer_runtime.handle();
+        let mut card_games = CardGameService::new(LandlordConfig::default());
+        let mut entertainment = EntertainmentState::new();
+        let mut active = None;
+        let mut pending = Vec::new();
+        let mut pending_outcomes = std::collections::VecDeque::new();
+        let operation_ids = BusinessOperationIdAllocator::new();
+
+        let (response, answer) = mpsc::sync_channel(1);
+        handle_card_game_message(
+            &mut card_games,
+            &mut entertainment,
+            CardGameRuntimeMessage::Begin {
+                player: "甲".to_string(),
+                player_display: "甲".to_string(),
+                command: LandlordCommand::Start,
+                now,
+                response,
+            },
+            Some(&timer),
+            &mut active,
+            &mut pending,
+            &operation_ids,
+            &mut pending_outcomes,
+            &mut true,
+            &SystemClock,
+        )
+        .unwrap();
+        let verification = match answer.recv().unwrap().unwrap() {
+            CardGameCommandStart::Suspended(request) => request,
+            CardGameCommandStart::Completed(_) => panic!("start should require verification"),
+        };
+        assert_eq!(
+            card_games.claim(verification.key).unwrap(),
+            CardGameEffectClaim::Claimed
+        );
+        let (response, answer) = mpsc::sync_channel(1);
+        handle_card_game_message(
+            &mut card_games,
+            &mut entertainment,
+            CardGameRuntimeMessage::Resume {
+                key: verification.key,
+                result: CardGameEffectResult::FriendVerify(Ok(true)),
+                response,
+            },
+            Some(&timer),
+            &mut active,
+            &mut pending,
+            &operation_ids,
+            &mut pending_outcomes,
+            &mut true,
+            &SystemClock,
+        )
+        .unwrap();
+        // 大厅成立后会挂一个「大厅到期」效果，领掉它才算走完这一步。
+        if let Ok(CardGameResume::Suspended(hall)) = answer.recv().unwrap() {
+            assert_eq!(
+                card_games.claim(hall.key).unwrap(),
+                CardGameEffectClaim::Claimed
+            );
+            let (response, answer) = mpsc::sync_channel(1);
+            handle_card_game_message(
+                &mut card_games,
+                &mut entertainment,
+                CardGameRuntimeMessage::Resume {
+                    key: hall.key,
+                    result: CardGameEffectResult::HallDelivery(Ok(())),
+                    response,
+                },
+                Some(&timer),
+                &mut active,
+                &mut pending,
+                &operation_ids,
+                &mut pending_outcomes,
+                &mut true,
+                &SystemClock,
+            )
+            .unwrap();
+            answer.recv().unwrap().unwrap();
+        }
+
+        for index in 0..extra_players.len() {
+            let player = extra_players[index];
+            let (response, answer) = mpsc::sync_channel(1);
+            handle_card_game_message(
+                &mut card_games,
+                &mut entertainment,
+                CardGameRuntimeMessage::Begin {
+                    player: player.to_string(),
+                    player_display: player.to_string(),
+                    command: LandlordCommand::Join,
+                    now: now + Duration::from_secs(index as u64 + 1),
+                    response,
+                },
+                Some(&timer),
+                &mut active,
+                &mut pending,
+                &operation_ids,
+                &mut pending_outcomes,
+                &mut true,
+                &SystemClock,
+            )
+            .unwrap();
+            let joined = match answer.recv().unwrap().unwrap() {
+                CardGameCommandStart::Suspended(request) => request,
+                CardGameCommandStart::Completed(_) => {
+                    panic!("join should suspend its friend verification")
+                }
+            };
+            assert_eq!(
+                card_games.claim(joined.key).unwrap(),
+                CardGameEffectClaim::Claimed
+            );
+            // 报名挂起的是好友验证（`VerifyJoin`），不是大厅投递。
+            let (response, answer) = mpsc::sync_channel(1);
+            handle_card_game_message(
+                &mut card_games,
+                &mut entertainment,
+                CardGameRuntimeMessage::Resume {
+                    key: joined.key,
+                    result: CardGameEffectResult::FriendVerify(Ok(true)),
+                    response,
+                },
+                Some(&timer),
+                &mut active,
+                &mut pending,
+                &operation_ids,
+                &mut pending_outcomes,
+                &mut true,
+                &SystemClock,
+            )
+            .unwrap();
+            answer.recv().unwrap().unwrap();
+        }
+
+        assert!(
+            card_games.next_deadline(now, true).is_some(),
+            "前置条件：牌局必须真的进入大厅，否则 next_deadline 仍是 None"
+        );
+        (timer_runtime, card_games, entertainment, active)
+    }
+
+    /// B13-P0-2(v1)：定时器同步失败**不得**吞掉已经提交的领域结果。
+    ///
+    /// 用已经关停的 `TimerRuntime` 当注入式失败：命令通道关闭后
+    /// `sync_card_game_deadline` 必定返回 `Err`。修复前 `Begin` 走
+    /// `.and_then(|result| { sync(...)?; Ok(result) })`，这个 `Err` 会把
+    /// `Suspended(CardGameEffectRequest)` 一起丢掉，调用方只收到
+    /// `TimerOperationFailed` —— 而玩法状态与娱乐互斥槽此时**已经提交**，
+    /// 那张效果句柄再也拿不回来，整局游戏与娱乐槽双死锁。
+    ///
+    /// # 为什么要先建大厅、并且要「第三个人」报名（旧版用例的真空之处）
+    ///
+    /// `sync_card_game_deadline` 只有在 `next_deadline` 返回 `Some(..)` **且**
+    /// 与 `active` 里的记录不一致时才会真的碰定时器：
+    ///
+    /// - 单发一条 `LandlordCommand::Start` **不创建任何牌局状态**，它只挂起
+    ///   「好友验证」效果并占住娱乐槽，`GameState` 仍是 `Idle` →
+    ///   `next_deadline == None` → `sync` 走「没有待调度期限 → `return Ok(())`」
+    ///   早退分支，`Err` 根本不会发生。旧用例就死在这里，回退成 `.and_then`
+    ///   照样全绿。
+    /// - 到了 `Lobby` 之后，第 2 个人报名走的是同一种「大厅到期」期限
+    ///   （`LobbyExpiry` + 同一个 `deadline_after(now, elapsed, timeout)`），
+    ///   与 `active` 完全相等 → `sync` 走「同一 Token、同代次、同期限 → 直接
+    ///   `return Ok(())`」的等值早退分支，仍然碰不到定时器。
+    /// - 只有第 3 个人报名会**发牌**把状态推到 `Playing`：期限种类从
+    ///   `LobbyExpiry` 换成出价/出牌期限，绝对时刻也跟着变，于是 `sync` 真的
+    ///   要 `reschedule`/`schedule` —— 这才是唯一能拿到 `Err` 的形状。
+    #[test]
+    fn card_game_begin_returns_the_suspended_handle_even_when_deadline_sync_fails() {
+        let now = Instant::now();
+        // 甲开局 + 乙报名 → 大厅（2/3），此时期限仍是 LobbyExpiry。
+        let (timer_runtime, mut card_games, mut entertainment, active) =
+            card_game_in_lobby(now, &["乙"]);
+        let timer = timer_runtime.handle();
+        let lobby_deadline = active.expect("大厅必须已经排上到期定时器");
+        let mut active = Some(lobby_deadline.clone());
+        let mut pending = Vec::new();
+        let mut pending_outcomes = std::collections::VecDeque::new();
+        let operation_ids = BusinessOperationIdAllocator::new();
+
+        // 关停计时器：此后所有 schedule/reschedule/cancel 都返回 RuntimeStopped。
+        timer_runtime.shutdown().unwrap();
+
+        // 丙报名：第 3 个人触发发牌，状态推进到 `Playing`，期限必然变化 →
+        // `sync_card_game_deadline` 一定会去改定时器，必然失败。
+        let (response, answer) = mpsc::sync_channel(1);
+        handle_card_game_message(
+            &mut card_games,
+            &mut entertainment,
+            CardGameRuntimeMessage::Begin {
+                player: "丙".to_string(),
+                player_display: "丙".to_string(),
+                command: LandlordCommand::Join,
+                now: now + Duration::from_secs(10),
+                response,
+            },
+            Some(&timer),
+            &mut active,
+            &mut pending,
+            &operation_ids,
+            &mut pending_outcomes,
+            &mut true,
+            &SystemClock,
+        )
+        .unwrap();
+
+        let result = answer
+            .recv()
+            .unwrap()
+            .expect("已提交的领域结果不能因定时器同步失败而丢失");
+        let request = match result {
+            CardGameCommandStart::Suspended(request) => request,
+            CardGameCommandStart::Completed(_) => panic!("join should suspend its reply"),
+        };
+
+        // 报名被领域状态接受：拿到的是「丙」的报名验证句柄，而不是
+        // 「已有牌局进行中」那类大厅回执——后者说明 `Begin` 根本没提交状态。
+        assert!(
+            matches!(
+                &request.effect,
+                CardGameEffect::FriendVerify { player_display, .. } if player_display == "丙"
+            ),
+            "报名必须已经被领域状态接受，实际效果：{:?}",
+            request.effect
+        );
+        // 领域状态与娱乐槽都已提交，句柄有效。
+        assert_eq!(entertainment.active(), Some(EntertainmentKind::Landlord));
+        assert_eq!(
+            card_games.claim(request.key).unwrap(),
+            CardGameEffectClaim::Claimed
+        );
+        // 期限同步失败后降级：旧的 `active` 记录原地保留，也没有挂上待取消项
+        // （下一次 sync 会按同一套对比逻辑重新对齐）。
+        assert_eq!(active, Some(lobby_deadline));
+        assert!(pending.is_empty());
+    }
+
+    /// B13-P1-5：只有待裁决状态**真的变化**时才广播，避免重复 `decision.pending`。
+    #[test]
+    fn decision_runtime_publishes_only_on_real_state_changes() {
+        use std::sync::Mutex;
+
+        struct RecordingSink {
+            decisions: Mutex<Vec<Option<DecisionSnapshot>>>,
+        }
+
+        impl BusinessStateSink for RecordingSink {
+            fn publish_turtle_soup(&self, _snapshot: TurtleSoupSnapshot) {}
+            fn publish_undercover(&self, _snapshot: UndercoverSnapshot) {}
+            fn publish_decision(&self, snapshot: Option<DecisionSnapshot>) {
+                self.decisions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(snapshot);
+            }
+        }
+
+        let sink = Arc::new(RecordingSink {
+            decisions: Mutex::new(Vec::new()),
+        });
+        let mut runtime = DecisionRuntimeState::new(Some(sink.clone()));
+
+        // 启动时的首次发布：当前没有待裁决项，不该凭空发一条 cleared。
+        runtime.publish();
+        assert!(
+            sink.decisions.lock().unwrap().is_empty(),
+            "启动时没有待裁决项，不该广播"
+        );
+
+        let (delivery, receiver) = mpsc::sync_channel(1);
+        let (response, answer) = mpsc::sync_channel(1);
+        runtime.handle(DecisionRuntimeMessage::Begin {
+            label: "候选确认".to_string(),
+            allow_switch_source: true,
+            allow_ai: true,
+            timeout: Duration::from_secs(30),
+            delivery,
+            response,
+        });
+        answer.recv().unwrap().unwrap();
+        let pending = {
+            let published = sink.decisions.lock().unwrap();
+            assert_eq!(published.len(), 1, "出现待裁决项必须广播一次");
+            published[0].clone().expect("这条应当是 pending 快照")
+        };
+
+        // 同样的状态再发布一次：不得重复广播。
+        runtime.publish();
+        assert_eq!(
+            sink.decisions.lock().unwrap().len(),
+            1,
+            "状态未变化时不得重复广播"
+        );
+
+        let (response, answer) = mpsc::sync_channel(1);
+        runtime.handle(DecisionRuntimeMessage::Submit {
+            id: pending.id,
+            action: DecisionAction::Confirm,
+            response,
+        });
+        answer.recv().unwrap().unwrap();
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            DecisionAction::Confirm,
+            "提交必须送到等待方"
+        );
+
+        // 提交之后 `snapshot()` 过滤已提交记录 → 一条 cleared，且仅此一条。
+        assert!(
+            runtime.state.snapshot().is_none(),
+            "已提交的记录不再算待裁决项"
+        );
+        runtime.publish();
+        runtime.publish();
+        let published = sink.decisions.lock().unwrap().clone();
+        assert_eq!(
+            published,
+            vec![Some(pending), None],
+            "应当只有 pending → cleared 两次广播"
+        );
     }
 
     #[test]

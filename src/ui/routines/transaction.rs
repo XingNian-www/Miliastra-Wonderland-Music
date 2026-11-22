@@ -19,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(test)]
 use enigo::Key;
 
-use super::friend_delivery::{UiResidencyOutcome, UiResidencyTarget};
+use super::friend_delivery::{ConversationKey, UiResidencyOutcome, UiResidencyTarget};
 use super::residency::{
     ConversationRef, RecoveryReport, ResidencyTarget, SettleEnvironment, SettleOptions,
     identify_conversation, settle_to, settle_to_with,
@@ -223,6 +223,9 @@ pub(crate) struct FinishReport {
     pub(crate) actions: u32,
     /// 声明 Leave：任务结束后不恢复入口，仅记录观察到的界面。
     pub(crate) left: bool,
+    /// 任务声明不产生聊天驻留（`Leave` 收尾观测到的界面本就不是聊天界面）：
+    /// 这不是失败，对外结论是 `UiResidencyOutcome::NotApplicable`（B16-P1-4）。
+    pub(crate) not_applicable: bool,
     /// 脚本声明收尾（CustomAction）：包装器没有确认驻留，不能当 `settled`。
     pub(crate) script_declared: bool,
     /// 入口不可重建而退到 `fallback`。
@@ -347,6 +350,26 @@ impl<R: UiRoutine> UiRoutine for UiTask<R> {
                 }
                 outcome.output = output;
                 outcome.output_failure = panic_failure;
+                // 内层例程可能已经判定「检测到目标、无条件停」（`force_finish`）：
+                // 该语义必须在这里同样生效，否则旁路分支照样会做收尾导航
+                // （最典型的是进千星成功后按一次 Esc），违背“检测到就无条件停”
+                // （B16-P1-2）。只拦截**会发导航输入**的收尾策略；`Leave` /
+                // `KeepCurrent` / `ScriptDeclared` 本身零输入，继续沿各自路径走，
+                // 不把任务声明目标冒充成观察到的驻留（B16-P1-4 的结论另见报告）。
+                if context.is_force_finished()
+                    && matches!(
+                        &self.spec.finish,
+                        FinishPolicy::Fixed(_) | FinishPolicy::RestoreEntry { .. }
+                    )
+                {
+                    outcome.finish = FinishReport {
+                        settled: true,
+                        target: Some(self.spec.target.clone()),
+                        ..FinishReport::default()
+                    };
+                    outcome.residency = finish_residency(&outcome.finish);
+                    return finish_outcome(outcome, context, started_epoch);
+                }
                 outcome.finish = match &self.spec.finish {
                     FinishPolicy::KeepCurrent | FinishPolicy::ScriptDeclared => {
                         no_action_finish(self.spec.finish.clone(), outcome.entry.as_ref())
@@ -455,10 +478,7 @@ impl<R: UiRoutine> UiRoutine for UiTask<R> {
                 target: Some(self.spec.target.clone()),
                 ..FinishReport::default()
             };
-            outcome.residency = UiResidencyOutcome::Confirmed(match &self.spec.target {
-                ResidencyTarget::Primary => UiResidencyTarget::Primary,
-                ResidencyTarget::Secondary(_) => UiResidencyTarget::SecondaryCurrentHall,
-            });
+            outcome.residency = residency_conclusion(&self.spec.target, None);
             return finish_outcome(outcome, context, started_epoch);
         }
         let input_epochs = context.input_epoch().saturating_sub(started_epoch);
@@ -718,14 +738,9 @@ fn run_finish(
                     report.target = residency_for(observed.kind);
                     report.settled = report.target.is_some();
                     if report.target.is_none() {
-                        report.failure = Some(failure(
-                            InputCertainty::BeforeInput,
-                            "ui_task_leave",
-                            format!(
-                                "任务声明 Leave：当前界面（{}）不是一级/二级聊天，不能作为聊天驻留结论",
-                                observed.label
-                            ),
-                        ));
+                        // Leave 任务本来就不承诺聊天驻留：冷启动停在提瓦特大世界
+                        // 属于正常结束，不是「驻留恢复失败」（B16-P1-4）。
+                        report.not_applicable = true;
                     }
                     report
                 }
@@ -848,6 +863,11 @@ fn no_action_finish(policy: FinishPolicy, entry: Option<&EntryUiState>) -> Finis
 
 fn finish_residency(report: &FinishReport) -> UiResidencyOutcome {
     let Some(target) = report.target.clone() else {
+        if report.not_applicable {
+            // 任务声明「不产生聊天驻留」且收尾界面本就不是聊天界面
+            // （如冷启动 EnterGame 停在提瓦特大世界）：这是预期语义，不是失败。
+            return UiResidencyOutcome::NotApplicable;
+        }
         if report.left {
             return UiResidencyOutcome::Failed(failure(
                 InputCertainty::BeforeInput,
@@ -862,21 +882,13 @@ fn finish_residency(report: &FinishReport) -> UiResidencyOutcome {
         ));
     };
     if report.settled {
-        return match &target {
-            ResidencyTarget::Primary => UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary),
-            ResidencyTarget::Secondary(conversation)
-                if *conversation == ConversationRef::Unknown =>
-            {
-                UiResidencyOutcome::Failed(failure(
-                    InputCertainty::AfterInputUnknown,
-                    "ui_task_finish",
-                    "收尾只确认在二级，入口会话身份未知，不能声明为当前大厅",
-                ))
-            }
-            ResidencyTarget::Secondary(_) => {
-                UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall)
-            }
-        };
+        // 结论必须用唯一恢复引擎**真正确认过**的会话，而不是收尾时请求的目标：
+        // 请求的是好友会话、引擎按 fallback 落到当前大厅时，两者并不相同。
+        let confirmed = report
+            .recovery
+            .as_ref()
+            .and_then(|recovery| recovery.settled_conversation.as_ref());
+        return residency_conclusion(&target, confirmed);
     }
     let failure = report.failure.clone().unwrap_or_else(|| {
         failure(
@@ -886,6 +898,79 @@ fn finish_residency(report: &FinishReport) -> UiResidencyOutcome {
         )
     });
     UiResidencyOutcome::Failed(failure)
+}
+
+/// 把收尾目标 + 引擎确认过的会话翻译成对外驻留结论。
+///
+/// 硬规则（`technical-docs/ui-task-return-design.md:24/55/132`）：
+///
+/// - `SecondaryCurrentHall` 只代表「二级聊天 · 当前大厅」；**识别不出会话就报
+///   `Failed`**，不得把任意 `Secondary(_)` 塌缩成"当前大厅"（B16-P1-3）；
+/// - 结论必须来自引擎**真正确认过**的会话（`RecoveryReport::settled_conversation`），
+///   而不是收尾时请求的目标：请求好友 A、引擎按 fallback 落到当前大厅时，
+///   对外要报的是真实落点（当前大厅），并靠 `degraded` 说明降级；
+/// - 二级界面子型（多人面板 / 千星地图 / 覆盖层）本身不是聊天驻留，报 `Failed`；
+/// - **确证落在具体好友会话时报 `SecondaryConversation(键)`**，不再沿用
+///   `SecondaryCurrentHall`（那会把好友私聊说成"当前大厅"）。
+fn residency_conclusion(
+    target: &ResidencyTarget,
+    confirmed: Option<&ConversationRef>,
+) -> UiResidencyOutcome {
+    let ResidencyTarget::Secondary(requested) = target else {
+        return UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary);
+    };
+    // 请求的就是"只保证在二级、会话未知"：即便引擎按当前大厅证据确认，
+    // 入口会话本身仍不明（`ui-task-return-design.md:24`：识别不出的入口不冒充当前大厅）。
+    if *requested == ConversationRef::Unknown {
+        return UiResidencyOutcome::Failed(failure(
+            InputCertainty::AfterInputUnknown,
+            "ui_task_finish",
+            "收尾只确认在二级，入口会话身份未知，不能声明为当前大厅",
+        ));
+    }
+    // 引擎确认过的会话优先；引擎没给出会话时退回请求的会话（导航目标/固定目标）。
+    let conversation = confirmed.unwrap_or(requested);
+    match conversation {
+        ConversationRef::CurrentHall => {
+            UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall)
+        }
+        // `AnySecondary` 是调用方显式声明的"任意二级"导航目标：只保证二级类型，
+        // 不声称具体会话（`ui-task-return-design.md:29`）。旧枚举只有"当前大厅"
+        // 一个二级变体，这里沿用 `SecondaryCurrentHall` 表达"二级聊天可用"，
+        // 不新增猜测（它是调用方声明而非观测推断）。收紧成 `Failed` 会改变
+        // 所有导航目标路径的可用性判断，超出本次"补具体会话变体"的范围。
+        ConversationRef::AnySecondary => {
+            UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall)
+        }
+        // 好友会话确证恢复（引擎确认的会话**就是**请求的那个）：上报具体会话。
+        // 键由备注/昵称归一化后取指纹，结论里不出现原文（隐私面）。
+        ConversationRef::Friend { identity, .. } if confirmed == Some(requested) => {
+            UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryConversation(
+                ConversationKey::from_identity(identity),
+            ))
+        }
+        ConversationRef::Unknown => UiResidencyOutcome::Failed(failure(
+            InputCertainty::AfterInputUnknown,
+            "ui_task_finish",
+            "收尾只确认在二级，入口会话身份未知，不能声明为当前大厅",
+        )),
+        // 会话确认不了 / 确认到的不是请求的那个会话 / 不是聊天子型：如实失败。
+        ConversationRef::Friend { .. } => UiResidencyOutcome::Failed(failure(
+            InputCertainty::AfterInputUnknown,
+            "ui_task_finish",
+            "收尾停在二级好友私聊，但会话身份与请求不一致，不能声明为当前大厅",
+        )),
+        ConversationRef::MultiplayerPanel
+        | ConversationRef::HallMap
+        | ConversationRef::Overlay(_) => UiResidencyOutcome::Failed(failure(
+            InputCertainty::AfterInputUnknown,
+            "ui_task_finish",
+            format!(
+                "收尾停在{}：该二级子型不是聊天驻留，不能声明为当前大厅",
+                confirmed.unwrap_or(requested).label()
+            ),
+        )),
+    }
 }
 
 fn frame_evidence_from_image(
@@ -919,7 +1004,6 @@ fn write_diagnostics_image(image: &image::DynamicImage) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -927,7 +1011,6 @@ mod tests {
     use image::DynamicImage;
 
     use super::*;
-    use crate::config::AppConfig;
     use crate::runtime::ui::{
         UiDevice, UiRoutine, UiRoutineContext, UiStateClassification, UiStateClassifier,
         UiStateEvidence, UiStateKind, execute_routine_for_test, sealed::UiRoutineSealed,
@@ -1062,7 +1145,7 @@ mod tests {
     }
 
     fn environment_with(timeout_ms: u64) -> SettleEnvironment {
-        let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let mut config = crate::config::bundled_config();
         config.timing.input.after_activate_ms = 0;
         config.timing.input.open_chat_ms = 0;
         config.timing.input.click_ms = 0;
@@ -1592,7 +1675,37 @@ mod tests {
         );
         assert!(execution.device.keys().is_empty());
         assert!(execution.output.finish.left);
-        assert!(execution.output.finish.failure.is_some());
+        assert!(
+            execution.output.finish.not_applicable,
+            "Leave 停在非聊天界面必须标记 not_applicable"
+        );
+        assert!(
+            execution.output.finish.failure.is_none(),
+            "Leave 收尾停在非聊天界面不是失败：{:?}",
+            execution.output.finish
+        );
+        assert!(
+            matches!(
+                execution.output.residency(),
+                UiResidencyOutcome::NotApplicable
+            ),
+            "Leave 停在提瓦特大世界不得报驻留失败：{:?}",
+            execution.output.residency()
+        );
+    }
+
+    /// B16-P1-4：只有「任务声明不产生聊天驻留」才可报 `NotApplicable`；
+    /// 声明了 `CurrentHall` 却落在陌生界面仍是真正的失败。
+    #[test]
+    fn declared_current_hall_landing_on_unknown_surface_is_still_a_failure() {
+        let target = ResidencyTarget::Secondary(ConversationRef::CurrentHall);
+        assert!(
+            matches!(
+                residency_conclusion(&target, Some(&ConversationRef::Unknown)),
+                UiResidencyOutcome::Failed(_)
+            ),
+            "声明当前大厅却只确认到陌生界面时必须报 Failed"
+        );
     }
 
     #[test]
@@ -1612,6 +1725,226 @@ mod tests {
             outcome.residency(),
             UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary)
         ));
+    }
+
+    // ---- 驻留结论（B16-P1-3） ----
+
+    /// 收尾结论只按**真实会话证据**给：识别不出会话就是 `Failed`，
+    /// 不允许把任意 `Secondary(_)` 塌缩成 `SecondaryCurrentHall`。
+    #[test]
+    fn secondary_without_confirmed_conversation_is_never_reported_as_current_hall() {
+        let target = ResidencyTarget::Secondary(ConversationRef::Unknown);
+        assert!(
+            matches!(
+                residency_conclusion(&target, None),
+                UiResidencyOutcome::Failed(_)
+            ),
+            "入口会话未知时不能声称当前大厅"
+        );
+        // 引擎也没给出会话：同样是失败，不做任何猜测。
+        let target = ResidencyTarget::Secondary(ConversationRef::friend("甲", vec!["甲".into()]));
+        assert!(
+            matches!(
+                residency_conclusion(&target, None),
+                UiResidencyOutcome::Failed(_)
+            ),
+            "引擎未确认会话时不能声称当前大厅"
+        );
+    }
+
+    /// 好友会话确证恢复：引擎确认的会话与请求一致，才允许给出"具体好友会话"结论。
+    #[test]
+    fn confirmed_friend_conversation_requires_matching_engine_evidence() {
+        let friend = ConversationRef::friend("甲", vec!["甲".into()]);
+        let target = ResidencyTarget::Secondary(friend.clone());
+        assert_eq!(
+            residency_conclusion(&target, Some(&friend)),
+            UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryConversation(
+                ConversationKey::from_identity("甲")
+            )),
+            "引擎确认的就是请求的那个好友时，结论必须点名那个会话"
+        );
+        // 引擎确认到的是另一个好友：不是"请求那个会话成功"。
+        let other = ConversationRef::friend("乙", vec!["乙".into()]);
+        assert!(
+            matches!(
+                residency_conclusion(&target, Some(&other)),
+                UiResidencyOutcome::Failed(_)
+            ),
+            "引擎落到另一个好友会话时不能报成请求成功的驻留"
+        );
+        // 引擎确认到的是当前大厅：那是**真实落点**（fallback），如实报当前大厅；
+        // 降级由 `RecoveryReport::degraded` / `session_restore_degraded` 另行告知。
+        assert_eq!(
+            residency_conclusion(&target, Some(&ConversationRef::CurrentHall)),
+            UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall),
+            "fallback 到当前大厅是真实落点，不是猜测"
+        );
+    }
+
+    /// 回归①：确证落在好友会话 X → 上报**精确**变体，且键与 X 绑定。
+    #[test]
+    fn confirmed_friend_conversation_reports_the_specific_conversation() {
+        let friend = ConversationRef::friend("甲", vec!["甲".into(), "玩家甲".into()]);
+        let target = ResidencyTarget::Secondary(friend.clone());
+        let expected =
+            UiResidencyTarget::SecondaryConversation(ConversationKey::from_identity("甲"));
+        assert_eq!(
+            residency_conclusion(&target, Some(&friend)),
+            UiResidencyOutcome::Confirmed(expected),
+            "确认落在好友会话 X 时必须点名 X，而不是当前大厅"
+        );
+        // 键是"X 的键"，不是任意好友的键：另一个好友给出的是另一个键。
+        let other_key = ConversationKey::from_identity("乙");
+        assert_ne!(
+            expected,
+            UiResidencyTarget::SecondaryConversation(other_key),
+            "不同会话必须给出不同的键，否则结论无法区分会话"
+        );
+        // OCR 抖动（全角/空白/大小写）不能把同一个会话折成两个不同会话。
+        assert_eq!(
+            ConversationKey::from_identity("甲"),
+            ConversationKey::from_identity(" 甲 "),
+            "归一化后同一备注必须得到同一个键"
+        );
+    }
+
+    /// 回归②：确证是当前大厅 → 仍然是 `SecondaryCurrentHall`（不被新变体抢走）。
+    #[test]
+    fn confirmed_current_hall_still_reports_current_hall() {
+        let target = ResidencyTarget::Secondary(ConversationRef::CurrentHall);
+        assert_eq!(
+            residency_conclusion(&target, Some(&ConversationRef::CurrentHall)),
+            UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall),
+            "确认是当前大厅就报当前大厅，不能报成泛化的二级会话"
+        );
+        // 引擎没给会话、请求本身就是当前大厅（导航目标）：同样是当前大厅。
+        assert_eq!(
+            residency_conclusion(&target, None),
+            UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall),
+            "固定目标就是当前大厅时结论一致"
+        );
+    }
+
+    /// 回归③：识别不出会话 → `Failed`（上一轮规则保留，不得因新增变体而放宽）。
+    #[test]
+    fn unrecognized_conversation_is_still_failed() {
+        for target in [
+            ResidencyTarget::Secondary(ConversationRef::Unknown),
+            ResidencyTarget::Secondary(ConversationRef::friend("甲", vec!["甲".into()])),
+        ] {
+            assert!(
+                matches!(
+                    residency_conclusion(&target, None),
+                    UiResidencyOutcome::Failed(_)
+                ),
+                "{target:?} 未获引擎确认时必须报 Failed"
+            );
+        }
+    }
+
+    /// 新变体不得被降级成"当前大厅"：对外文案必须区分好友私聊与大厅。
+    #[test]
+    fn conversation_key_labels_never_look_like_the_current_hall() {
+        let key = ConversationKey::from_identity("甲");
+        let label = key.to_string();
+        assert!(
+            label.contains("好友会话") && !label.contains("大厅"),
+            "具体会话的文案不能出现「大厅」，实际：{label}"
+        );
+        assert!(
+            !label.contains('甲'),
+            "对外文案不得包含昵称/备注原文，实际：{label}"
+        );
+        // 同一备注不同输入形态给出同一个对外标识（跨进程稳定、可比对）。
+        assert_eq!(label, ConversationKey::from_identity("甲").to_string());
+    }
+
+    /// 端到端：`FinishReport.recovery.settled_conversation` 里的好友会话必须
+    /// 一路传到对外结论的精确变体（而不是只在该函数内部对）。
+    #[test]
+    fn settled_friend_conversation_reaches_the_outward_conclusion() {
+        let friend = ConversationRef::friend("甲", vec!["甲".into()]);
+        let report = FinishReport {
+            attempted: true,
+            settled: true,
+            target: Some(ResidencyTarget::Secondary(friend.clone())),
+            recovery: Some(crate::ui::routines::RecoveryReport {
+                target: ResidencyTarget::Secondary(friend.clone()),
+                settled_as: UiStateKind::Secondary,
+                settled_conversation: Some(friend.clone()),
+                degraded: false,
+                esc_presses: 0,
+                open_chat_presses: 1,
+                conversation_actions: 1,
+                resamples: 2,
+                last_snapshot: None,
+                history: Vec::new(),
+            }),
+            ..FinishReport::default()
+        };
+        assert_eq!(
+            finish_residency(&report),
+            UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryConversation(
+                ConversationKey::from_identity("甲")
+            )),
+            "引擎确认了好友会话时，对外结论必须点名该会话"
+        );
+        // 同一份报告，引擎确认的是当前大厅 → 结论回到当前大厅（真实落点）。
+        let hall_report = FinishReport {
+            target: Some(ResidencyTarget::Secondary(friend)),
+            recovery: Some(crate::ui::routines::RecoveryReport {
+                target: ResidencyTarget::Secondary(ConversationRef::CurrentHall),
+                settled_as: UiStateKind::Secondary,
+                settled_conversation: Some(ConversationRef::CurrentHall),
+                degraded: true,
+                esc_presses: 0,
+                open_chat_presses: 1,
+                conversation_actions: 1,
+                resamples: 2,
+                last_snapshot: None,
+                history: Vec::new(),
+            }),
+            ..report
+        };
+        assert_eq!(
+            finish_residency(&hall_report),
+            UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall),
+            "fallback 落到当前大厅时必须报当前大厅，不能报成好友会话"
+        );
+    }
+
+    /// 真实落点优先：请求好友、引擎按 fallback 回到当前大厅 → 报当前大厅（并另有
+    /// `degraded` 说明降级），不能因为"请求的是好友"就报失败或报成好友。
+    #[test]
+    fn fallen_back_current_hall_is_reported_as_current_hall() {
+        let target = ResidencyTarget::Secondary(ConversationRef::friend("甲", vec!["甲".into()]));
+        assert_eq!(
+            residency_conclusion(&target, Some(&ConversationRef::CurrentHall)),
+            UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall),
+            "引擎实际落在当前大厅，结论就是当前大厅"
+        );
+    }
+
+    /// 二级界面子型（多人面板 / 地图 / 覆盖层）不是聊天驻留。
+    #[test]
+    fn secondary_surfaces_are_not_chat_residency() {
+        for conversation in [
+            ConversationRef::MultiplayerPanel,
+            ConversationRef::HallMap,
+            ConversationRef::Overlay(
+                crate::ui::routines::state_observation::OverlaySurface::FriendPanel,
+            ),
+        ] {
+            let target = ResidencyTarget::Secondary(conversation.clone());
+            assert!(
+                matches!(
+                    residency_conclusion(&target, Some(&conversation)),
+                    UiResidencyOutcome::Failed(_)
+                ),
+                "{conversation:?} 不是聊天驻留"
+            );
+        }
     }
 
     #[test]
@@ -1713,6 +2046,38 @@ mod tests {
         );
         assert!(outcome.finish.settled);
         assert!(!outcome.finish.attempted, "强制完成不应进入收尾阶段");
+        assert_eq!(outcome.finish.actions, 0);
+        assert!(matches!(
+            outcome.residency,
+            UiResidencyOutcome::Confirmed(UiResidencyTarget::Primary)
+        ));
+    }
+
+    /// B16-P1-2：`Passthrough` 分支也必须尊重内层 `force_finish`。
+    ///
+    /// 真实路径是进千星成功：内层判定“已到一级大厅、无条件停”后调用
+    /// `force_finish`，而该任务的 spec 正是 `Passthrough + Fixed(Primary)`。
+    /// 旧实现会继续 `settle_to(Primary)`，从二级聊天按 Esc 打断玩家界面。
+    #[test]
+    fn passthrough_forced_finish_skips_finish_navigation() {
+        // 入口停在二级聊天：若收尾导航真的执行，settle_to(Primary) 必然按 Esc。
+        let mut script = vec![secondary(); 8];
+        script.extend(vec![primary(); 8]);
+        let spec = UiTaskSpec::new(
+            ResidencyTarget::Primary,
+            FinishPolicy::Fixed(ResidencyTarget::Primary),
+            environment(),
+        )
+        .with_entry(EntryPolicy::Passthrough);
+        let (outcome, device) =
+            run_task_with(script, spec, ForceFinish, Arc::new(AtomicBool::new(false)));
+        assert!(
+            device.keys().is_empty(),
+            "强制完成之后不允许再发收尾按键：{:?}",
+            device.keys()
+        );
+        assert!(outcome.finish.settled);
+        assert!(!outcome.finish.attempted, "强制完成不应进入收尾导航阶段");
         assert_eq!(outcome.finish.actions, 0);
         assert!(matches!(
             outcome.residency,

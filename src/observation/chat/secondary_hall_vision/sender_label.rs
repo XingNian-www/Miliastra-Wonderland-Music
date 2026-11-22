@@ -45,9 +45,13 @@ struct AvatarTextureScan {
 impl Drop for AvatarTextureScan {
     fn drop(&mut self) {
         // 把缓冲区归还线程局部缓存,供下一帧复用(保留已分配容量)。
+        // 用 `<=` 而不是 `<`：取用时缓存被 `mem::take` 清成零容量，若这里只认
+        // 「缓存更小」，容量相等的归还永远不发生，第二帧之后每帧都要重新分配。
+        // 归还前清空长度，让下一帧的 `resize` 正常补零，避免残留上一帧的旧值。
         ROW_PREFIXES_SCRATCH.with(|cell| {
             let mut scratch = cell.borrow_mut();
-            if scratch.capacity() < self.row_prefixes.capacity() {
+            if scratch.capacity() <= self.row_prefixes.capacity() {
+                self.row_prefixes.clear();
                 *scratch = std::mem::take(&mut self.row_prefixes);
             }
         });
@@ -90,8 +94,10 @@ impl AvatarTextureScan {
         let visible_bottom = config.search_rect.bottom().min(image.height() as i32);
         let prefix_width = x_coordinates.len() + 1;
         let needed = visible_bottom.max(0) as usize * prefix_width;
+        // `mem::take` 直接转让这块堆内存；`drain(..).collect()` 会新建一个 Vec
+        // 再把元素逐个数拷过去，线程局部缓存里的容量反而永远用不上。
         let mut row_prefixes: Vec<usize> =
-            ROW_PREFIXES_SCRATCH.with(|cell| cell.borrow_mut().drain(..).collect());
+            ROW_PREFIXES_SCRATCH.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
         row_prefixes.resize(needed, 0);
         for y in 0..(visible_bottom - 1).max(0) {
             let row_start = y as usize * prefix_width;
@@ -605,6 +611,37 @@ mod tests {
 
         assert_eq!(labels.len(), 1);
         assert_eq!(labels[0].bubble_indices, vec![0]);
+    }
+
+    #[test]
+    fn avatar_texture_scan_reuses_the_thread_local_prefix_buffer_across_frames() {
+        let image = DynamicImage::new_rgba8(1920, 1080);
+        let config = SenderLabelConfig::default();
+
+        let first = AvatarTextureScan::new(&image, &config);
+        let first_ptr = first.row_prefixes.as_ptr();
+        let first_capacity = first.row_prefixes.capacity();
+        assert!(first_capacity > 0);
+        drop(first);
+
+        let cached_capacity = ROW_PREFIXES_SCRATCH.with(|cell| cell.borrow().capacity());
+        assert!(
+            cached_capacity >= first_capacity,
+            "扫描结束必须把缓冲区归还线程局部缓存，否则每帧都要重新分配"
+        );
+
+        let second = AvatarTextureScan::new(&image, &config);
+        assert_eq!(
+            second.row_prefixes.as_ptr(),
+            first_ptr,
+            "第二帧必须复用第一帧的缓冲区，不能重新分配"
+        );
+        assert_eq!(second.row_prefixes.capacity(), first_capacity);
+
+        // 连续多帧仍然复用同一块内存。
+        drop(second);
+        let third = AvatarTextureScan::new(&image, &config);
+        assert_eq!(third.row_prefixes.as_ptr(), first_ptr);
     }
 
     #[test]

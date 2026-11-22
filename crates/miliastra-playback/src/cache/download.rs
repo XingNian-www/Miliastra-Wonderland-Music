@@ -7,14 +7,31 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use tokio::io::AsyncWriteExt;
+use tokio::sync::OwnedSemaphorePermit;
 
 use crate::cache::{
     CacheInner, DownloadHandle, EntryState, cache_file_name, complete_file_size,
     lock_metadata_store, trim_cache,
 };
 
+/// 下载请求的来源。点播必须永远优先于预取：代理发出 `200` 后客户端只能等数据，
+/// 预热若占满并发槽位会让点播排队到 `seek_wait_timeout` 后断流。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DownloadPriority {
+    /// 代理点播触发的下载：可以排队，但队列里绝不出现预取任务。
+    OnDemand,
+    /// 播放成功后的后台预热：只使用预留之外的槽位，拿不到立即让位。
+    Prefetch,
+}
+
 /// 开始下载；幂等：已下载中/已完成则直接返回现有句柄。
-pub(crate) async fn start_download(inner: &Arc<CacheInner>, hash: &str) -> Option<DownloadView> {
+///
+/// 预取在预取名额耗尽时直接返回 `None`（不占位、不排队），因此不会影响点播。
+pub(crate) async fn start_download(
+    inner: &Arc<CacheInner>,
+    hash: &str,
+    priority: DownloadPriority,
+) -> Option<DownloadView> {
     loop {
         let mut entries = inner.entries.write().await;
         let entry = entries.get_mut(hash)?;
@@ -95,6 +112,20 @@ pub(crate) async fn start_download(inner: &Arc<CacheInner>, hash: &str) -> Optio
                     return Some(DownloadView::Complete { bytes });
                 }
                 // 先占位为 Downloading，再释放锁启动任务，防止并发重复下载。
+                // 预取在这里同步抢占预取名额：名额耗尽就直接放弃本次预热，
+                // 绝不创建 Downloading 占位（否则点播会等一个不会启动的下载）。
+                let prefetch_permit = match priority {
+                    DownloadPriority::Prefetch => {
+                        match inner.prefetch_slots.clone().try_acquire_owned() {
+                            Ok(permit) => Some(permit),
+                            Err(_) => {
+                                log::debug!("预取名额已满，跳过预热以让点播优先: {hash}");
+                                return None;
+                            }
+                        }
+                    }
+                    DownloadPriority::OnDemand => None,
+                };
                 let handle = DownloadHandle {
                     token: Arc::new(()),
                     ready: Arc::new(tokio::sync::Notify::new()),
@@ -110,7 +141,15 @@ pub(crate) async fn start_download(inner: &Arc<CacheInner>, hash: &str) -> Optio
                 let inner = inner.clone();
                 let task_handle = handle.clone();
                 tokio::spawn(async move {
-                    run_download(inner.clone(), hash, source, file, task_handle).await;
+                    run_download(
+                        inner.clone(),
+                        hash,
+                        source,
+                        file,
+                        task_handle,
+                        prefetch_permit,
+                    )
+                    .await;
                 });
                 return Some(DownloadView::InProgress(handle));
             }
@@ -159,13 +198,46 @@ async fn run_download(
     source: crate::domain::StreamSource,
     part_file: PathBuf,
     task_handle: DownloadHandle,
+    prefetch_permit: Option<OwnedSemaphorePermit>,
 ) {
     // 并发下载槽位：占满时排队等待，保证配置的并发上限生效。
     // 信号量只在进程退出时关闭，acquire 失败视为放弃本次下载。
-    let _permit = match inner.download_slots.clone().acquire_owned().await {
-        Ok(permit) => permit,
-        Err(_) => return,
+    //
+    // 关键区分：点播可以排队（队列里只有点播），预取**不可以**排队——
+    // 预取只申请「当前空闲」的共享槽位，拿不到就立刻让位。否则预热任务
+    // 会排在点播前面，代理已经写出 200 的响应只能等到超时后断流。
+    let _permit = if prefetch_permit.is_some() {
+        match inner.download_slots.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                log::debug!("共享下载槽位已满，预取让位给点播: {hash}");
+                release_entry_after_aborted_download(
+                    &inner,
+                    &hash,
+                    &task_handle,
+                    "共享下载槽位已满，预取让位",
+                )
+                .await;
+                return;
+            }
+        }
+    } else {
+        match inner.download_slots.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                release_entry_after_aborted_download(
+                    &inner,
+                    &hash,
+                    &task_handle,
+                    "下载信号量已关闭",
+                )
+                .await;
+                return;
+            }
+        }
     };
+    // 预取名额在整个下载期间保持占用，确保预取并发始终不超过预留上限。
+    let _prefetch_permit = prefetch_permit;
     inner.active_downloads.fetch_add(1, Ordering::SeqCst);
     let result = download_to_file(&inner, &hash, &source, &part_file, &task_handle).await;
     inner.active_downloads.fetch_sub(1, Ordering::SeqCst);
@@ -232,6 +304,36 @@ async fn run_download(
     if completed {
         trim_cache(inner.clone(), max_bytes).await;
     }
+}
+
+/// 下载在真正开始前被放弃（预取让位/信号量关闭）时恢复条目状态。
+///
+/// 不置 `failed`：等待方应把「下载已结束但状态回到 Idle」理解为可重试，
+/// 由代理按点播优先级重新申请槽位；置 `failed` 会让已写出的响应直接断流。
+async fn release_entry_after_aborted_download(
+    inner: &Arc<CacheInner>,
+    hash: &str,
+    task_handle: &DownloadHandle,
+    reason: &'static str,
+) {
+    let notify = {
+        let mut entries = inner.entries.write().await;
+        let Some(entry) = entries.get_mut(hash) else {
+            return;
+        };
+        let EntryState::Downloading(handle) = &entry.state else {
+            return;
+        };
+        if !Arc::ptr_eq(&handle.token, &task_handle.token) {
+            return;
+        }
+        let notify = handle.ready.clone();
+        entry.state = EntryState::Idle;
+        notify
+    };
+    log::debug!("缓存下载在开始前放弃，条目恢复为可重试: {hash}, {reason}");
+    task_handle.finished.store(true, Ordering::SeqCst);
+    notify.notify_waiters();
 }
 
 async fn download_to_file(

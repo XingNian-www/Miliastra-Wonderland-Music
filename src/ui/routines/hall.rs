@@ -13,6 +13,7 @@ use crate::config::AppConfig;
 use crate::config::{HallTimingConfig, OcrConfig, ScreenConfig};
 use crate::geometry::{Rect, crop_canvas};
 use crate::runtime::ocr::{OcrPriority, OcrRuntimeHandle};
+use crate::runtime::recovery::GameRecoveryCoordinator;
 use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure, UiRuntimeHandle,
     UiSubmitError, sealed,
@@ -111,6 +112,8 @@ pub(crate) struct HallUi {
     runtime: UiRuntimeHandle,
     ocr: OcrRuntimeHandle,
     config: HallRoutineConfig,
+    /// 进程级共享的恢复协调器（见 [`SettleEnvironment::with_recovery`]）。
+    recovery: GameRecoveryCoordinator,
 }
 
 impl HallUi {
@@ -123,7 +126,14 @@ impl HallUi {
             runtime,
             ocr,
             config,
+            recovery: GameRecoveryCoordinator::default(),
         }
+    }
+
+    /// 用进程级共享的恢复协调器替换默认实例（装配层只 `default()` 一次）。
+    pub(crate) fn with_recovery(mut self, recovery: GameRecoveryCoordinator) -> Self {
+        self.recovery = recovery;
+        self
     }
 
     pub(crate) fn submit_read(
@@ -134,6 +144,7 @@ impl HallUi {
             request,
             ocr: self.ocr.clone(),
             config: self.config.clone(),
+            recovery: self.recovery.clone(),
         })
     }
 
@@ -145,6 +156,7 @@ impl HallUi {
             request,
             ocr: self.ocr.clone(),
             config: self.config.clone(),
+            recovery: self.recovery.clone(),
         })
     }
 
@@ -156,6 +168,7 @@ impl HallUi {
             request,
             ocr: self.ocr.clone(),
             config: self.config.clone(),
+            recovery: self.recovery.clone(),
         })
     }
 }
@@ -544,6 +557,15 @@ struct ReadHallInfoTask {
     request: ReadHallInfo,
     ocr: OcrRuntimeHandle,
     config: HallRoutineConfig,
+    recovery: GameRecoveryCoordinator,
+}
+
+impl ReadHallInfoTask {
+    /// 收尾环境必须挂着进程级共享的协调器，否则本次恢复记账只活在本任务里。
+    fn environment(&self) -> SettleEnvironment {
+        SettleEnvironment::new(self.ocr.clone(), self.config.residency.clone())
+            .with_recovery(self.recovery.clone())
+    }
 }
 
 impl sealed::UiRoutineSealed for ReadHallInfoTask {}
@@ -552,7 +574,7 @@ impl UiRoutine for ReadHallInfoTask {
     type Output = ReadHallInfoOutcome;
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
-        let environment = SettleEnvironment::new(self.ocr.clone(), self.config.residency.clone());
+        let environment = self.environment();
         let activate_wait_ms = self.config.residency.after_activate_ms;
         let outcome = UiTask::new(
             hall_task_spec(environment, activate_wait_ms),
@@ -590,6 +612,14 @@ struct DetectPublicHallTask {
     request: DetectPublicHall,
     ocr: OcrRuntimeHandle,
     config: HallRoutineConfig,
+    recovery: GameRecoveryCoordinator,
+}
+
+impl DetectPublicHallTask {
+    fn environment(&self) -> SettleEnvironment {
+        SettleEnvironment::new(self.ocr.clone(), self.config.residency.clone())
+            .with_recovery(self.recovery.clone())
+    }
 }
 
 impl sealed::UiRoutineSealed for DetectPublicHallTask {}
@@ -598,7 +628,7 @@ impl UiRoutine for DetectPublicHallTask {
     type Output = DetectPublicHallOutcome;
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
-        let environment = SettleEnvironment::new(self.ocr.clone(), self.config.residency.clone());
+        let environment = self.environment();
         let activate_wait_ms = self.config.residency.after_activate_ms;
         let outcome = UiTask::new(
             hall_task_spec(environment, activate_wait_ms),
@@ -635,6 +665,14 @@ struct ToggleMicrophoneTask {
     request: ToggleMicrophone,
     ocr: OcrRuntimeHandle,
     config: HallRoutineConfig,
+    recovery: GameRecoveryCoordinator,
+}
+
+impl ToggleMicrophoneTask {
+    fn environment(&self) -> SettleEnvironment {
+        SettleEnvironment::new(self.ocr.clone(), self.config.residency.clone())
+            .with_recovery(self.recovery.clone())
+    }
 }
 
 impl sealed::UiRoutineSealed for ToggleMicrophoneTask {}
@@ -643,7 +681,7 @@ impl UiRoutine for ToggleMicrophoneTask {
     type Output = ToggleMicrophoneOutcome;
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
-        let environment = SettleEnvironment::new(self.ocr.clone(), self.config.residency.clone());
+        let environment = self.environment();
         let activate_wait_ms = self.config.residency.after_activate_ms;
         let outcome = UiTask::new(
             hall_task_spec(environment, activate_wait_ms),
@@ -821,9 +859,78 @@ mod tests {
         }
     }
 
+    /// B15-P2-4 回归：大厅三个任务都必须把进程级协调器交给收尾环境。
+    ///
+    /// 三个入口各自构造 `SettleEnvironment`；少接一处，那一处的恢复记账就只
+    /// 活在自己的默认实例里，进程级冷却与互斥对它不可见。
+    #[test]
+    fn hall_tasks_share_the_injected_recovery_coordinator() {
+        let config = crate::config::bundled_config();
+        let ocr_runtime = OcrRuntime::start(HallOcrDevice { member_count: "" }, 1).unwrap();
+        let shared = GameRecoveryCoordinator::default();
+        shared.record_restart_completed(
+            std::time::Instant::now(),
+            crate::runtime::recovery::RecoveryTrigger::ExternalChatDisconnect,
+        );
+        let hall_config = HallRoutineConfig::from_app(&config);
+        let ocr = ocr_runtime.handle();
+
+        let read = ReadHallInfoTask {
+            request: ReadHallInfo,
+            ocr: ocr.clone(),
+            config: hall_config.clone(),
+            recovery: shared.clone(),
+        };
+        let detect = DetectPublicHallTask {
+            request: DetectPublicHall,
+            ocr: ocr.clone(),
+            config: hall_config.clone(),
+            recovery: shared.clone(),
+        };
+        let microphone = ToggleMicrophoneTask {
+            request: ToggleMicrophone,
+            ocr,
+            config: hall_config.clone(),
+            recovery: shared.clone(),
+        };
+        for (name, environment) in [
+            ("读取大厅信息", read.environment()),
+            ("检测公共大厅", detect.environment()),
+            ("切换麦克风", microphone.environment()),
+        ] {
+            assert_eq!(
+                environment.recovery().health_snapshot_now().total_restarts,
+                1,
+                "{name}任务的收尾环境必须共享注入的协调器"
+            );
+        }
+
+        let unwired = ReadHallInfoTask {
+            request: ReadHallInfo,
+            ocr: ocr_runtime.handle(),
+            config: hall_config,
+            recovery: GameRecoveryCoordinator::default(),
+        };
+        assert_eq!(
+            unwired
+                .environment()
+                .recovery()
+                .health_snapshot_now()
+                .total_restarts,
+            0,
+            "默认构造的协调器不得看到共享实例的重启记录"
+        );
+        ocr_runtime.shutdown().unwrap();
+    }
+
     #[test]
     fn public_hall_detection_owns_f2_ocr_and_primary_recovery_in_one_operation() {
-        let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        if crate::test_support::corpus::skip_without_corpus(
+            "public_hall_detection_owns_f2_ocr_and_primary_recovery_in_one_operation",
+        ) {
+            return;
+        }
+        let mut config = crate::config::bundled_config();
         config.timing.input.after_activate_ms = 0;
         config.timing.input.click_ms = 0;
         config.timing.hall.page_settle_ms = 0;
@@ -886,7 +993,12 @@ mod tests {
 
     #[test]
     fn hall_screenshot_stacks_the_list_top_above_the_scrolled_bottom() {
-        let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        if crate::test_support::corpus::skip_without_corpus(
+            "hall_screenshot_stacks_the_list_top_above_the_scrolled_bottom",
+        ) {
+            return;
+        }
+        let mut config = crate::config::bundled_config();
         config.timing.input.after_activate_ms = 0;
         config.timing.input.click_ms = 0;
         config.timing.hall.page_settle_ms = 0;
@@ -944,16 +1056,26 @@ mod tests {
 
     #[test]
     fn hall_screenshot_skips_black_entry_frames_and_waits_for_primary_after_exit() {
+        if crate::test_support::corpus::skip_without_corpus(
+            "hall_screenshot_skips_black_entry_frames_and_waits_for_primary_after_exit",
+        ) {
+            return;
+        }
         assert_hall_transition_outcome(false);
     }
 
     #[test]
     fn hall_screenshot_failure_after_black_frames_still_recovers_primary() {
+        if crate::test_support::corpus::skip_without_corpus(
+            "hall_screenshot_failure_after_black_frames_still_recovers_primary",
+        ) {
+            return;
+        }
         assert_hall_transition_outcome(true);
     }
 
     fn assert_hall_transition_outcome(fail_entry_capture: bool) {
-        let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let mut config = crate::config::bundled_config();
         config.timing.input.after_activate_ms = 0;
         config.timing.input.click_ms = 0;
         config.timing.hall.page_settle_ms = 0;
@@ -1045,7 +1167,12 @@ mod tests {
 
     #[test]
     fn secondary_entry_navigates_primary_and_returns_to_secondary() {
-        let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        if crate::test_support::corpus::skip_without_corpus(
+            "secondary_entry_navigates_primary_and_returns_to_secondary",
+        ) {
+            return;
+        }
+        let mut config = crate::config::bundled_config();
         config.timing.input.after_activate_ms = 0;
         config.timing.hall.page_settle_ms = 0;
         config.timing.hall.ocr_sample_interval_ms = 0;

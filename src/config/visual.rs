@@ -430,11 +430,16 @@ pub fn differences(before: &VisualProfile, after: &VisualProfile) -> Result<Vec<
                 if !looks_like_path(&a) || !looks_like_path(&b) {
                     return false;
                 }
-                let a = a.trim_end_matches('/');
-                let b = b.trim_end_matches('/');
+                // 尾斜杠会让两侧长度不同却内容等价；先统一去掉再比较。
+                let a = a.trim_end_matches(['/', '\\']);
+                let b = b.trim_end_matches(['/', '\\']);
+                if a == b {
+                    return true;
+                }
                 // "deps/assets/x.png" 与 "C:/.../deps/assets/x.png"
-                b.ends_with(a) && b.as_bytes()[b.len() - a.len() - 1] == b'/'
-                    || a.ends_with(b) && a.as_bytes()[a.len() - b.len() - 1] == b'/'
+                let (long, short) = if b.len() > a.len() { (b, a) } else { (a, b) };
+                let offset = long.len().saturating_sub(short.len());
+                offset > 0 && long.ends_with(short) && long.as_bytes()[offset - 1] == b'/'
             }
             _ => false,
         }
@@ -613,5 +618,42 @@ mod tests {
         let diffs = differences(&saved, &effective).unwrap();
         assert_eq!(diffs.len(), 1, "真实路径变化必须报告: {diffs:?}");
         assert_eq!(diffs[0]["path"], "/templates/confirm_button");
+    }
+
+    #[test]
+    fn path_with_trailing_slash_does_not_underflow() {
+        let current = serde_json::to_value(AppConfig::default()).unwrap();
+        let base = VisualProfile::export(&current).unwrap();
+        // 两侧只差一个尾分隔符时，旧实现的 `len - len - 1` 会 usize 下溢。
+        for (saved_path, effective_path) in [
+            ("a/b", "a/b/"),
+            ("a/b/", "a/b"),
+            (r"a\b", r"a\b\"),
+            (r"a\b\", r"a\b"),
+        ] {
+            let mut saved = base.clone();
+            let mut effective = base.clone();
+            saved
+                .templates
+                .insert("confirm_button".into(), saved_path.into());
+            effective
+                .templates
+                .insert("confirm_button".into(), effective_path.into());
+            assert!(
+                differences(&saved, &effective).unwrap().is_empty(),
+                "仅尾斜杠不同不应视为配置差异: {saved_path:?} vs {effective_path:?}"
+            );
+        }
+        // 去掉尾斜杠后仍然不同的路径必须继续报告差异。
+        let mut saved = base.clone();
+        let mut effective = base;
+        saved
+            .templates
+            .insert("confirm_button".into(), "a/b".into());
+        effective
+            .templates
+            .insert("confirm_button".into(), "a/c/".into());
+        let diffs = differences(&saved, &effective).unwrap();
+        assert_eq!(diffs.len(), 1, "不同路径必须报告差异: {diffs:?}");
     }
 }

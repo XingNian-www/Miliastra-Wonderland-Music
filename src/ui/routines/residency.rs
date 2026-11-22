@@ -248,8 +248,17 @@ impl From<super::friend_delivery::UiResidencyTarget> for ResidencyTarget {
     fn from(target: super::friend_delivery::UiResidencyTarget) -> Self {
         match target {
             super::friend_delivery::UiResidencyTarget::Primary => Self::Primary,
+            // 明确就是"当前大厅会话"：给出可重建的会话目标。
             super::friend_delivery::UiResidencyTarget::SecondaryCurrentHall => {
                 Self::Secondary(ConversationRef::CurrentHall)
+            }
+            // `SecondaryConversation` 携带的是**脱敏结论键**（只有指纹），
+            // 不含重建所需的备注/候选名与行锚点——那些留在恢复引擎内部的
+            // `ConversationRef::Friend` 里，故意不进入对外驻留结论（隐私面）。
+            // 因此这里只能表达"已确认在二级聊天、具体会话不可重建"，
+            // 用 `AnySecondary`（显式不声明具体会话），绝不冒充 `CurrentHall`。
+            super::friend_delivery::UiResidencyTarget::SecondaryConversation(_) => {
+                Self::Secondary(ConversationRef::AnySecondary)
             }
         }
     }
@@ -391,6 +400,12 @@ struct RecoveryProgress {
     panel_samples: u32,
     conversation_samples: u32,
     conversation_identity: Option<String>,
+    /// 好友行已经点过、但高亮仍未切过去时，允许的**再试点击**次数。
+    ///
+    /// 「点过」不等于「切过去了」：只按 `conversation_actions > 0` 就判成功正是
+    /// 会话恢复假阳性的来源（`ui-task-return-design.md:18` 要求这种情况显式
+    /// fallback 当前大厅并报降级）。这里给一次有界重试，仍失败就如实报未满足。
+    friend_reclick_attempts: u32,
     /// 当前大厅行不可见时的有界滚动次数。
     hall_scroll_attempts: u32,
     pending_action_identity: Option<String>,
@@ -719,6 +734,7 @@ fn rejection_of(
 }
 
 /// 会话确认/导航结果。
+#[derive(Debug)]
 enum ConversationStep {
     /// 已确认目标会话（连续确认由调用方计数）。
     Satisfied,
@@ -1144,6 +1160,34 @@ fn hall_fallback(
     }
 }
 
+/// 目标好友行可见、但高亮**不在**它上面时的下一步。
+///
+/// 这正是 B15-P1-2 的旧假阳性点：旧实现只要 `already_clicked`（点过一次）就报
+/// `Satisfied`，于是"点了但没切过去"被当成恢复成功，调用方不会走
+/// `ui-task-return-design.md:18` 要求的显式 fallback 与 `session_restore_degraded`。
+///
+/// 现在按真实证据推进：先等一轮重采样（高亮动画/点击动画可能还没跟上），
+/// 仍不匹配再重试点击一次，两次都不成功就如实报 `Unavailable`，
+/// 由调用方 fallback 当前大厅并标记降级——**绝不**报 `Satisfied`。
+fn friend_mismatch_step(
+    point: Point,
+    already_clicked: bool,
+    reclick_attempts: &mut u32,
+) -> ConversationStep {
+    if !already_clicked {
+        return ConversationStep::Navigate(point);
+    }
+    *reclick_attempts = reclick_attempts.saturating_add(1);
+    match *reclick_attempts {
+        // 第一次发现不匹配：先重采样，可能只是还没切完。
+        1 => ConversationStep::Continue,
+        // 重采样仍不匹配：再点一次（用户手动点也可能第一次没生效）。
+        2 => ConversationStep::Navigate(point),
+        // 点了两次仍未切过去：如实报未满足。
+        _ => ConversationStep::Unavailable("已点击好友行但高亮仍未切到目标会话".to_string()),
+    }
+}
+
 /// 读一帧，判断目标会话当前是否已经满足，或需要点哪一行。
 fn conversation_step(
     context: &mut UiRoutineContext<'_>,
@@ -1276,10 +1320,11 @@ fn conversation_step(
                 return Ok(ConversationStep::Satisfied);
             }
             if let Some(point) = matches.first() {
-                if already_clicked {
-                    return Ok(ConversationStep::Satisfied);
-                }
-                return Ok(ConversationStep::Navigate(*point));
+                return Ok(friend_mismatch_step(
+                    *point,
+                    already_clicked,
+                    &mut progress.friend_reclick_attempts,
+                ));
             }
             // 当前列表没看到目标：允许轻量向下/向上滚动查找（有界）。
             let Some(point) = locate_friend_row_with_scroll(context, ocr, config, &targets)? else {
@@ -1765,6 +1810,44 @@ mod tests {
         assert!(hall_fallback(&ConversationRef::CurrentHall, SettleOptions::default()).is_none());
     }
 
+    /// B15-P1-2：点了好友行但高亮没切过去，**不允许**报 `Satisfied`。
+    ///
+    /// 旧实现在 `already_clicked` 时直接返回 `Satisfied`，把"没切过去"伪装成
+    /// 恢复成功；`ui-task-return-design.md:18` 要求这种情况显式 fallback 当前大厅
+    /// 并报 `session_restore_degraded`，所以这里必须先复核、再重试一次，
+    /// 仍失败就如实报未满足。
+    #[test]
+    fn clicked_friend_row_without_highlight_switch_is_never_reported_satisfied() {
+        let point = Point::new(120, 260);
+        let mut attempts = 0_u32;
+
+        // 未点过：正常导航。
+        assert!(matches!(
+            friend_mismatch_step(point, false, &mut attempts),
+            ConversationStep::Navigate(_)
+        ));
+        assert_eq!(attempts, 0, "首次导航不算重试");
+
+        // 点过但仍不匹配：先重采样（不是 Satisfied）。
+        let first = friend_mismatch_step(point, true, &mut attempts);
+        assert!(
+            matches!(first, ConversationStep::Continue),
+            "第一次不匹配必须先重采样，不得直接 Satisfied：{first:?}"
+        );
+
+        // 重采样仍不匹配：允许重试点击一次。
+        let second = friend_mismatch_step(point, true, &mut attempts);
+        assert!(matches!(second, ConversationStep::Navigate(_)));
+
+        // 再失败：如实报未满足，交给调用方 fallback + 降级。
+        let third = friend_mismatch_step(point, true, &mut attempts);
+        assert!(
+            matches!(third, ConversationStep::Unavailable(_)),
+            "两次点过仍不匹配必须如实报未满足：{third:?}"
+        );
+        assert_eq!(attempts, 3, "每一次不匹配都要计数，不能静默过关");
+    }
+
     #[test]
     fn ui_target_maps_to_clean_residency_target() {
         let target: ResidencyTarget =
@@ -1778,13 +1861,36 @@ mod tests {
         ));
     }
 
+    /// 已确认的具体好友会话只能映射到"任意二级"，**绝不**映射成当前大厅：
+    /// 结论键里没有重建会话所需的备注/候选名（那是隐私面），只能表达
+    /// "在二级聊天、具体会话不可重建"（`ui-task-return-design.md:24`）。
+    #[test]
+    fn confirmed_conversation_target_never_maps_to_current_hall() {
+        let key = crate::ui::routines::friend_delivery::ConversationKey::from_identity("甲");
+        let target: ResidencyTarget =
+            crate::ui::routines::friend_delivery::UiResidencyTarget::SecondaryConversation(key)
+                .into();
+        assert!(
+            matches!(
+                target,
+                ResidencyTarget::Secondary(ConversationRef::AnySecondary)
+            ),
+            "具体会话不可冒充当前大厅，实际：{target:?}"
+        );
+        // 会话键不进入恢复目标：不泄漏、也不假装能重建那一行。
+        assert_ne!(
+            target,
+            ResidencyTarget::Secondary(ConversationRef::CurrentHall)
+        );
+    }
+
     // ==== 真实二级聊天帧：会话确认扫描区（左侧侧栏整条）====
 
     const SCROLLED_FRIEND_FRAME: &str = "tests/fixtures/ui/secondary-chat-scrolled-1920x1080.jpg";
     const HALL_ROW_FRAME: &str = "tests/fixtures/ui/secondary-with-hall-row-1920x1080.png";
 
     fn fixture_config() -> AppConfig {
-        AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap()
+        crate::config::bundled_config()
     }
 
     fn fixture_routine() -> FriendDeliveryRoutineConfig {
@@ -1885,6 +1991,11 @@ mod tests {
 
     #[test]
     fn real_friend_frame_selected_row_above_list_top_is_unique_and_identified_as_friend() {
+        if crate::test_support::corpus::skip_without_corpus(
+            "real_friend_frame_selected_row_above_list_top_is_unique_and_identified_as_friend",
+        ) {
+            return;
+        }
         let routine = fixture_routine();
         let image = real_frame(SCROLLED_FRIEND_FRAME);
         let friends = routine.friend_list_region();
@@ -1945,6 +2056,11 @@ mod tests {
 
     #[test]
     fn real_current_hall_frame_still_identified_as_current_hall() {
+        if crate::test_support::corpus::skip_without_corpus(
+            "real_current_hall_frame_still_identified_as_current_hall",
+        ) {
+            return;
+        }
         let routine = fixture_routine();
         let image = real_frame(HALL_ROW_FRAME);
         let region = conversation_row_region(&routine);
@@ -1975,6 +2091,11 @@ mod tests {
 
     #[test]
     fn highlight_scan_requires_exactly_one_sidebar_row_and_ignores_chat_area() {
+        if crate::test_support::corpus::skip_without_corpus(
+            "highlight_scan_requires_exactly_one_sidebar_row_and_ignores_chat_area",
+        ) {
+            return;
+        }
         let routine = fixture_routine();
         let region = conversation_row_region(&routine);
         let unique = crate::ui::routines::highlighted_conversation_row;
@@ -2037,7 +2158,7 @@ mod conversation_substate_evidence {
         };
         let out_path = std::env::var("MILIASTRA_CONVERSATION_OUT")
             .expect("MILIASTRA_CONVERSATION_OUT 必须给出");
-        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let config = crate::config::bundled_config();
         let routine = FriendDeliveryRoutineConfig::from_app(&config);
         let canvas = Canvas {
             width: config.screen.expected_width,

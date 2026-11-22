@@ -2356,3 +2356,253 @@ fn migration_also_rewrites_history_snapshots_so_rollback_still_works() {
     );
     cleanup(&root);
 }
+
+/// B04-P1-5：`save()` 的合并基准必须在写事务**之内**读取。
+///
+/// 用两条真实连接模拟两个进程：连接 A 持 IMMEDIATE 写锁并把某一版写进库
+/// （未提交），连接 B 同时发起保存。旧实现先在事务外读基准，B 读到的是 A
+/// 提交前的旧值；修好后 B 在取锁之后才读，只能读到 A 提交后的新值。这里用
+/// 「B 的保存是否包含 A 刚写入的段值」直接区分两种实现——并且不丢更新。
+#[test]
+fn save_reads_merge_base_inside_the_write_transaction() {
+    let (root, database_path) = temp_database("save-base-in-tx");
+    let bootstrap = test_bootstrap(&database_path);
+    let mut store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+    let baseline = full_sections(&store);
+    let revision = store.current_revision().unwrap();
+
+    // 连接 A：另一进程的保存事务，写入 queue.max_size = 23，持锁不提交。
+    let mut connection_a = rusqlite::Connection::open(&database_path).unwrap();
+    ConfigStore::initialize_connection(&connection_a).unwrap();
+    let transaction_a = connection_a
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    let mut other_sections = baseline.clone();
+    other_sections["queue"]["max_size"] = json!(23);
+    for (section, value) in &other_sections {
+        transaction_a
+            .execute(
+                "INSERT OR REPLACE INTO config_sections (section, value_json, revision, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    section,
+                    serde_json::to_string(value).unwrap(),
+                    revision + 1,
+                    0
+                ],
+            )
+            .unwrap();
+    }
+    transaction_a
+        .execute(
+            "INSERT INTO config_revisions (revision, snapshot_json, created_at_ms) VALUES (?1, ?2, 0)",
+            rusqlite::params![
+                revision + 1,
+                serde_json::to_string(&Value::Object(other_sections.clone())).unwrap()
+            ],
+        )
+        .unwrap();
+    transaction_a
+        .execute(
+            "UPDATE config_meta SET revision = ?1 WHERE id = 1",
+            rusqlite::params![revision + 1],
+        )
+        .unwrap();
+
+    // 连接 B：同一进程的另一实例，提交只含 timing 的候选（queue 应沿用库值）。
+    let mut timing_only = Map::new();
+    timing_only.insert(
+        "timing".to_string(),
+        serde_json::to_value(AppConfig::default().to_db_value()["timing"].clone()).unwrap(),
+    );
+    let base = revision + 1;
+    let handle = std::thread::spawn(move || store.save(base, timing_only));
+
+    // B 必须先阻塞在 A 的写锁上；提交 A 后 B 才在事务内读到 queue=23。
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    transaction_a.commit().unwrap();
+    let outcome = handle.join().expect("保存线程必须正常结束").unwrap();
+    assert_eq!(outcome.revision, base + 1);
+
+    // 不丢更新：A 写入的 queue.max_size 必须仍在，且 B 的 timing 变更也生效。
+    assert_eq!(
+        stored_section(&database_path, "queue")["max_size"],
+        json!(23),
+        "合并基准必须在事务内读：事务外读到旧基准会把并发保存的段覆盖回默认值"
+    );
+    assert_eq!(
+        stored_section(&database_path, "timing")["loop_idle_ms"],
+        AppConfig::default().to_db_value()["timing"]["loop_idle_ms"]
+    );
+
+    // 取锁后基准已过期（B 用了 revision+1，正好是最新）时仍要正确冲突判定：
+    let mut third = ConfigStore::open(&database_path, &root, bootstrap).unwrap();
+    let mut stale = full_sections(&third);
+    stale["queue"]["max_size"] = json!(7);
+    assert!(matches!(
+        third.save(revision, stale),
+        Err(ConfigSaveError::Conflict)
+    ));
+    cleanup(&root);
+}
+
+/// B04-P1-6：`rollback()` 的基准读取与写回在同一个事务里。
+///
+/// 判别用的是「回滚是否会回退并发提交的密钥」：连接 B 先开着 IMMEDIATE 事务把
+/// `ai.api_key` 改成当前值（未提交），回滚线程随即启动。
+///
+/// - 修好后：回滚的读基准发生在自己的写事务内，被 B 的写锁挡到 B 提交之后，
+///   读到的是 B 提交的新密钥 → 回滚保留它。
+/// - 旧实现：事务外先读一次基准（WAL 下读者不被写者阻塞，读到的是 B 提交**前**
+///   的旧密钥），把旧密钥 force-retain 进候选，再调 `save()` 二次读库；`save()`
+///   的保留规则只对 null/空串/掩码生效，具名的旧密钥于是覆盖掉 B 刚提交的新密钥。
+///
+/// 这正是「重复读取导致基准不一致」的可观测后果，不是依赖内部调用次数。
+#[test]
+fn rollback_reads_baseline_once_inside_the_write_transaction() {
+    let (root, database_path) = temp_database("rollback-single-read");
+    let bootstrap = test_bootstrap(&database_path);
+    let mut store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+
+    // revision 2：api_key = "snapshot-key"（历史快照里的旧密钥）。
+    let mut first = full_sections(&store);
+    first["ai"]["api_key"] = json!("snapshot-key");
+    store.save(1, first).unwrap();
+    // revision 3：api_key = "current-key"（当前库值）。
+    let mut second = full_sections(&store);
+    second["ai"]["api_key"] = json!("current-key");
+    store.save(2, second).unwrap();
+
+    // 连接 B：并发保存事务，把密钥推进到 "concurrent-key" 并抬到 revision 4。
+    let mut connection_b = rusqlite::Connection::open(&database_path).unwrap();
+    ConfigStore::initialize_connection(&connection_b).unwrap();
+    let transaction_b = connection_b
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    let mut concurrent = full_sections(&store);
+    concurrent["ai"]["api_key"] = json!("concurrent-key");
+    transaction_b
+        .execute(
+            "UPDATE config_sections SET value_json = ?1, revision = 4 WHERE section = 'ai'",
+            rusqlite::params![serde_json::to_string(&concurrent["ai"]).unwrap()],
+        )
+        .unwrap();
+    transaction_b
+        .execute(
+            "INSERT INTO config_revisions (revision, snapshot_json, created_at_ms) VALUES (4, ?1, 0)",
+            rusqlite::params![serde_json::to_string(&Value::Object(concurrent.clone())).unwrap()],
+        )
+        .unwrap();
+    transaction_b
+        .execute("UPDATE config_meta SET revision = 4 WHERE id = 1", [])
+        .unwrap();
+
+    // 回滚线程：目标 revision 2，基线 4（B 提交后的版本）。
+    let handle = std::thread::spawn(move || store.rollback(2, 4));
+    // 给回滚线程足够时间走到「等写锁」这一步；B 此前一直持锁。
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    transaction_b.commit().unwrap();
+    let outcome = handle.join().expect("回滚线程必须正常结束").unwrap();
+    assert_eq!(outcome.revision, 5);
+
+    // 关键断言：回滚不得把 B 提交的新密钥回退成事务外读到的旧值。
+    assert_eq!(
+        stored_section(&database_path, "ai")["api_key"],
+        json!("concurrent-key"),
+        "回滚的合并基准必须在写事务内读；事务外读一次再经 save() 二次读会回退并发提交的密钥"
+    );
+    // 非 secret 字段仍按目标快照（revision 2）恢复：queue.max_size 取快照值。
+    assert_eq!(
+        stored_section(&database_path, "queue")["max_size"],
+        json!(5),
+        "回滚仍要按目标快照恢复非 secret 字段"
+    );
+    assert_eq!(stored_revision(&database_path), 5);
+    cleanup(&root);
+}
+
+/// B04-P1-6（upgrade）：取写锁后版本已变（并发升级）时必须放弃本次迁移并
+/// 重新校验，而不是按过期的 `stale_version` 决策。
+///
+/// 判别点：调用方按「库还是 v3」决定迁移，取锁后库里已经是 v2（另一进程回退/换了
+/// 一份更老的库）。v2 没有迁移路径，若仍按 stale_version 走迁移，`migrate_sections`
+/// 会在事务里报「没有 v2 的迁移路径」并让 `open` 失败；修好后放弃本次、重走
+/// `ensure_schema`，由**实际**版本决定路径（v2 → 断代重置为默认值）。
+#[test]
+fn migration_aborts_when_the_locked_version_moved_on() {
+    let (root, database_path) = temp_database("migrate-stale-version");
+    let bootstrap = test_bootstrap(&database_path);
+    let mut store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+    let mut sections = full_sections(&store);
+    sections["queue"]["max_size"] = json!(23);
+    store.save(1, sections).unwrap();
+    let v3_shaped = v3_sections_from_current(&store);
+    drop(store);
+    write_sections_as_version(&database_path, 2, &v3_shaped);
+    assert_eq!(stored_schema_version(&database_path), 2);
+
+    // 模拟「决策时版本是 3、取锁时已是 2」：以 stale_version = 3 调迁移路径。
+    let mut connection = rusqlite::Connection::open(&database_path).unwrap();
+    ConfigStore::initialize_connection(&connection).unwrap();
+    let path = database_path.clone();
+    ConfigStore::migrate_previous_schema(&mut connection, &path, 3)
+        .expect("版本已推进/变化时必须放弃本次迁移并按实际版本重来，而不是报迁移路径缺失");
+
+    // 按实际版本 v2 处理：没有迁移路径 → 断代重置为默认值，版本推进到当前。
+    assert_eq!(stored_schema_version(&database_path), CONFIG_SCHEMA_VERSION);
+    assert_eq!(
+        stored_revision(&database_path),
+        1,
+        "按实际版本 v2 应走断代重置（revision 回到 1），不是按 stale v3 迁移"
+    );
+    assert_eq!(
+        stored_section(&database_path, "queue")["max_size"],
+        json!(5),
+        "断代重置取默认值"
+    );
+    cleanup(&root);
+}
+
+/// 断代路径同样受 stale_version 守卫保护：取锁后版本已变，绝不 DROP 配置表。
+///
+/// 判别点：调用方按「库还是 v1」决定断代，取锁后库里已经是 v3（有迁移路径）。
+/// 旧实现不看 stale_version 直接 DROP 三表并按默认值重建——可迁移的用户设置
+/// 全部丢失；修好后放弃本次断代、重走 `ensure_schema`，按实际 v3 平滑迁移。
+#[test]
+fn reset_aborts_when_the_locked_version_moved_on() {
+    let (root, database_path) = temp_database("reset-stale-version");
+    let bootstrap = test_bootstrap(&database_path);
+    let mut store = ConfigStore::open(&database_path, &root, bootstrap.clone()).unwrap();
+    let mut sections = full_sections(&store);
+    sections["queue"]["max_size"] = json!(23);
+    store.save(1, sections).unwrap();
+    let mut v3 = v3_sections_from_current(&store);
+    v3["queue"]["max_size"] = json!(23);
+    v3["templates"]["friend_confirm"] = json!("custom/可迁移的设置.png");
+    drop(store);
+    write_sections_as_version(&database_path, 3, &v3);
+    assert_eq!(stored_schema_version(&database_path), 3);
+
+    // 模拟「决策时版本是 1、取锁时已是 3」：以 stale_version = 1 调断代路径。
+    let mut connection = rusqlite::Connection::open(&database_path).unwrap();
+    ConfigStore::initialize_connection(&connection).unwrap();
+    let path = database_path.clone();
+    ConfigStore::reset_previous_schema(&mut connection, &path, 1)
+        .expect("版本已变化时必须放弃断代并按实际版本重来");
+
+    assert_eq!(stored_schema_version(&database_path), CONFIG_SCHEMA_VERSION);
+    assert_eq!(
+        stored_section(&database_path, "queue")["max_size"],
+        json!(23),
+        "守卫失效会 DROP 配置三表并按默认值重建，可迁移的用户设置全部丢失"
+    );
+    assert_eq!(
+        stored_section(&database_path, "templates")["confirm_button"],
+        json!("custom/可迁移的设置.png"),
+        "必须按实际 v3 平滑迁移，而不是断代重置"
+    );
+    // 备份在取锁前产生（`VACUUM INTO` 不能在事务内跑，只能留在取锁之前）：
+    // 放弃的断代留下 1 份，随后的真实迁移再留 1 份，共 2 份。关键是配置表没有被重建。
+    assert_eq!(backup_files(database_path.parent().unwrap()).len(), 2);
+    cleanup(&root);
+}

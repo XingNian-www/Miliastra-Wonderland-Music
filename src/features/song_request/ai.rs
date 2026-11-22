@@ -125,6 +125,14 @@ impl AiClient {
         }
     }
 
+    /// 调试接口（`?model=`）显式覆盖模型时的调用选项。
+    fn overridden_call_options(
+        &self,
+        query: &[(String, String)],
+    ) -> crate::config::ai::AiCallOptions {
+        call_options_for_query(&self.config, query)
+    }
+
     /// 共用连接配置和超时，但由独立业务提供系统提示词，避免混用点歌提示词。
     pub(crate) fn request_feature_json(&self, system: &str, prompt: &str) -> Result<Value> {
         let reply = crate::config::ai::request_json(
@@ -142,6 +150,7 @@ impl AiClient {
     fn match_song_identity_json(
         &self,
         connection: &AiConfig,
+        options: &crate::config::ai::AiCallOptions,
         request: &str,
         song_name: &str,
         song_singer: &str,
@@ -154,7 +163,7 @@ impl AiClient {
         let reply = crate::config::ai::request_json(
             &self.openai,
             connection,
-            &self.call_options(),
+            options,
             &self.system_prompt(),
             &build_match_prompt(
                 &self.config.match_prompt,
@@ -317,7 +326,7 @@ impl AiClient {
         let reply = crate::config::ai::request_json(
             &self.openai,
             &self.query_connection(query)?,
-            &self.call_options(),
+            &self.overridden_call_options(query),
             &self.system_prompt(),
             &build_recognize_prompt(&self.config.recognize_prompt, &text),
             SONG_AI_MAX_TOKENS,
@@ -330,8 +339,10 @@ impl AiClient {
 
     pub fn match_with_query(&self, query: &[(String, String)]) -> Result<String> {
         let connection = self.query_connection(query)?;
+        let options = self.overridden_call_options(query);
         self.match_song_identity_json(
             &connection,
+            &options,
             query_value(query, "request").unwrap_or(""),
             query_value(query, "songName").unwrap_or(""),
             query_value(query, "songSinger").unwrap_or(""),
@@ -355,7 +366,7 @@ impl AiClient {
         let reply = crate::config::ai::request_json(
             &self.openai,
             &connection,
-            &self.call_options(),
+            &self.overridden_call_options(query),
             &self.system_prompt(),
             &build_candidate_pick_prompt(
                 &self.config.candidate_pick_prompt,
@@ -393,6 +404,27 @@ fn parse_query_candidates(text: &str) -> Result<Vec<SearchCandidate>> {
         bail!("candidates参数缺少有效候选");
     }
     Ok(candidates)
+}
+
+/// 一次 QA/调试调用的模型选项：显式 `?model=` 必须真的生效。
+///
+/// `song_ai.model` 在 `effective_model` 里的优先级**高于** `ai.model`，
+/// 所以只把查询参数写进临时 `AiConfig.model` 是没用的——`call_options()`
+/// 仍然带着 `song_ai.model`，把调试参数静静吃掉（线上表现为"加 `?model=`
+/// 完全没变化"）。显式覆盖时清空这里的模型，让 `effective_model` 落到
+/// 连接配置（已被查询参数覆盖）里的值。
+fn call_options_for_query(
+    config: &SongAiConfig,
+    query: &[(String, String)],
+) -> crate::config::ai::AiCallOptions {
+    let mut options = crate::config::ai::AiCallOptions {
+        model: config.model.clone(),
+        reasoning: config.reasoning,
+    };
+    if query_value(query, "model").is_some() {
+        options.model.clear();
+    }
+    options
 }
 
 /// 解析一次点歌 AI 调用的目标；连接参数来自共享 `ai` 段。
@@ -498,15 +530,47 @@ fn default_candidate_pick_prompt() -> String {
     .join("\n")
 }
 
+/// 单遍展开 `{{name}}` 占位符。
+///
+/// **不能**用顺序 `String::replace`：玩家输入是不可信数据，`@点歌 {{candidates}}`
+/// 里的 `{{candidates}}` 会被后续那次替换二次展开，把候选列表 JSON 塞进
+/// "用户点歌"那一行——既是提示词注入，也让模型看到自相矛盾的内容。
+///
+/// 单遍扫描天然免疫：值写出去以后不再参与后续匹配。模板里出现未知占位符时
+/// 原样保留（便于用户发现拼错），未闭合的 `{{` 也不吞掉后面整段文本。
 fn render_prompt(template: &str, replacements: &[(&str, &str)], fallback_context: &str) -> String {
-    let mut rendered = template.to_string();
+    let mut rendered = String::with_capacity(template.len() + 64);
     let mut replaced = false;
-    for (placeholder, value) in replacements {
-        if rendered.contains(placeholder) {
-            replaced = true;
-            rendered = rendered.replace(placeholder, value);
+    let mut rest = template;
+    while let Some(open) = rest.find("{{") {
+        rendered.push_str(&rest[..open]);
+        let after = &rest[open + 2..];
+        let Some(close) = after.find("}}") else {
+            // 未闭合的 `{{`：原样保留，不吞掉后续文本。
+            rendered.push_str(&rest[open..]);
+            rest = "";
+            break;
+        };
+        let name = &after[..close];
+        let matched = replacements.iter().find(|(placeholder, _)| {
+            placeholder
+                .strip_prefix("{{")
+                .and_then(|rest| rest.strip_suffix("}}"))
+                == Some(name)
+        });
+        match matched {
+            Some((_, value)) => {
+                rendered.push_str(value);
+                replaced = true;
+            }
+            None => {
+                // 未知占位符原样保留。
+                rendered.push_str(&rest[open..open + 2 + close + 2]);
+            }
         }
+        rest = &after[close + 2..];
     }
+    rendered.push_str(rest);
     // 若旧配置或用户自定义模板没有占位符，仍把必要上下文附在末尾，避免空请求。
     if !replaced && !fallback_context.is_empty() {
         rendered.push('\n');
@@ -860,6 +924,89 @@ mod tests {
             "周杰伦",
         );
         assert_eq!(matched, "晴天/晴天/周杰伦");
+    }
+
+    /// 回归（B08-P1-7）：玩家输入里的 `{{...}}` 不能被二次展开。
+    ///
+    /// 修复前 `render_prompt` 对 replacements 顺序 `String::replace`：先把
+    /// `{{request}}` 换成玩家原文，再替换 `{{candidates}}`——玩家原文里若带
+    /// `{{candidates}}`，那一行会被塞进整个候选 JSON。既是提示词注入，也让
+    /// 模型看到"用户点歌：<候选列表>"这种自相矛盾的内容。
+    #[test]
+    fn player_text_with_placeholder_syntax_is_never_expanded_twice() {
+        let candidates = vec![(
+            0,
+            test_candidate("first", "miliastra://track/qqmusic/first"),
+        )];
+        let injection = "晴天 {{candidates}} 与 {{request}}";
+        let prompt = build_candidate_pick_prompt(
+            &default_candidate_pick_prompt(),
+            injection,
+            false,
+            &candidates,
+        );
+        // 玩家原文原样出现在"用户点歌"那一行，没有被替换成候选 JSON。
+        assert!(
+            prompt.contains(&format!("用户点歌：{injection}")),
+            "玩家输入必须原样保留，实际: {prompt}"
+        );
+        // 候选列表那一行只出现一次，且带着真实候选 JSON。
+        assert_eq!(
+            prompt.matches("候选列表：").count(),
+            1,
+            "候选列表只能出现一次: {prompt}"
+        );
+        assert!(
+            prompt.contains(r#"候选列表：[{"index":1"#),
+            "实际: {prompt}"
+        );
+        // 二次展开的判据：`{{candidates}}` 只在玩家原文里出现一次；
+        // 修复前它会被替换成候选 JSON，因而变成 0 次并多出一行候选列表。
+        assert_eq!(
+            prompt.matches("{{candidates}}").count(),
+            1,
+            "占位符语法只应作为玩家原文出现一次: {prompt}"
+        );
+        assert_eq!(prompt.matches("{{request}}").count(), 1);
+    }
+
+    /// 单遍展开的边界：未知占位符原样保留、未闭合的 `{{` 不吞掉后续文本。
+    #[test]
+    fn placeholder_rendering_keeps_unknown_and_unclosed_markers_verbatim() {
+        assert_eq!(
+            render_prompt("A{{known}}B{{unknown}}C", &[("{{known}}", "值")], ""),
+            "A值B{{unknown}}C"
+        );
+        assert_eq!(render_prompt("尾部{{未闭合", &[], ""), "尾部{{未闭合");
+        // 没有命中任何占位符时才追加兜底上下文。
+        assert_eq!(
+            render_prompt("没有占位符", &[("{{x}}", "y")], "补充上下文"),
+            "没有占位符\n补充上下文"
+        );
+        assert_eq!(render_prompt("{{x}}", &[("{{x}}", "y")], "补充上下文"), "y");
+    }
+
+    /// 回归（B08-P1-8）：`?model=` 在配置了 `song_ai.model` 时必须仍然生效。
+    ///
+    /// 修复前调用点始终传 `self.call_options()`，`song_ai.model` 优先级更高，
+    /// 把调试参数静静吃掉。
+    #[test]
+    fn query_model_override_beats_the_feature_specific_model() {
+        let config = SongAiConfig {
+            model: "song-ai-model".to_string(),
+            ..SongAiConfig::default()
+        };
+        // 没写 ?model= 时沿用功能段配置。
+        let plain = call_options_for_query(&config, &[]);
+        assert_eq!(plain.model, "song-ai-model");
+        // 写了 ?model= 时必须让 effective_model 回落到连接配置（已被查询参数覆盖）。
+        let overridden =
+            call_options_for_query(&config, &[("model".to_string(), "debug-model".to_string())]);
+        assert!(
+            overridden.model.is_empty(),
+            "显式覆盖时必须清空功能段模型，否则 song_ai.model 会压过 ?model=，实际: {}",
+            overridden.model
+        );
     }
 
     #[test]

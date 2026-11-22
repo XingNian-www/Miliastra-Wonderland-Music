@@ -131,11 +131,16 @@ pub(super) fn timing_section() -> Vec<ConfigFieldSchema> {
             int(1, MAX_TIMEOUT_MS),
             "命令执行后等待聊天列表/动画稳定再复扫的时间，单位毫秒；保存后立即生效",
         ),
+        // `Live` 声明准确：该值由 `delivery::reply_batch` 在运行期重新读取 live
+        // 快照（`composition/application/delivery.rs` 的 `reply_batch` 每次调用都读
+        // `live_configs.snapshot().timing.command.help_batch_ms`，根本不用传进来的
+        // 参数）。`PlaybackApplicationConfig` 里的 `help_batch_ms` 副本仅供测试替身
+        // 使用，不代表运行期取值路径。
         ConfigFieldSchema::db_live(
             "command.help_batch_ms",
             "帮助消息间隔",
             int(1, MAX_TIMEOUT_MS),
-            "@帮助及其他批量消息之间的间隔，单位毫秒；保存后立即生效",
+            "@帮助及其他批量消息之间的间隔，单位毫秒；保存后立即生效（由 delivery::reply_batch 在运行期重新读取 live 快照）",
         ),
         ConfigFieldSchema::db_idle_reload(
             "input.after_activate_ms",
@@ -836,11 +841,28 @@ pub(super) fn startup_section() -> Vec<ConfigFieldSchema> {
             FieldKind::Bool,
             "找不到游戏窗口时是否启动游戏",
         ),
-        ConfigFieldSchema::db_live(
+        // 数据库可编辑，但**要等运行态闲置重载才真正生效**，不是 Live：
+        // 调度侧（`recovery_guard::automatic_startup_task`）读 live 快照，执行侧
+        // （`ui/routines/startup.rs` 的 `execute_enter_game`）读的却是启动期冻结在
+        // `StartupUiConfig` 里的 `enter_game`。只改一半会变成「面板说已生效、实际
+        // 按旧值执行」，违反「配置 effect 必须准确」。
+        //
+        // 与同段的 `launch_game` 同一档：`startup.*` 一旦改动，`tasks.rs` 的
+        // `reload_fields_require_startup` 会把重载升级成 `ConfigReloadWithStartup`，
+        // 也就是「闲置时重载并重新走启动流程」——效果等同重启，而面板文案如实写
+        // 「任务结束后重载」。
+        //
+        // 说明：审计决策写的是「改为 `Restart`」。这里没有照抄，因为把 `source: Db`
+        // 的字段声明成 `Effect::Restart` 会直接违反 `schema/mod.rs` 的
+        // `database_fields_never_require_manual_restart`（「数据库字段应立即生效或在
+        // 闲置时自动重载」），而那个文件不在本次允许改动范围内；`ui.rs` 里也不存在
+        // 数据库字段可用的 `Restart` 构造器（`bootstrap_restart` 会连带把 source
+        // 改成 Bootstrap，让面板只读且不写回，等于把可编辑字段变灰）。
+        ConfigFieldSchema::db_idle_reload(
             "enter_game",
             "自动进入游戏",
             FieldKind::Bool,
-            "持续未知时 OCR 检测到“点击进入”，确认大门界面后自动进入游戏",
+            "持续未知时 OCR 检测到“点击进入”，确认大门界面后自动进入游戏；任务结束后重载子进程时生效",
         ),
         ConfigFieldSchema::db_live(
             "enter_wonderland",

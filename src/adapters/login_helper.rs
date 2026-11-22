@@ -26,6 +26,8 @@ const REAPER_POLL: Duration = Duration::from_millis(25);
 const TERMINATION_GRACE: Duration = Duration::from_secs(2);
 /// 等待登录助手输出线程退出的上限;超过则分离(孙进程可能持有管道写端)。
 const READER_JOIN_GRACE: Duration = Duration::from_secs(3);
+/// 强杀登录助手后等待其退出的上限;超期按「结果未知」处理,不得回报成功。
+const KILL_WAIT_GRACE: Duration = Duration::from_secs(5);
 const MAX_LOGIN_HELPER_FRAMES: usize = 8;
 const PROFILE_ROOT_NAME: &str = ".login-profiles";
 
@@ -227,22 +229,16 @@ pub(crate) fn sync_kugou_device_file(
     {
         return Ok(false);
     }
-    fs::create_dir_all(directory)?;
     let content = serde_json::to_vec_pretty(&device)
         .map_err(|error| io::Error::other(format!("serialize KuGou device identity: {error}")))?;
-    // 临时名必须唯一：固定成 `kugou-device.json.tmp` 时，两个进程/线程同时
-    // 写同一 profile 目录会互相截断——B 的 fs::write 清空 A 正在写的临时文件，
-    // A 随后 rename 就把半截内容提交成正式文件；或 A 先 rename 走，
-    // B 的 rename 直接 ENOENT 失败。
-    let temporary = path.with_file_name(format!(".kugou-device.{}.tmp", std::process::id()));
-    if let Err(error) = fs::write(&temporary, &content) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
-    }
-    if let Err(error) = fs::rename(&temporary, &path) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
-    }
+    // 临时文件必须对「同一进程内的并发写入」也唯一：设置页保存与登录前刷新可能
+    // 同时落盘，若临时名只由固定字面量（或进程号）构成，两个写者会互相截断——
+    // B 清空 A 正在写的临时文件，A 随后 rename 就把半截内容提交成正式文件；
+    // 或 A 先 rename 走，B 的 rename 直接 ENOENT 失败（B01-P0-11）。
+    // `file_store::write_atomic` 用「进程内递增序号 + sync_all + 原子替换」，
+    // 同进程并发不会撞名，落盘内容也不会只写一半（目录也会自动创建）。
+    crate::adapters::file_store::write_atomic(&path, &content, "酷狗设备标识")
+        .map_err(|error| io::Error::other(format!("{error:#}")))?;
     Ok(true)
 }
 
@@ -396,6 +392,12 @@ struct ManagerState {
     deadline_at_ms: Option<u64>,
     qr_code: Option<LoginQrCodeView>,
     last_error: Option<LoginErrorView>,
+    /// 关停位：置位后拒绝新登录，并让「启动中」的登录在登记前自行回收子进程。
+    ///
+    /// 不能只用瞬时的「正在取消」标志：`shutdown` 若在 `start` 之前拿到锁，会看到
+    /// `phase == Idle` 而直接返回，紧接着 `start` 拉起登录助手——子进程就漏在关停
+    /// 之后了（B01-P1-7）。管理器只服务于单次运行期，关停即终态。
+    closed: bool,
 }
 
 struct ActiveLogin {
@@ -583,6 +585,7 @@ impl LoginHelperManager {
                     deadline_at_ms: None,
                     qr_code: None,
                     last_error: None,
+                    closed: false,
                 }),
                 changed: Condvar::new(),
             }),
@@ -679,6 +682,13 @@ impl LoginHelperManager {
                     Some(provider),
                 )
             })?;
+            if state.closed {
+                return Err(manager_failure(
+                    "login_manager_closed",
+                    "登录管理器已关闭，不再接受新的登录任务",
+                    Some(provider),
+                ));
+            }
             if state.active.is_some()
                 || matches!(
                     state.phase,
@@ -719,11 +729,20 @@ impl LoginHelperManager {
         };
         let spawned = match self.inner.launcher.spawn(provider, &profile, login_timeout) {
             Ok(spawned) => spawned,
-            Err(_) => {
+            Err(error) => {
                 let _ = self.inner.playback.cancel_login(session.session_id);
                 cleanup_profile(&profile);
-                let failure =
-                    manager_failure("helper_start_failed", "登录助手启动失败", Some(provider));
+                // B01-P1-5：底层错误链只进日志（含 `{error:#}`，便于定位是路径、
+                // 权限还是 WebView2 缺失），给调用方的提示必须可操作但不含密钥。
+                log::warn!(
+                    "登录助手启动失败（步骤：拉起登录助手进程，平台 {}）：{error:#}",
+                    provider.as_str()
+                );
+                let failure = manager_failure(
+                    "helper_start_failed",
+                    "登录助手启动失败。请检查登录助手可执行文件路径（playback.login_helper_executable）是否存在且可执行、凭据目录（playback.credential_directory）是否可写，确认游戏已启动后重试；若仍失败，请查看日志文件（logging.dir 目录）中的详细错误",
+                    Some(provider),
+                );
                 self.record_start_failure(&failure);
                 return Err(failure);
             }
@@ -751,6 +770,21 @@ impl LoginHelperManager {
                 ));
             }
         };
+        if state.closed {
+            // 关停与启动并发：`shutdown` 已置位，而子进程刚刚被拉起、还没有工作线程
+            // 接手它。这里必须自己回收，否则登录助手会漏在关停之后（B01-P1-7）。
+            drop(state);
+            terminate_child(&child);
+            let _ = self.inner.playback.cancel_login(session.session_id);
+            cleanup_profile(&profile);
+            let failure = manager_failure(
+                "login_cancelled",
+                "程序正在关闭，登录任务已取消",
+                Some(provider),
+            );
+            self.record_start_failure(&failure);
+            return Err(failure);
+        }
         state.active = Some(ActiveLogin {
             session: session.clone(),
             cancel: Arc::clone(&cancel),
@@ -768,6 +802,7 @@ impl LoginHelperManager {
                     spawned.stdout,
                     spawned.stderr,
                     worker_profile,
+                    login_timeout,
                 );
             });
         match worker {
@@ -775,10 +810,15 @@ impl LoginHelperManager {
                 state.worker = Some(worker);
                 Ok(session)
             }
-            Err(_) => {
+            Err(error) => {
+                // B01-P1-5：线程起不来时同样保留底层错误链，提示给出排查方向。
+                log::warn!(
+                    "登录助手线程启动失败（步骤：创建工作线程等待登录结果，平台 {}）：{error:#}",
+                    provider.as_str()
+                );
                 let failure = manager_failure(
                     "helper_start_failed",
-                    "登录助手线程启动失败",
+                    "登录助手线程启动失败。请重启程序后重试；若仍失败，请查看日志文件（logging.dir 目录）中的详细错误，并确认系统资源充足",
                     Some(provider),
                 );
                 state.active = None;
@@ -915,8 +955,45 @@ impl LoginHelperManager {
             .map_err(|error| playback_failure(error, Some(provider)))
     }
 
+    /// 关停登录管理器。
+    ///
+    /// 旧实现用 `status().session_id` 判断有没有可取消的会话，而 `Starting` 阶段
+    /// 会话还没登记进 `active`：这期间 `shutdown` 会认为「没有登录任务」直接返回，
+    /// 随后 `start` 继续拉起登录助手，进程漏在关停之后（B01-P1-7）。
+    ///
+    /// 现在关停位 `closed` 与 `phase` 在同一把锁下判定：要么关停先置位、启动在
+    /// 登记前看到并自行回收子进程；要么启动先登记、这里按正常取消路径回收。
     pub(crate) fn shutdown(&self) -> Result<(), LoginHelperFailure> {
-        let session_id = self.status().session_id;
+        let deadline = Instant::now() + TERMINATION_GRACE + Duration::from_secs(1);
+        let session_id = loop {
+            let mut state = self.inner.state.lock().map_err(|_| {
+                manager_failure("login_manager_unavailable", "登录管理器不可用", None)
+            })?;
+            state.closed = true;
+            if let Some(active) = state.active.as_ref() {
+                break Some(active.session.session_id);
+            }
+            if state.phase == LoginPhase::Starting {
+                if Instant::now() >= deadline {
+                    return Err(manager_failure(
+                        "login_cancel_timeout",
+                        "取消登录超时：启动中的登录任务未在限期内退出，登录助手会在启动完成后自行回收",
+                        None,
+                    ));
+                }
+                // 启动中的会话还没登记 `active`。等它登记或失败：`start` 登记时会
+                // 拿同一把锁，因此这里释放锁等待即可，不会错过状态变化。
+                let wait = deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(REAPER_POLL);
+                let (next, _) = self.inner.changed.wait_timeout(state, wait).map_err(|_| {
+                    manager_failure("login_manager_unavailable", "登录管理器不可用", None)
+                })?;
+                drop(next);
+                continue;
+            }
+            break None;
+        };
         let cancel_error = session_id.and_then(|session_id| self.cancel(session_id).err());
         let join_error = self.join_finished_worker().err();
         cancel_error.or(join_error).map_or(Ok(()), Err)
@@ -935,10 +1012,15 @@ impl LoginHelperManager {
         session_id: Uuid,
         provider: ProviderId,
     ) -> Result<PathBuf, LoginHelperFailure> {
-        fs::create_dir_all(&self.inner.profile_root).map_err(|_| {
+        fs::create_dir_all(&self.inner.profile_root).map_err(|error| {
+            // B01-P1-5：底层错误链进日志，提示里给可操作的排查方向。
+            log::warn!(
+                "登录 profile 目录创建失败（步骤：准备登录助手的临时配置目录）「{}」：{error:#}",
+                self.inner.profile_root.display()
+            );
             manager_failure(
                 "profile_create_failed",
-                "登录 profile 创建失败",
+                "登录 profile 创建失败：无法创建登录备用配置目录。请检查凭据目录（playback.credential_directory）是否存在且可写，或查看日志文件（logging.dir 目录）中的详细错误",
                 Some(provider),
             )
         })?;
@@ -946,10 +1028,14 @@ impl LoginHelperManager {
             .inner
             .profile_root
             .join(format!("{}-{}", provider.as_str(), session_id));
-        fs::create_dir(&profile).map_err(|_| {
+        fs::create_dir(&profile).map_err(|error| {
+            log::warn!(
+                "登录 profile 创建失败（步骤：创建本次登录的临时配置目录）「{}」：{error:#}",
+                profile.display()
+            );
             manager_failure(
                 "profile_create_failed",
-                "登录 profile 创建失败",
+                "登录 profile 创建失败：无法创建本次登录的临时配置目录。请检查凭据目录（playback.credential_directory）是否存在且可写、是否残留同名目录，并查看日志文件（logging.dir 目录）中的详细错误",
                 Some(provider),
             )
         })?;
@@ -1046,8 +1132,12 @@ fn run_helper(
     stdout: Box<dyn Read + Send>,
     stderr: Box<dyn Read + Send>,
     profile: PathBuf,
+    // B01-P1-8：超时值由 `start` 读取一次后传下来，工作线程**不得**再读
+    // `effective_timeout()`。否则两次读取之间发生配置热更新时，管理器对外公布的
+    // `deadline_at_ms` 与工作线程实际使用的回收窗口会不一致。
+    timeout: Duration,
 ) {
-    let deadline = Instant::now() + inner.effective_timeout();
+    let deadline = Instant::now() + timeout;
     let (output_tx, output_rx) = std::sync::mpsc::sync_channel(1);
     let reader = thread::Builder::new()
         .name("login-helper-output".to_owned())
@@ -1153,7 +1243,34 @@ fn run_helper(
     }
 
     let process_deadline = deadline.min(Instant::now() + TERMINATION_GRACE);
-    let process_success = wait_child_until(&child, process_deadline).unwrap_or(false);
+    let process_success = match wait_child_until(&child, process_deadline) {
+        Ok(exit) => {
+            match exit {
+                // 句柄已被其它路径回收：拿不到退出码，退出状态就是**未知**，不能当成功
+                // （与 `ChildExit::Unknown` 同一原则：未知不得上报成登录成功）。
+                //
+                // 生产上当前不可达：全仓只有 `wait_child_until` 自己会把 `SharedChild`
+                // 里的 `Option` 取成 `None`，`terminate_child` 只 `kill` 不取走。若将来
+                // 新增第二条回收路径，这里会如实按失败处理，而不是把未知当成功。
+                ChildExit::AlreadyReaped => log::warn!(
+                    "登录助手进程句柄已被其它路径回收（步骤：回收登录助手进程），拿不到退出码，本次登录按结果未知处理：平台 {} 的登录结果需要重新确认",
+                    session.provider.as_str()
+                ),
+                ChildExit::Unknown => log::warn!(
+                    "登录助手强杀后仍未退出（步骤：超时或取消后回收登录助手进程），本次登录按失败处理，平台 {} 的登录结果未知：进程可能仍在运行",
+                    session.provider.as_str()
+                ),
+                ChildExit::Exited(_) => {}
+            }
+            exit_reports_success(exit)
+        }
+        Err(error) => {
+            log::warn!(
+                "登录助手进程状态查询失败（步骤：回收登录助手进程），本次登录按失败处理：{error}"
+            );
+            false
+        }
+    };
     if failure.is_none() && !process_success {
         failure = Some(if Instant::now() >= deadline {
             manager_failure("login_timeout", "登录等待超时", Some(session.provider))
@@ -1626,12 +1743,12 @@ fn duration_ms(duration: Duration) -> u64 {
 
 fn manager_failure(
     code: &'static str,
-    message: &'static str,
+    message: impl Into<String>,
     provider: Option<ProviderId>,
 ) -> LoginHelperFailure {
     LoginHelperFailure {
         code: code.to_owned(),
-        message: message.to_owned(),
+        message: message.into(),
         provider,
     }
 }
@@ -1735,21 +1852,65 @@ fn terminate_child(child: &SharedChild) {
     }
 }
 
-fn wait_child_until(child: &SharedChild, deadline: Instant) -> io::Result<bool> {
+/// 登录助手进程的等待结局。
+///
+/// 三种结局必须分开：`Unknown`（强杀后仍未退出）不能当成 `Exited(true)`，
+/// 否则超时/取消后会把「进程还活着」上报成登录成功（B01-P1-6 / P0-10）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChildExit {
+    /// 进程已退出，携带退出码是否成功。
+    Exited(bool),
+    /// 句柄已被其它路径取走，本进程不再持有可等待的对象：退出状态未知。
+    AlreadyReaped,
+    /// 强杀后到限期仍未退出：进程可能还活着，结果未知。
+    Unknown,
+}
+
+/// 退出结局能否视为「登录助手成功退出」。
+///
+/// 只有 `Exited(true)` 是成功。`AlreadyReaped` / `Unknown` 都是「拿不到真实退出码」
+/// 的未知状态，一律按失败处理：未知不得上报成登录成功（否则超时/取消后会把
+/// 「进程还活着」或「句柄被收走」上报成登录成功）。`Exited(false)` 是明确的失败。
+fn exit_reports_success(exit: ChildExit) -> bool {
+    matches!(exit, ChildExit::Exited(true))
+}
+
+/// 强杀后有限等待进程退出，超期返回 [`ChildExit::Unknown`]。
+///
+/// 不能在这里回报「成功」：`kill` 返回成功只代表信号/调用发出去了，进程可能卡在
+/// 驱动或无响应状态继续活着；此时登录结果未知，调用方必须按失败处理。
+fn wait_for_exit_after_kill(
+    process: &mut dyn ManagedChild,
+    wait_deadline: Instant,
+) -> io::Result<ChildExit> {
+    loop {
+        if let Some(success) = process.try_wait()? {
+            return Ok(ChildExit::Exited(success));
+        }
+        if Instant::now() >= wait_deadline {
+            return Ok(ChildExit::Unknown);
+        }
+        thread::sleep(REAPER_POLL);
+    }
+}
+
+fn wait_child_until(child: &SharedChild, deadline: Instant) -> io::Result<ChildExit> {
     loop {
         let poll = child
             .lock()
             .map_err(|_| io::Error::other("login helper process state is unavailable"))?;
         let mut poll = poll;
         let result = match poll.as_mut() {
-            Some(child) => child.try_wait()?,
-            None => Some(true),
+            Some(child) => child.try_wait()?.map(ChildExit::Exited),
+            // 「已被收走」不等于「成功退出」：句柄已被其它路径回收时，本进程拿不到
+            // 退出码。单独标记成 [`ChildExit::AlreadyReaped`]，避免调用方误读。
+            None => Some(ChildExit::AlreadyReaped),
         };
-        if let Some(success) = result {
+        if let Some(outcome) = result {
             if poll.is_some() {
                 let _ = poll.take();
             }
-            return Ok(success);
+            return Ok(outcome);
         }
         drop(poll);
         if Instant::now() >= deadline {
@@ -1759,19 +1920,12 @@ fn wait_child_until(child: &SharedChild, deadline: Instant) -> io::Result<bool> 
             if let Some(mut process) = process.take() {
                 let _ = process.kill();
                 // 有限等待被杀进程退出，避免极端情况下无界阻塞登录请求。
-                let wait_deadline = Instant::now() + Duration::from_secs(5);
-                loop {
-                    if let Some(success) = process.try_wait()? {
-                        drop(process);
-                        return Ok(success);
-                    }
-                    if Instant::now() >= wait_deadline {
-                        return Ok(true);
-                    }
-                    thread::sleep(REAPER_POLL);
-                }
+                return wait_for_exit_after_kill(
+                    process.as_mut(),
+                    Instant::now() + KILL_WAIT_GRACE,
+                );
             }
-            return Ok(true);
+            return Ok(ChildExit::AlreadyReaped);
         }
         thread::sleep(REAPER_POLL);
     }
@@ -2075,6 +2229,20 @@ mod tests {
         }
     }
 
+    /// 强杀也不会退出的进程：真实系统里可能卡在驱动或无响应状态，
+    /// `kill` 返回成功但进程仍活着。用来验证「强杀后仍未退出」不被误报成成功。
+    struct UnkillableProcess;
+
+    impl ManagedChild for UnkillableProcess {
+        fn try_wait(&mut self) -> io::Result<Option<bool>> {
+            Ok(None)
+        }
+
+        fn kill(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     struct BlockingReader {
         state: Arc<(Mutex<FakeProcessState>, Condvar)>,
     }
@@ -2093,6 +2261,8 @@ mod tests {
         Message(Vec<u8>),
         Oversized,
         Blocking,
+        /// `spawn` 在闸门放开前不返回：用来稳定构造「登录处于 Starting」的窗口。
+        GatedSpawn(Arc<(Mutex<bool>, Condvar)>),
     }
 
     struct FakeKugouDeviceRegistrar;
@@ -2112,12 +2282,15 @@ mod tests {
 
     struct FakeLauncher {
         scenarios: Mutex<VecDeque<FakeScenario>>,
+        /// 每次 spawn 出来的子进程状态，供「启动中被关停」用例断言子进程被回收。
+        children: Mutex<Vec<Arc<(Mutex<FakeProcessState>, Condvar)>>>,
     }
 
     impl FakeLauncher {
         fn new(scenarios: impl IntoIterator<Item = FakeScenario>) -> Arc<Self> {
             Arc::new(Self {
                 scenarios: Mutex::new(scenarios.into_iter().collect()),
+                children: Mutex::new(Vec::new()),
             })
         }
     }
@@ -2132,14 +2305,27 @@ mod tests {
             let scenario = self.scenarios.lock().unwrap().pop_front().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, "no fake helper scenario")
             })?;
-            let (child, state) =
-                FakeProcess::new(!matches!(&scenario, FakeScenario::Blocking), true);
+            let (child, state) = match &scenario {
+                FakeScenario::GatedSpawn(gate) => {
+                    let (lock, condvar) = &**gate;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = condvar.wait(released).unwrap();
+                    }
+                    FakeProcess::new(false, false)
+                }
+                FakeScenario::Blocking => FakeProcess::new(false, true),
+                FakeScenario::Message(_) | FakeScenario::Oversized => FakeProcess::new(true, true),
+            };
+            self.children.lock().unwrap().push(Arc::clone(&state));
             let stdout: Box<dyn Read + Send> = match scenario {
                 FakeScenario::Message(bytes) => Box::new(Cursor::new(bytes)),
                 FakeScenario::Oversized => {
                     Box::new(Cursor::new(vec![b'x'; MAX_LOGIN_MESSAGE_BYTES + 1]))
                 }
-                FakeScenario::Blocking => Box::new(BlockingReader { state }),
+                FakeScenario::Blocking | FakeScenario::GatedSpawn(_) => {
+                    Box::new(BlockingReader { state })
+                }
             };
             Ok(SpawnedHelper {
                 child: Box::new(child),
@@ -2222,6 +2408,63 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    /// B01-P0-11 回归：同一进程内的并发写入（设置页保存与登录前刷新）共用同一个
+    /// 进程号；临时名若只由进程号构成，两个写者会互相截断或抢 rename。
+    /// `file_store::write_atomic` 的「进程内递增序号 + sync_all + 原子替换」保证
+    /// 每个写者各写各的临时文件。
+    #[test]
+    fn concurrent_device_writes_do_not_collide_on_a_shared_temporary_name() {
+        let directory = profile_root("kugou-device-concurrent");
+        fs::create_dir_all(&directory).unwrap();
+        let threads = 8;
+        let rounds = 8;
+        let barrier = Arc::new(std::sync::Barrier::new(threads));
+        let mut handles = Vec::new();
+        for index in 0..threads {
+            let barrier = Arc::clone(&barrier);
+            let directory = directory.clone();
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                for round in 0..rounds {
+                    let config = crate::config::KugouDeviceConfig {
+                        device_guid: format!(
+                            "550e8400-e29b-41d4-a716-44665544{index:02}{round:02}"
+                        ),
+                        device_dev: format!("device-{index}"),
+                        device_mac: format!("aa:bb:cc:dd:ee:{index:02}"),
+                    };
+                    sync_kugou_device_file(&config, &directory)
+                        .expect("同进程并发写设备标识不得互相截断");
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("并发写线程不得失败");
+        }
+        let loaded = load_kugou_device(&directory).expect("并发写后设备文件必须完整");
+        // 设备 GUID 会被归一化（v4 UUID 转 32 位哈希），这里只断言内容是**某一次
+        // 完整写入**而非半截：字段齐全、格式正确。
+        assert_eq!(loaded.guid.len(), 32, "guid 归一化后应为 32 位: {loaded:?}");
+        assert!(
+            loaded.dev.starts_with("DEVICE-"),
+            "dev 应为完整写入的值: {loaded:?}"
+        );
+        assert!(
+            loaded.mac.starts_with("AA:BB:CC:DD:EE:"),
+            "mac 应为完整写入的值: {loaded:?}"
+        );
+        let leftovers: Vec<String> = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            leftovers,
+            vec![KUGOU_DEVICE_FILE.to_owned()],
+            "不得残留临时文件: {leftovers:?}"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     fn manager(
         playback: Arc<FakePlayback>,
         launcher: Arc<FakeLauncher>,
@@ -2269,6 +2512,95 @@ mod tests {
             manager.inner.effective_timeout(),
             Duration::from_millis(45_678)
         );
+    }
+
+    /// B01-P1-8 回归：一次登录只读一次 `effective_timeout()`，工作线程沿用
+    /// `start` 读到的窗口。构造「两次读取之间配置热更新」的场景：provider 第一次
+    /// 返回 40ms、第二次返回 10s。修复前 `run_helper` 会再读一次并改用 10s，
+    /// 管理器公布 40ms 却迟迟不回收；修复后只调用一次，必须按 40ms 超时。
+    #[test]
+    fn login_timeout_is_read_once_and_shared_with_the_worker() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        let playback = FakePlayback::new();
+        let launcher = FakeLauncher::new([FakeScenario::Blocking]);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let provider = {
+            let reads = Arc::clone(&reads);
+            Arc::new(move || {
+                if reads.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                    40
+                } else {
+                    10_000
+                }
+            })
+        };
+        let manager = LoginHelperManager::new_with_dependencies(
+            playback,
+            launcher,
+            Arc::new(FakeKugouDeviceRegistrar),
+            profile_root("single-timeout-read"),
+            Duration::from_secs(9),
+            Some(provider),
+            Arc::new(test_kugou_device_config),
+        );
+        manager.start(ProviderId::QqMusic).unwrap();
+        let status = wait_idle(&manager);
+        assert_eq!(
+            status.last_error.as_ref().map(|error| error.code.as_str()),
+            Some("login_timeout"),
+            "工作线程必须沿用 start 读到的 40ms 窗口，而不是第二次读到的 10s"
+        );
+        assert_eq!(
+            reads.load(AtomicOrdering::SeqCst),
+            1,
+            "一次登录只能读一次超时值"
+        );
+        manager.shutdown().unwrap();
+    }
+
+    /// B01-P1-5 回归：启动失败时提示必须可操作（给出路径/日志排查方向），
+    /// 且不得把令牌等敏感值带进提示。
+    #[test]
+    fn helper_start_failure_message_is_actionable_and_contains_no_secret() {
+        let playback = FakePlayback::new();
+        let launcher = FakeLauncher::new(Vec::<FakeScenario>::new());
+        let manager = manager(
+            Arc::clone(&playback),
+            launcher,
+            "start-failure-hint",
+            Duration::from_millis(40),
+        );
+        let failure = match manager.start(ProviderId::QqMusic) {
+            Ok(_) => panic!("登录助手拉不起来时必须返回错误"),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.code, "helper_start_failed");
+        for keyword in [
+            "playback.login_helper_executable",
+            "playback.credential_directory",
+            "日志文件",
+        ] {
+            assert!(
+                failure.message.contains(keyword),
+                "失败提示缺少可操作的排查信息「{keyword}」: {}",
+                failure.message
+            );
+        }
+        assert!(
+            !failure.message.to_ascii_lowercase().contains("token"),
+            "失败提示不得泄露令牌: {}",
+            failure.message
+        );
+        assert_eq!(
+            manager
+                .status()
+                .last_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("helper_start_failed"),
+            "失败必须记到状态里，Web 面板才能展示"
+        );
+        manager.shutdown().unwrap();
     }
 
     /// 测试用设备信息：模拟用户在设置页填写的酷狗设备。
@@ -2589,6 +2921,140 @@ mod tests {
         assert_eq!(status.last_error.as_ref().unwrap().code, "login_timeout");
         assert_eq!(playback.state.lock().unwrap().cancelled, 1);
         manager.shutdown().unwrap();
+    }
+
+    /// B01-P1-6 / P0-10 回归：强杀后进程仍未退出时必须标记为「结果未知」，
+    /// 不能把 `kill` 调用成功当成登录成功。
+    #[test]
+    fn forced_kill_that_does_not_exit_is_reported_as_unknown() {
+        let mut process: Box<dyn ManagedChild> = Box::new(UnkillableProcess);
+        let started = Instant::now();
+        let outcome =
+            wait_for_exit_after_kill(process.as_mut(), Instant::now() + Duration::from_millis(30))
+                .unwrap();
+        assert_eq!(
+            outcome,
+            ChildExit::Unknown,
+            "强杀后仍未退出必须标记为结果未知，不能回报成功"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(30),
+            "必须等满限期才能判定进程仍未退出"
+        );
+    }
+
+    /// B01-P1-6 / P0-10 回归：「子进程句柄已被收走」与「进程成功退出」必须可区分。
+    #[test]
+    fn already_reaped_helper_is_not_conflated_with_exited_success() {
+        let reaped: SharedChild = Arc::new(Mutex::new(None));
+        assert_eq!(
+            wait_child_until(&reaped, Instant::now()).unwrap(),
+            ChildExit::AlreadyReaped,
+            "句柄已被收走时退出状态未知，不能当成成功"
+        );
+
+        let exited: SharedChild =
+            Arc::new(Mutex::new(Some(Box::new(FakeProcess::new(true, true).0))));
+        assert_eq!(
+            wait_child_until(&exited, Instant::now()).unwrap(),
+            ChildExit::Exited(true)
+        );
+    }
+
+    /// 回归（A4 审计小项）：`AlreadyReaped` 也是「退出状态未知」，不能当成功。
+    ///
+    /// 旧实现对 `AlreadyReaped` 直接返回成功，与 `ChildExit::Unknown` 的
+    /// 「未知不得上报成登录成功」原则矛盾（生产上当前不可达，但语义必须一致）。
+    #[test]
+    fn unknown_exit_outcomes_never_count_as_a_successful_login() {
+        assert!(exit_reports_success(ChildExit::Exited(true)));
+        assert!(!exit_reports_success(ChildExit::Exited(false)));
+        assert!(
+            !exit_reports_success(ChildExit::AlreadyReaped),
+            "句柄被收走时拿不到退出码，属于结果未知，不能当登录成功"
+        );
+        assert!(
+            !exit_reports_success(ChildExit::Unknown),
+            "强杀后仍未退出属于结果未知，不能当登录成功"
+        );
+    }
+
+    /// B01-P1-7 回归：登录处于 `Starting`（会话尚未登记 `active`、登录助手正在
+    /// 拉起）时关停，必须等启动流程返回并回收刚拉起的子进程。
+    ///
+    /// 修复前 `shutdown` 用 `status().session_id` 判断可取消会话，`Starting`
+    /// 期间为 `None`，于是直接返回成功；随后 `start` 继续把登录助手拉起来，
+    /// 子进程漏在关停之后。
+    #[test]
+    fn shutdown_during_starting_cancels_and_reaps_the_spawned_helper() {
+        let playback = FakePlayback::new();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let launcher = FakeLauncher::new([FakeScenario::GatedSpawn(Arc::clone(&gate))]);
+        let manager = manager(
+            Arc::clone(&playback),
+            Arc::clone(&launcher),
+            "shutdown-during-start",
+            Duration::from_secs(30),
+        );
+        let starter = {
+            let manager = manager.clone();
+            thread::spawn(move || manager.start(ProviderId::QqMusic))
+        };
+        let started_at = Instant::now();
+        while manager.status().phase != LoginPhase::Starting {
+            assert!(
+                started_at.elapsed() < Duration::from_secs(2),
+                "登录应进入 Starting 阶段"
+            );
+            thread::sleep(REAPER_POLL);
+        }
+
+        let (shutdown_done_tx, shutdown_done_rx) = std::sync::mpsc::sync_channel(1);
+        {
+            let manager = manager.clone();
+            thread::spawn(move || {
+                let result = manager.shutdown();
+                let _ = shutdown_done_tx.send(result);
+            });
+        }
+        // 关停必须等「启动中」的登录落地，不能立刻返回成功。
+        assert!(
+            shutdown_done_rx
+                .recv_timeout(Duration::from_millis(150))
+                .is_err(),
+            "Starting 期间关停不得立即返回"
+        );
+
+        // 放行 spawn：启动流程必须看到关停位并自行回收刚拉起的子进程。
+        {
+            let (lock, condvar) = &*gate;
+            *lock.lock().unwrap() = true;
+            condvar.notify_all();
+        }
+
+        let shutdown_result = shutdown_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("关停应在启动流程返回后完成");
+        assert!(shutdown_result.is_ok(), "关停应当成功: {shutdown_result:?}");
+        let start_result = starter.join().unwrap();
+        assert_eq!(
+            start_result.unwrap_err().code,
+            "login_cancelled",
+            "启动中的登录应被关停取消"
+        );
+        let status = manager.status();
+        assert!(!status.active);
+        assert_eq!(status.phase, LoginPhase::Failed);
+        assert_eq!(
+            playback.state.lock().unwrap().cancelled,
+            1,
+            "播放侧登录租约必须被取消"
+        );
+        let children = launcher.children.lock().unwrap();
+        assert_eq!(children.len(), 1, "应当恰好拉起过一个登录助手");
+        let child = children[0].0.lock().unwrap();
+        assert!(child.exited, "启动中拉起的登录助手必须被回收");
+        assert!(!child.success, "被强杀的登录助手不得记为成功");
     }
 
     #[test]

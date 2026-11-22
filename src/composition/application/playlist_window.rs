@@ -105,6 +105,18 @@ fn owner_matches_identity(owner: &str, sender: &str, candidates: &[String]) -> b
         || owner_matches(owner, sender)
 }
 
+/// 「发送者不是属主」的日志正文：只写阶段/原因，不带任何标识。
+///
+/// `owner` 是 `id:<uuid>` 归属键，`sender` 在外部源缺昵称时会回退成 UID——
+/// 两者都是真实玩家标识，不得进入日志（MUST_READ §9 / B02-P1-9）。
+/// 这条日志的结论（谁不是属主）与具体是谁无关，因此删掉标识不损失可排查性。
+fn owner_mismatch_log(message_text: &str) -> String {
+    format!(
+        "命令未执行：歌单窗口决策的发送者不是当前窗口属主，忽略这条决策「{}」",
+        crate::privacy::redacted_chat_text(message_text)
+    )
+}
+
 fn acknowledge_playlist_decision(
     shared: &crate::observation::chat::ChatTimeline,
     envelope: &CommandEnvelope,
@@ -377,12 +389,7 @@ impl AppServices {
                 let sender_candidates =
                     self.playlist_owner_candidates(sender_name, envelope.account());
                 if !owner_matches_identity(&owner, sender_name, &sender_candidates) {
-                    log::info!(
-                        "命令未执行：歌单窗口决策的发送者不是当前窗口属主（发送者「{}」，属主「{}」），忽略这条决策「{}」",
-                        envelope.username(),
-                        owner,
-                        crate::privacy::redacted_chat_text(&message.text)
-                    );
+                    log::info!("{}", owner_mismatch_log(&message.text));
                     continue;
                 }
                 let Some(command) = playlist_decision(&envelope) else {
@@ -841,6 +848,43 @@ mod tests {
                 sender.is_some()
             );
         }
+    }
+
+    /// 回归（B02-P1-9 隐私半）：拒绝日志不得带归属键或 UID 形态的标识。
+    ///
+    /// 旧日志同时打印了发送者与 `owner`（`id:<uuid>`）。属主是身份 UUID，
+    /// 外部源缺昵称时发送者还会回退成 UID——两者都不允许进日志。
+    #[test]
+    fn owner_mismatch_log_does_not_leak_owner_key_or_uid() {
+        fn has_long_digit_run(text: &str) -> bool {
+            let mut run = 0usize;
+            for ch in text.chars() {
+                if ch.is_ascii_digit() {
+                    run += 1;
+                    if run >= 8 {
+                        return true;
+                    }
+                } else {
+                    run = 0;
+                }
+            }
+            false
+        }
+
+        let text = owner_mismatch_log("@确认清空");
+        assert!(
+            !text.contains("id:"),
+            "日志不得出现 `id:` 归属键前缀，实际: {text}"
+        );
+        assert!(
+            !has_long_digit_run(&text),
+            "日志不得出现 8 位以上连续数字（UID），实际: {text}"
+        );
+        // 脱敏文本仍要保留，便于确认是哪条决策被忽略。
+        assert!(
+            text.contains("@确认清空"),
+            "日志应保留决策正文，实际: {text}"
+        );
     }
 }
 

@@ -1082,10 +1082,22 @@ fn append_path_segment(base: &Url, segment: &str) -> Result<Url, CatalogError> {
 }
 
 fn parse_refresh_csrf(html: &str) -> Option<String> {
+    // 三种引号形态逐一尝试。这里不能用 `html.find(marker)?`：
+    // 第一个 marker 未命中时 `?` 会让整个函数提前返回，后面两种形态永远不可达，
+    // 网页改用单引号或裸属性书写 `id` 时就必然报「refresh CSRF was not found」。
     for marker in ["id=\"1-name\"", "id='1-name'", "id=1-name"] {
-        let start = html.find(marker)? + marker.len();
-        let content_start = html[start..].find('>')? + start + 1;
-        let content_end = html[content_start..].find('<')? + content_start;
+        let Some(start) = html.find(marker).map(|index| index + marker.len()) else {
+            continue;
+        };
+        let Some(content_start) = html[start..].find('>').map(|index| index + start + 1) else {
+            continue;
+        };
+        let Some(content_end) = html[content_start..]
+            .find('<')
+            .map(|index| index + content_start)
+        else {
+            continue;
+        };
         let value = html[content_start..content_end].trim();
         if !value.is_empty() {
             return Some(value.to_owned());
@@ -1214,10 +1226,14 @@ fn classify_status(response: &reqwest::Response) -> Result<(), CatalogError> {
 }
 
 fn classify_request_error(error: reqwest::Error) -> CatalogError {
-    if error.is_timeout() {
-        CatalogError::TimedOut(error.to_string())
+    // 隐私红线：Display 会附上完整请求 URL（凭证刷新链路的查询串含 token），而
+    // CatalogError 会经 `#[error(transparent)]` 进日志；取文本前必须剥离 URL。
+    let timed_out = error.is_timeout();
+    let detail = error.without_url().to_string();
+    if timed_out {
+        CatalogError::TimedOut(detail)
     } else {
-        CatalogError::Transient(error.to_string())
+        CatalogError::Transient(detail)
     }
 }
 
@@ -1780,5 +1796,45 @@ mod tests {
                 .await,
             Err(CatalogError::CredentialRejected(_))
         ));
+    }
+}
+
+/// B18-P1-1 回归：请求失败文本不得携带 URL / 查询参数。
+#[cfg(test)]
+mod request_error_redaction_tests {
+    use super::classify_request_error;
+    use crate::catalog::request_error_probe::assert_classified_error_is_redacted;
+
+    #[test]
+    fn classified_request_errors_never_carry_the_request_url() {
+        assert_classified_error_is_redacted(classify_request_error);
+    }
+}
+
+/// B17-P1-3 回归：三种引号形态都必须可达。
+#[cfg(test)]
+mod refresh_csrf_tests {
+    use super::parse_refresh_csrf;
+
+    #[test]
+    fn parse_refresh_csrf_tries_every_quote_style() {
+        assert_eq!(
+            parse_refresh_csrf(r#"<div id="1-name">AA</div>"#).as_deref(),
+            Some("AA")
+        );
+        assert_eq!(
+            parse_refresh_csrf(r#"<div id='1-name'>BB</div>"#).as_deref(),
+            Some("BB")
+        );
+        assert_eq!(
+            parse_refresh_csrf(r#"<div id=1-name>CC</div>"#).as_deref(),
+            Some("CC")
+        );
+        // 首个形态命中但内容为空时，要继续尝试后面的形态，而不是直接返回 None。
+        assert_eq!(
+            parse_refresh_csrf(r#"<div id="1-name"></div><div id='1-name'>DD</div>"#).as_deref(),
+            Some("DD")
+        );
+        assert_eq!(parse_refresh_csrf("<html></html>"), None);
     }
 }

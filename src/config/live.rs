@@ -109,7 +109,7 @@ pub(crate) const LIVE_CONFIG_PATHS: &[&str] = &[
     "ai_chat.ai_reply.user_prompt",
     "ai_chat.ai_reply.max_tokens",
     "ai_chat.ai_reply.timeout_seconds",
-    // tts：除 endpoint/api_key（IdleReload）外的运行期字段。
+    // tts：除连接三项 endpoint/api_key/http_proxy（IdleReload）外的运行期字段。
     "tts.enabled",
     "tts.model",
     "tts.reference_id",
@@ -127,9 +127,11 @@ pub(crate) const LIVE_CONFIG_PATHS: &[&str] = &[
     // 点歌决策窗口（task-29 已把消费方改为每次读 snapshot）。
     "timing.decision.timeout_ms",
     "timing.decision.poll_ms",
-    // 启动流程三个开关/入口（listener 每次读 live 快照）。
+    // 启动流程的两个开关（listener 每次读 live 快照）。
+    // `startup.enter_game` 不在这里：执行侧读的是启动期冻结的 `StartupUiConfig`，
+    // 标 Live 会「面板说已生效、实际按旧值执行」，因此 schema 已改为 IdleReload
+    // （`startup.*` 改动会把重载升级为 `ConfigReloadWithStartup`）。
     "startup.enabled",
-    "startup.enter_game",
     "startup.enter_wonderland",
     // 外部聊天源：仅连接参数与失联重启两项实时，
     // 其余（开关/url/token/自动启动/路径/uid）保留旧值。
@@ -482,7 +484,8 @@ impl LiveConfigs {
         effective.timing.decision.timeout_ms = config.timing.decision.timeout_ms;
         effective.timing.decision.poll_ms = config.timing.decision.poll_ms;
         effective.startup.enabled = config.startup.enabled;
-        effective.startup.enter_game = config.startup.enter_game;
+        // `startup.enter_game` 声明为 IdleReload：这里刻意不合并，保留启动值，
+        // 等子进程重载时才换新，与「面板声明 = 实际生效时机」保持一致。
         effective.startup.enter_wonderland = config.startup.enter_wonderland;
         // chat_source：只实时 reconnect/lease 两项；其余字段（含 secret token、
         // 自动启动与可执行路径）必须保留旧值，避免未登记字段被悄悄实时。
@@ -491,10 +494,14 @@ impl LiveConfigs {
         chat_source.lease_timeout_ms = config.chat_source.lease_timeout_ms;
         chat_source.disconnect_action = config.chat_source.disconnect_action;
         effective.chat_source = chat_source;
-        // tts：只实时 Live 字段；endpoint/api_key 保留旧值（IdleReload）。
+        // tts：只实时 Live 字段；连接三项（endpoint/api_key/http_proxy）都声明
+        // IdleReload，必须一律保留旧值，等空闲重载子进程时才换新。
+        // 曾经漏了 http_proxy：面板标「重载后生效」，实际保存瞬间就被应用，
+        // 属于「面板说未生效、实际已生效」，违反「配置 effect 必须准确」。
         let mut tts = config.tts.clone();
         tts.endpoint = effective.tts.endpoint.clone();
         tts.api_key = effective.tts.api_key.clone();
+        tts.http_proxy = effective.tts.http_proxy.clone();
         effective.tts = tts;
         effective.visual = config.visual.clone();
         self.effective.replace(effective);
@@ -943,7 +950,7 @@ mod tests {
             );
         }
     }
-    /// tts：Live 字段逐项进快照，endpoint/api_key 保留旧值（IdleReload）。
+    /// tts：Live 字段逐项进快照，endpoint/api_key/http_proxy 保留旧值（IdleReload）。
     #[test]
     fn newly_live_tts_fields_reach_the_snapshot() {
         use serde_json::json;
@@ -980,6 +987,11 @@ mod tests {
             "tts.api_key",
             json!("should-not-apply-key"),
         );
+        set_json_path(
+            &mut changed_value,
+            "tts.http_proxy",
+            json!("socks5://127.0.0.1:9999"),
+        );
         let changed: AppConfig =
             serde_json::from_value(changed_value.clone()).expect("改动配置反序列化");
 
@@ -992,7 +1004,7 @@ mod tests {
                 "tts Live 字段 apply 后必须等于改动值: {path}"
             );
         }
-        for path in ["tts.endpoint", "tts.api_key"] {
+        for path in ["tts.endpoint", "tts.api_key", "tts.http_proxy"] {
             assert_eq!(
                 json_at(&snapshot, path),
                 json_at(&baseline, path),
@@ -1000,8 +1012,62 @@ mod tests {
             );
         }
     }
-    /// task-30：startup 3 + decision 2 + chat_source 2 的表驱动 apply 断言。
-    /// 未登记 Live 的 startup.launch_game / chat_source.enabled / url 必须保留旧值。
+
+    /// 面板声明与运行态行为必须一致：凡是 schema 标 IdleReload 的 tts 字段，
+    /// `apply()` 都不得把它写进快照；凡是标 Live 的，都必须写进去。
+    ///
+    /// 这条契约独立于 [`LIVE_CONFIG_PATHS`] 的手写清单：清单只保证「集合相等」，
+    /// 不保证 apply 的实现没有漏回填（`http_proxy` 就是这样漏的——它在集合外，
+    /// 却被 `config.tts.clone()` 顺带覆盖了）。
+    #[test]
+    fn tts_live_and_idle_reload_effects_match_runtime_behaviour() {
+        use serde_json::json;
+
+        let live = LiveConfigs::default();
+        let baseline = serde_json::to_value(AppConfig::default()).expect("默认配置序列化");
+
+        // 默认值必须与下面的改动值不同，否则测试无法证明 apply 做了什么。
+        let changed_values: Vec<(&str, serde_json::Value)> = vec![
+            ("tts.endpoint", json!("https://idle-reload.example")),
+            ("tts.api_key", json!("idle-reload-key")),
+            ("tts.http_proxy", json!("socks5://127.0.0.1:9999")),
+            ("tts.model", json!("live-model")),
+            ("tts.voice", json!("live-voice")),
+        ];
+        let mut changed_value = baseline.clone();
+        for (path, value) in &changed_values {
+            assert_ne!(
+                json_at(&baseline, path),
+                value,
+                "测试值必须与默认值不同（证明 apply 真的做过选择）: {path}"
+            );
+            set_json_path(&mut changed_value, path, value.clone());
+        }
+        let changed: AppConfig =
+            serde_json::from_value(changed_value.clone()).expect("改动配置反序列化");
+        live.apply(&changed);
+        let snapshot = serde_json::to_value(&*live.snapshot()).expect("快照序列化");
+
+        for (path, _) in &changed_values {
+            let effect = config_effect_for_path(path)
+                .unwrap_or_else(|| panic!("schema 必须声明该字段的 effect: {path}"));
+            let expected = match effect {
+                // IdleReload：保存后运行态仍是旧值，等子进程重载才换新。
+                Effect::IdleReload => json_at(&baseline, path),
+                // Live：保存后运行态立即等于新值。
+                Effect::Live => json_at(&changed_value, path),
+                other => panic!("tts 的 {path} 不应声明为 {other:?}"),
+            };
+            assert_eq!(
+                json_at(&snapshot, path),
+                expected,
+                "面板声明与运行态行为必须一致（effect={effect:?}）: {path}"
+            );
+        }
+    }
+    /// task-30：startup 2 + decision 2 + chat_source 2 的表驱动 apply 断言。
+    /// 未登记 Live 的 startup.launch_game / startup.enter_game /
+    /// chat_source.enabled / url 必须保留旧值。
     #[test]
     fn newly_live_startup_decision_chat_source_fields_reach_the_snapshot() {
         use serde_json::json;
@@ -1011,7 +1077,6 @@ mod tests {
         let mut changed_value = serde_json::to_value(AppConfig::default()).expect("序列化默认配置");
         let live_values: Vec<(&str, serde_json::Value)> = vec![
             ("startup.enabled", json!(true)),
-            ("startup.enter_game", json!(true)),
             ("startup.enter_wonderland", json!(true)),
             ("timing.decision.timeout_ms", json!(21_000)),
             ("timing.decision.poll_ms", json!(2_100)),
@@ -1029,6 +1094,9 @@ mod tests {
         }
         // 未登记 Live 的字段：改动后必须被 apply 丢弃（保留旧值）。
         set_json_path(&mut changed_value, "startup.launch_game", json!(true));
+        // `startup.enter_game` 已改为 IdleReload：面板说重载后生效，运行态就必须
+        // 保留启动值——只对调度侧生效、执行侧仍读冻结值属于「effect 不准确」。
+        set_json_path(&mut changed_value, "startup.enter_game", json!(true));
         set_json_path(&mut changed_value, "chat_source.enabled", json!(true));
         set_json_path(
             &mut changed_value,
@@ -1050,6 +1118,7 @@ mod tests {
         }
         for path in [
             "startup.launch_game",
+            "startup.enter_game",
             "chat_source.enabled",
             "chat_source.url",
         ] {

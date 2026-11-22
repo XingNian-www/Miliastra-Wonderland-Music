@@ -108,6 +108,53 @@ fn prefix(p: CommandPrefix) -> char {
         CommandPrefix::Amp => '&',
     }
 }
+
+/// 从 `user_command` 里取出**信封前缀**。
+///
+/// `RoutedCommand` 没有单独的前缀字段，但 `user_command` 恒为带前缀的原文
+/// （`@帮助` / `#娱乐帮助`），而信封本身就是按它切前缀的（`CommandEnvelope::new`）。
+/// 认不出前缀时返回 `None`，调用方退回「只按文本查」的旧行为。
+fn envelope_prefix(command: &RoutedCommand) -> Option<CommandPrefix> {
+    let first = command.user_command.trim().chars().next()?;
+    // 全角 `＠`/`＃` 与半角等价：信封构造时两者都接受。
+    let first = crate::text::fold_wide_char(first).unwrap_or(first);
+    match first {
+        '@' => Some(CommandPrefix::At),
+        '#' => Some(CommandPrefix::Hash),
+        '&' => Some(CommandPrefix::Amp),
+        _ => None,
+    }
+}
+
+/// 按「matched 文本 + 信封前缀」反查面板条目。
+///
+/// **必须同时校验前缀**：命令目录里同名写法在 `@` 与 `#` 下各有一条
+/// （`@帮助`，以及别名含「帮助」的 `#娱乐帮助`/`#帮助`/`#娱乐`）。旧实现只比文本、
+/// 再取「名字最长」，于是 `@帮助` 被名字更长的 `#娱乐帮助` 抢走——`@帮助` 在面板里
+/// 的开关与门槛全部落到娱乐帮助那条上，与 `docs/user-guide.md:49`「`@帮助` 显示点歌帮助，
+/// `#娱乐` 或 `@娱乐帮助` 显示娱乐玩法帮助」把两条命令当独立开关的说法相反。
+///
+/// 同前缀内仍可能有多条命中（别名重叠，例如点歌各平台与 `@点歌`）：
+/// **先比「主名与 matched 完全同名」，再比名字长度，最后按名字字典序**，
+/// 保证结果确定、与 `all_specs()` 的遍历顺序无关。
+fn spec_for_matched(
+    text: &str,
+    envelope: CommandPrefix,
+) -> Option<&'static super::command_catalog::CommandSpec> {
+    let text = text.strip_prefix(prefix(envelope)).unwrap_or(text);
+    super::command_catalog::all_specs()
+        .into_iter()
+        .filter(|spec| spec.prefix == envelope)
+        .filter(|spec| spec.matches_text(text))
+        .max_by(|a, b| {
+            let rank = |spec: &super::command_catalog::CommandSpec| {
+                // `true` 排前：同前缀下「主名就是 matched」的那条优先。
+                (spec.name == text, spec.name.chars().count())
+            };
+            // `max_by` 需要「a 大于 b」的比较；名字逆序让字典序小的排后（即胜出）。
+            rank(a).cmp(&rank(b)).then_with(|| b.name.cmp(a.name))
+        })
+}
 /// 需要管理员及以上才能使用的命令。
 ///
 /// 这个列表是**唯一**的 Admin 判定来源。以前靠 `authorities` 隐式推导
@@ -358,10 +405,15 @@ pub(crate) fn resolve_for_routed(
         return (id.into(), catalog_policy(config, id).unwrap());
     }
     let text = crate::text::normalize_chat_text(&command.matched);
-    let spec = super::command_catalog::all_specs()
-        .into_iter()
-        .filter(|s| s.matches_text(text.strip_prefix(prefix(s.prefix)).unwrap_or(&text)))
-        .max_by_key(|s| s.name.chars().count());
+    let spec = match envelope_prefix(command) {
+        Some(envelope) => spec_for_matched(&text, envelope),
+        // 认不出前缀（控制台构造的 `RoutedCommand` 也会给 `user_command` 补 `@`，
+        // 这里只是兜底）：退回旧口径——任意前缀里取最贴切的一条。
+        None => super::command_catalog::all_specs()
+            .into_iter()
+            .filter(|s| s.matches_text(text.strip_prefix(prefix(s.prefix)).unwrap_or(&text)))
+            .max_by_key(|s| s.name.chars().count()),
+    };
     if let Some(spec) = spec {
         let id = format!("{}{}", prefix(spec.prefix), spec.name);
         if let Some(policy) = catalog_policy(config, &id) {
@@ -744,6 +796,9 @@ mod tests {
     fn empty_policy_id_is_limited_to_whitelisted_internal_sources() {
         use crate::features::command::{CommandObservation, CommandPrefix, ModuleCommand};
         let config = CommandAccessConfig::default();
+        // 信封前缀必须与命令目录里的 spec 一致：`resolve_for_routed` 现在按前缀
+        // 过滤候选（B06-P1-01），用 `@` 伪造一条 `#` 命令的 `user_command`
+        // 已经不是真实路由形态，测出来的结论没有意义。
         let routed =
             |command: ModuleCommand, matched: &str| crate::features::command::RoutedCommand {
                 matched: matched.to_string(),
@@ -759,6 +814,23 @@ mod tests {
                 command,
                 observation: CommandObservation::default(),
             };
+        let routed_prefix = |command: ModuleCommand, envelope: CommandPrefix, matched: &str| {
+            let envelope = prefix(envelope);
+            crate::features::command::RoutedCommand {
+                matched: matched.to_string(),
+                raw: matched.to_string(),
+                user_command: format!("{envelope}{matched}"),
+                message_type: "blue".to_string(),
+                username: "玩家甲".to_string(),
+                account: None,
+                authority: CommandAuthority::HallMember,
+                role: None,
+                permission_required: None,
+                denied_reason: None,
+                command,
+                observation: CommandObservation::default(),
+            }
+        };
         let _ = CommandPrefix::At;
 
         // 白名单内：歌单窗口选择、AI 关键词提问 → 允许空 id。
@@ -804,8 +876,8 @@ mod tests {
         // 命令会落进空 id 分支。
         //
         // 覆盖的是「新增命令后忘了在 resolve_for_routed 里给它 id」这个真实风险：
-        // 只要命令按自己的规范名被路由（`matched` == spec.name），就必须能通过
-        // 「按 matched 反查面板 spec」那一步拿到非空 id。
+        // 只要命令按自己的规范名被路由（`matched` == spec.name 且信封前缀与 spec
+        // 一致），就必须能通过「按 matched 反查面板 spec」那一步拿到非空 id。
         //
         // 已知的覆盖盲区（如实记录，不要因为这条测试变绿就以为没有风险）：
         // 像 `administration::Help` 那样把 `matched` 写成 "#"（而非规范名的）
@@ -816,14 +888,21 @@ mod tests {
         for spec in crate::features::command_catalog::all_specs() {
             let (id, policy) = resolve_for_routed(
                 &config,
-                &routed(
+                &routed_prefix(
                     ModuleCommand::Playback(crate::features::playback::PlaybackCommand::Status),
+                    spec.prefix,
                     spec.name,
                 ),
             );
             assert!(
                 !id.is_empty(),
                 "命令 {} 落进了空 id 分支：面板禁用会失效",
+                spec.name
+            );
+            assert_eq!(
+                id,
+                format!("{}{}", prefix(spec.prefix), spec.name),
+                "命令 {} 必须解析到它自己的面板条目，不能被同名的其它前缀抢走",
                 spec.name
             );
             assert!(
@@ -913,5 +992,93 @@ mod tests {
         let (id, policy) = resolve_with_active(&config, &routed(LandlordCommand::Pass), active);
         assert_eq!(id, "#跑得快");
         assert!(!policy.enabled, "跟着对局走的动作仍受 #跑得快 开关约束");
+    }
+
+    /// B06-P1-01：`@帮助` 与 `#娱乐帮助` 必须各用各的面板条目。
+    ///
+    /// 旧实现过滤候选时不校验 `s.prefix`，再取「名字最长」——`@帮助`（matched=`帮助`）
+    /// 会被别名里含「帮助」的 `#娱乐帮助`（名字 4 字）抢走，于是用户在面板里关掉
+    /// 「娱乐帮助」会连点歌帮助一起关掉，反之亦然。`docs/user-guide.md:49` 把两条
+    /// 命令写成独立开关，所以这是实现与文档相反的错误。
+    #[test]
+    fn at_help_and_hash_entertainment_help_resolve_to_their_own_policies() {
+        use crate::features::administration::AdministrationCommand;
+        use crate::features::command::{CommandObservation, ModuleCommand};
+
+        let routed = |user_command: &str, matched: &str, command: AdministrationCommand| {
+            crate::features::command::RoutedCommand {
+                matched: matched.to_string(),
+                raw: matched.to_string(),
+                user_command: user_command.to_string(),
+                message_type: "blue".to_string(),
+                username: "玩家甲".to_string(),
+                account: None,
+                authority: CommandAuthority::HallMember,
+                role: None,
+                permission_required: None,
+                denied_reason: None,
+                command: ModuleCommand::Administration(command),
+                observation: CommandObservation::default(),
+            }
+        };
+
+        let config = CommandAccessConfig::default();
+        let (help_id, _) = resolve_for_routed(
+            &config,
+            &routed("@帮助", "帮助", AdministrationCommand::Help),
+        );
+        let (entertainment_id, _) = resolve_for_routed(
+            &config,
+            &routed("#娱乐帮助", "#", AdministrationCommand::EntertainmentHelp),
+        );
+        assert_eq!(help_id, "@帮助", "`@帮助` 必须落到点歌帮助的条目上");
+        assert_eq!(
+            entertainment_id, "@娱乐帮助",
+            "`#娱乐帮助` 必须落到娱乐帮助的条目上（路由把 matched 固定写成 `#`，靠 fallback 兜住）"
+        );
+        assert_ne!(help_id, entertainment_id, "两条命令的策略 id 不能相同");
+
+        // 同一段文本、不同信封前缀也必须分开：这正是旧实现串号的地方。
+        let (at_help, _) = resolve_for_routed(
+            &config,
+            &routed("@帮助", "帮助", AdministrationCommand::Help),
+        );
+        let (hash_help, _) = resolve_for_routed(
+            &config,
+            &routed(
+                "#娱乐帮助",
+                "娱乐帮助",
+                AdministrationCommand::EntertainmentHelp,
+            ),
+        );
+        assert_eq!(at_help, "@帮助");
+        assert_eq!(
+            hash_help, "#娱乐帮助",
+            "`#` 信封下同名写法应落到 `#` 自己的条目，而不是被 `@` 的条目吃掉"
+        );
+
+        // 用户视角的终局断言：只关掉「娱乐帮助」，点歌帮助必须仍然开着。
+        let mut config = CommandAccessConfig::default();
+        config.overrides.insert(
+            "#娱乐帮助".into(),
+            CommandPolicy {
+                enabled: false,
+                minimum_role: CommandPermission::User,
+            },
+        );
+        let (_, help_policy) = resolve_for_routed(
+            &config,
+            &routed("@帮助", "帮助", AdministrationCommand::Help),
+        );
+        assert!(help_policy.enabled, "关掉娱乐帮助不该连点歌帮助一起关掉");
+        let (_, hash_policy) = resolve_for_routed(
+            &config,
+            &routed(
+                "#娱乐帮助",
+                "娱乐帮助",
+                AdministrationCommand::EntertainmentHelp,
+            ),
+        );
+        assert!(!hash_policy.enabled, "娱乐帮助自己的开关必须生效");
     }
 }

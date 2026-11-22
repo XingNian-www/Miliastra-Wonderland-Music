@@ -1645,6 +1645,30 @@ impl Drop for UiScanPermit {
                 lease.scan_permits -= 1;
             }
         }
+        // 与 `acquire_formal` 同形：本线程仍持有扫描租约时，下面的等待条件
+        // 「在途扫描归零」只能靠本线程自己 drop 租约满足，而本线程已阻塞在
+        // 这里——条件永远不成立，形成自等待死锁。静默卡死不可诊断，显式报错。
+        //
+        // 例外：如果此刻正在 unwinding（调用方 panic 导致 permit 随栈展开被
+        // drop），再 panic 一次会直接 abort 整个进程，比死锁更难诊断。这时只记
+        // 一条错误日志并跳过 drain 屏障：租约计数在上面已经扣减，`scan_may_run`
+        // 会因本租约贡献归零而拒绝新的扫描，状态不会被破坏。
+        let current_thread = std::thread::current().id();
+        let holds_scan_lease = state
+            .scan_owners
+            .values()
+            .any(|owner| *owner == current_thread);
+        if holds_scan_lease {
+            if std::thread::panicking() {
+                log::error!(
+                    "UiScanPermit 在线程 panic 退栈时被 drop，且本线程仍持有扫描租约（步骤：释放界面扫描许可）；已跳过等待「在途扫描归零」并放弃 drain 屏障，以免二次 panic 直接终止进程，请检查扫描租约与许可的释放顺序"
+                );
+                return;
+            }
+            panic!(
+                "UiScanPermit 不能在本线程仍持有扫描租约时 drop：等待「在途扫描归零」会自等待死锁，请先 drop 扫描租约"
+            );
+        }
         // Block new admissions even when an outer permit still exists. This
         // makes every drop a drain barrier without cancelling nested permits.
         state.scan_not_before = Some(Instant::now());
@@ -3677,6 +3701,84 @@ mod tests {
         assert!(coordinator.try_acquire_scan().is_some());
     }
 
+    /// B14-P1-1：同线程仍持有扫描租约时 drop permit，等待「在途扫描归零」会
+    /// 自等待死锁。必须立刻 panic 指出原因，而不是静默卡死。
+    #[test]
+    fn scan_permit_drop_panics_instead_of_self_deadlocking_on_the_same_thread() {
+        let coordinator = UiCoordinator::new();
+        let owner = coordinator.clone();
+        let (message_tx, message_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let _formal = owner.acquire_formal();
+            let permit = owner.permit_scans_for_current_thread();
+            let scan = owner.try_acquire_scan().unwrap();
+            let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(permit)));
+            let message = match payload {
+                Ok(()) => "<没有 panic>".to_string(),
+                Err(payload) => payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| {
+                        payload
+                            .downcast_ref::<&'static str>()
+                            .map(|text| text.to_string())
+                    })
+                    .unwrap_or_default(),
+            };
+            drop(scan);
+            let _ = message_tx.send(message);
+        });
+        // 若检测被移除，worker 会永久阻塞在 drop 里；这里用超时判红，而不是
+        // join 一个死锁线程把整个测试进程卡死。
+        let message = message_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("持租约时 drop permit 没有在 5 秒内 panic：自等待死锁回归");
+        worker.join().unwrap();
+        assert!(
+            message.contains("自等待死锁"),
+            "panic 消息必须指出自等待死锁，实际：{message}"
+        );
+        // panic 发生在 drain 之前，租约与 permit 都已释放：协调器仍可正常使用。
+        assert!(coordinator.try_acquire_scan().is_some());
+    }
+
+    /// 回归（A4 审计小项）：unwinding 中 drop permit 且本线程仍持有扫描租约时，
+    /// 若继续 `assert!` 就会「panic while panicking」→ 直接 abort 整个进程。
+    ///
+    /// 这里构造「内层 permit 在 unwinding 时先于扫描租约被 drop」的形状：旧实现
+    /// 会 abort 测试进程（本测试直接失败），修复后只记日志、跳过 drain 屏障，
+    /// 进程与协调器都保持可用。
+    #[test]
+    fn scan_permit_drop_during_unwind_does_not_abort_the_process() {
+        let coordinator = UiCoordinator::new();
+        let owner = coordinator.clone();
+        let worker = thread::spawn(move || {
+            // 正式租约在闭包外持有：扫描许可以及扫描租约都必须挂在它上面，
+            // 否则 permit 的 `lease_ids` 为空，Drop 会直接返回，测不到自等待检测。
+            let formal = owner.acquire_formal();
+            let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _outer = owner.permit_scans_for_current_thread();
+                let _scan = owner.try_acquire_scan().expect("拿到许可后扫描应被放行");
+                // 声明在最后 → 退栈时最先 drop：此刻扫描租约仍在，命中自等待检测。
+                let _inner = owner.permit_scans_for_current_thread();
+                panic!("测试用：退栈时 permit 仍持有扫描租约");
+            }));
+            assert!(payload.is_err(), "测试闭包必须 panic 才能进入 unwinding");
+            drop(formal);
+        });
+        worker
+            .join()
+            .expect("退栈时 drop permit 不应 abort 进程，也不应让线程再次 panic");
+
+        // 状态仍然可用：重新拿正式租约与许可后扫描可以放行。
+        let _formal = coordinator.acquire_formal();
+        let _permit = coordinator.permit_scans_for_current_thread();
+        assert!(
+            coordinator.try_acquire_scan().is_some(),
+            "unwinding 中的 Drop 只应记录错误，不应永久损坏协调器状态"
+        );
+    }
+
     // Observe the actual admission barrier, rather than assuming a sleeping
     // worker reached it. Bound the wait so a regression fails instead of hangs.
     fn wait_until_scans_blocked(coordinator: &UiCoordinator) {
@@ -3745,13 +3847,18 @@ mod tests {
         let _formal = coordinator.acquire_formal();
         let outer = coordinator.permit_scans_for_current_thread();
         let inner = coordinator.permit_scans_for_current_thread();
-        let scan = coordinator.try_acquire_scan().unwrap();
+        // 扫描租约必须在**持有它的线程**上获取并释放：permit 的 drop 会检查
+        // 「本线程是否仍持有租约」，把租约挪到别的线程释放会误触发该检查。
+        let (acquired_tx, acquired_rx) = mpsc::channel();
         let observer = coordinator.clone();
         let worker = thread::spawn(move || {
+            let scan = observer.try_acquire_scan().unwrap();
+            acquired_tx.send(()).unwrap();
             wait_until_scans_blocked(&observer);
             assert!(observer.try_acquire_scan().is_none());
             drop(scan);
         });
+        acquired_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         drop(inner);
         worker.join().unwrap();
         assert!(coordinator.try_acquire_scan().is_some());

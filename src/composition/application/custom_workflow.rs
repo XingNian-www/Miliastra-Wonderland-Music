@@ -106,9 +106,18 @@ impl AppServices {
             );
             return false;
         }
-        // 收件人主键沿用第一个候选，其余候选随投递一起下发用于搜列表。
+        // 收件人主键沿用第一个候选，其余候选随投递一起下发用于搜列表：
+        // 身份映射里未必查得到第一个候选（可能是外部源 UID），丢掉其余候选
+        // 会让确认私聊白白定位失败。
+        let Some((delivery, extra_search_names)) = invite_decision_delivery(recipients, message)
+        else {
+            log::error!(
+                "好友邀请确认回复失败（步骤：确定收件人），没有可用的收件人名字，本次无法回复该好友；通常是发起人未登记身份映射或昵称/UID 均缺失，需先补全身份配置"
+            );
+            return false;
+        };
         let outcome =
-            self.send_friend_delivery_batch(&[FriendMessage::new(recipients[0].as_str(), message)]);
+            self.send_friend_delivery_batch_with_search_names(&[delivery], &extra_search_names);
         match outcome {
             Ok(FriendBatchOutcome::Complete) => true,
             Ok(FriendBatchOutcome::Failed { failure, .. })
@@ -202,6 +211,19 @@ impl AppServices {
         &self,
         messages: &[FriendMessage],
     ) -> Result<FriendBatchOutcome> {
+        self.send_friend_delivery_batch_with_search_names(messages, &[])
+    }
+
+    /// 同 [`Self::send_friend_delivery_batch`]，但额外并入调用方手上的候选名。
+    ///
+    /// 好友邀请确认的收件人来自上游候选列表（外部源 UID、资料包昵称、备注串），
+    /// 身份映射可能一条都反查不到。这些候选名必须一起拿去搜好友列表，否则
+    /// 「只按主键反查」的结果是空表，确认私聊定位失败。
+    pub(super) fn send_friend_delivery_batch_with_search_names(
+        &self,
+        messages: &[FriendMessage],
+        extra_search_names: &[String],
+    ) -> Result<FriendBatchOutcome> {
         let residency = match self.active_ui_residency()? {
             super::UiResidency::Primary => UiResidencyTarget::Primary,
             super::UiResidency::SecondaryCurrentHall => UiResidencyTarget::SecondaryCurrentHall,
@@ -221,11 +243,13 @@ impl AppServices {
             // 好友列表显示的是备注串，所以这里先认身份再换回屏幕名；
             // 换不回来（未登记玩家）时退回收件人本身，行为与以前一致。
             // 同名歧义时该函数返回空表，宁可在 UI 前失败，也不发给另一个人。
-            let search_names = self
-                .shared
-                .live_configs
-                .identity
-                .friend_search_names(message.recipient(), None);
+            let search_names = merge_search_names(
+                self.shared
+                    .live_configs
+                    .identity
+                    .friend_search_names(message.recipient(), None),
+                extra_search_names,
+            );
             if let Some((recipient, items)) = grouped.last_mut()
                 && recipient == message.recipient()
             {
@@ -523,6 +547,9 @@ impl InviteExecutionPort for AppServicesPort<'_> {
         let residency_failure = match outcome.residency() {
             crate::ui::routines::UiResidencyOutcome::Confirmed(_) => None,
             crate::ui::routines::UiResidencyOutcome::Failed(failure) => Some(failure.to_string()),
+            // 邀请任务收尾固定为 `Fixed(Primary)`，正常不会走到「不产生聊天驻留」；
+            // 即便出现也只说明无需恢复界面，不构成邀请失败。
+            crate::ui::routines::UiResidencyOutcome::NotApplicable => None,
         };
         match outcome.effect() {
             InviteEffect::Entered => {
@@ -578,15 +605,57 @@ impl InviteExecutionPort for AppServicesPort<'_> {
     }
 }
 
+/// 好友邀请确认的投递目标：主键取第一个候选，其余候选作为搜好友列表的补充名。
+///
+/// 上游给的是候选名列表，只拿第一个去反查往往一个都命不中；把它们一起下发，
+/// 才算真正「用了几个候选名」（日志里那句数量也才有意义）。
+fn invite_decision_delivery(
+    recipients: &[String],
+    message: &str,
+) -> Option<(FriendMessage, Vec<String>)> {
+    let (first, rest) = recipients.split_first()?;
+    Some((FriendMessage::new(first.as_str(), message), rest.to_vec()))
+}
+
+/// 把额外候选名并进搜好友列表用的名单：去空白、去重、保持原顺序。
+fn merge_search_names(mut names: Vec<String>, extra: &[String]) -> Vec<String> {
+    for name in extra {
+        let name = name.trim();
+        if name.is_empty() || names.iter().any(|existing| existing == name) {
+            continue;
+        }
+        names.push(name.to_string());
+    }
+    names
+}
+
 fn parse_invite_decision(text: &str) -> Option<bool> {
     let raw = text.trim();
-    let command_text = if let Some(index) = raw.find(['：', ':', ']', '】']) {
-        let sep_len = raw[index..].chars().next().map(char::len_utf8).unwrap_or(1);
-        &raw[index + sep_len..]
-    } else {
-        raw
+    if raw.is_empty() {
+        return None;
     }
-    .trim_start_matches(['：', ':', ' ', '\t', ']', '】']);
+    // 不能「按第一个分隔符截断」就完事，两种合法写法都会因此失效：
+    // 1) 外部聊天源的正文没有昵称前缀，玩家直接发「@邀请确认：好的」——
+    //    截断会得到「好的」，命令被整条忽略；
+    // 2) OCR 读到的昵称带标签，如「[公会]玩家A：@邀请确认」——截断会得到
+    //    「玩家A：@邀请确认」，前缀匹配同样失败。
+    // 因此整串与每一个分隔符之后的部分都当作候选正文逐个试，命中即返回。
+    let candidates = std::iter::once(raw).chain(
+        raw.char_indices()
+            .filter(|(_, ch)| matches!(ch, '：' | ':' | ']' | '】'))
+            .map(|(index, ch)| &raw[index + ch.len_utf8()..]),
+    );
+    for candidate in candidates {
+        if let Some(decision) = invite_decision_in(candidate) {
+            return Some(decision);
+        }
+    }
+    None
+}
+
+/// 单段候选正文里的决策判定：允许前面残留分隔符，判定前缀后必须紧跟边界。
+fn invite_decision_in(candidate: &str) -> Option<bool> {
+    let command_text = candidate.trim_start_matches(['：', ':', ' ', '\t', ']', '】']);
     if ["@邀请确认", "@确认邀请", "@同意邀请"]
         .iter()
         .any(|prefix| {
@@ -614,8 +683,87 @@ fn decision_boundary(ch: Option<char>) -> bool {
             ch.is_whitespace()
                 || matches!(
                     ch,
-                    '，' | ',' | '。' | '.' | '!' | '！' | '?' | '？' | ']' | '】'
+                    '，' | ',' | '。' | '.' | '!' | '！' | '?' | '？' | ']' | '】' | '：' | ':'
                 )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{invite_decision_delivery, merge_search_names, parse_invite_decision};
+
+    /// 回归：命令在正文开头、后面还带冒号附言时不能按「第一个分隔符」截断。
+    ///
+    /// 外部聊天源的正文没有昵称前缀，玩家直接发「@邀请确认：好的」；旧实现
+    /// 截到第一个冒号之后只剩「好的」，整条确认被当成闲聊丢掉，窗口只能等超时。
+    #[test]
+    fn invite_decision_accepts_a_command_followed_by_a_colon_and_remark() {
+        assert_eq!(parse_invite_decision("@邀请确认：好的"), Some(true));
+        assert_eq!(parse_invite_decision("@邀请拒绝: 先不加"), Some(false));
+    }
+
+    /// 回归：昵称带方括号标签（OCR 读到的公会标签）时仍要能读出邀请决策。
+    ///
+    /// 「[公会]玩家A：@邀请确认」旧实现先截到第一个右方括号，正文变成
+    /// 「玩家A：@邀请确认」，前缀永远匹配不上，确认窗口只能等超时。
+    #[test]
+    fn invite_decision_survives_a_bracketed_sender_prefix() {
+        assert_eq!(parse_invite_decision("[公会]玩家A：@邀请确认"), Some(true));
+        assert_eq!(parse_invite_decision("玩家乙：@邀请拒绝"), Some(false));
+    }
+
+    /// 正常写法与误命中边界：命令必须是独立词，不能被闲聊相似句吞掉。
+    #[test]
+    fn invite_decision_still_requires_a_whole_command() {
+        assert_eq!(parse_invite_decision("@邀请确认"), Some(true));
+        assert_eq!(parse_invite_decision("@同意邀请"), Some(true));
+        assert_eq!(parse_invite_decision("玩家甲：@邀请确认。"), Some(true));
+        assert_eq!(parse_invite_decision("@邀请确认是啥意思"), None);
+        assert_eq!(parse_invite_decision("今天天气不错"), None);
+        assert_eq!(parse_invite_decision("   "), None);
+    }
+
+    /// 回归：邀请确认必须把上游给出的**全部**候选名一起下发去搜好友列表。
+    ///
+    /// 旧实现只取 `recipients[0]` 构造投递，其余候选名（资料包昵称、备注串）
+    /// 全部丢弃；第一个候选在身份映射里查不到时，确认私聊只能定位失败。
+    #[test]
+    fn invite_decision_delivers_every_candidate_name() {
+        let recipients = vec![
+            "10001".to_string(),
+            "资料包昵称".to_string(),
+            "备注串".to_string(),
+        ];
+        let (delivery, extra) =
+            invite_decision_delivery(&recipients, "邀请已通过").expect("有候选名就必须能投递");
+        assert_eq!(delivery.recipient(), "10001", "收件人主键沿用第一个候选");
+        assert_eq!(
+            extra,
+            vec!["资料包昵称".to_string(), "备注串".to_string()],
+            "其余候选名必须随投递一起下发用于搜好友列表"
+        );
+        assert!(invite_decision_delivery(&[], "邀请已通过").is_none());
+    }
+
+    /// 候选名合并：去空白、去重、保持顺序。
+    #[test]
+    fn search_names_are_merged_without_duplicates() {
+        assert_eq!(
+            merge_search_names(
+                vec!["甲".to_string()],
+                &[
+                    "甲".to_string(),
+                    "  乙  ".to_string(),
+                    String::new(),
+                    "乙".to_string(),
+                ]
+            ),
+            vec!["甲".to_string(), "乙".to_string()]
+        );
+        assert_eq!(
+            merge_search_names(Vec::new(), &["丙".to_string()]),
+            vec!["丙".to_string()]
+        );
     }
 }

@@ -44,6 +44,12 @@ pub(crate) struct NumberBombTimeout {
     pub(crate) replies: Vec<NumberBombReply>,
 }
 
+/// 「满员且全员离场」判定阈值：连续多少次自动猜都无人操作。
+///
+/// 取 2 整轮而不是 1 轮：`min_players` 为 2 时一轮只有两个人，一个人临时走开
+/// 就会被误判成全员离场；2 轮保证"整桌都轮过两次"，且最坏多占一个回合的时间。
+const ABANDON_ROUNDS: u32 = 2;
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum NumberBombCommand {
     /// 大厅创建房间，发起人自动加入。
@@ -278,6 +284,10 @@ struct Session {
     turn: usize,
     timer: ActiveTimer,
     last_result: Option<RoundResult>,
+    /// 连续多少轮"轮到的人没来"（只在 `tick` 的自动猜里累加，任何真人操作清零）。
+    ///
+    /// 用于「满员且全员离场」的兜底判定：见 [NumberBombService::tick]。
+    abandoned_rounds: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -349,6 +359,8 @@ impl NumberBombService {
         command: &NumberBombCommand,
         now: Instant,
     ) -> Result<NumberBombCommandOutcome> {
+        // 兜底清掉的房间必须就地释放（见 `tick` 的全员离场分支），
+        // 任何新房间逻辑都要先看到空槽位，否则会被自己残留的锁判成「其他玩法进行中」。
         let outcome = match command {
             NumberBombCommand::Start => {
                 self.start_room(entertainment, player, player_display, now)?
@@ -366,7 +378,24 @@ impl NumberBombService {
 
     /// 回合超时推进。返回的是这批应发送的文案；状态已在调用线程内推进，
     /// 调用方只负责把文案送出去，不需要额外的 claim/resume 协议。
-    pub(crate) fn tick(&mut self, now: Instant, clock_active: bool) -> Option<NumberBombTimeout> {
+    ///
+    /// # 满员且全员离场的兜底
+    ///
+    /// 房间**刻意**没有大厅超时（见 `end()` 的注释：只允许发起人结束会让发起人
+    /// 离开后整局永久占位，所以改成"参与者都能收尾"）。但那条补偿有一个缺口：
+    /// 满员后**所有**参与者都离开，既没人能 `#加入`（房间满），也没人能 `#结束`
+    /// （`end()` 要求结束者是当前参与者），娱乐互斥位就再也放不掉了。
+    ///
+    /// 这里补的是**唯一**的兜底：所有人连续 [ABANDON_ROUNDS] 个回合都没参与
+    /// （`tick` 每次自动猜都算一次"轮到的人不在"），就判定全员离场并释放。
+    /// 不推翻「参与者都能收尾」，也不引入大厅成员名单依赖——
+    /// 只看本玩法自己的活动证据。
+    pub(crate) fn tick(
+        &mut self,
+        entertainment: &mut EntertainmentState,
+        now: Instant,
+        clock_active: bool,
+    ) -> Option<NumberBombTimeout> {
         let session = self.session.as_mut()?;
         if session.phase != Phase::Playing {
             return None;
@@ -376,6 +405,29 @@ impl NumberBombService {
         if session.timer.elapsed_at(now, clock_active) < timeout {
             return None;
         }
+        // 连续自动猜满这么多轮仍无人操作 → 认定为「全员离场」。
+        // 条数与人数无关，只保证"整桌都轮过不止一次"，避免一个人暂离就整局消失。
+        if session.abandoned_rounds >= ABANDON_ROUNDS {
+            // 就地释放：兜底恰恰发生在「没有任何人再操作」的状态，会话清掉后
+            // 不会再有下一次 `handle_command` / `abort` 来兑现延迟释放，
+            // 迟一步就是把互斥位占到进程退出。先判所有权，避免误清别人的锁。
+            if entertainment.active() == Some(EntertainmentKind::NumberBomb) {
+                entertainment.release(EntertainmentKind::NumberBomb);
+            }
+            self.session = None;
+            log::info!(
+                "数字炸弹连续 {ABANDON_ROUNDS} 个回合无人操作：按「全员离场」结束本局并释放娱乐互斥位"
+            );
+            // 复用既有的结束文案（`number_bomb.end.done`）：新增 key 要动回复模板登记表，
+            // 那是另一份契约，且用户面板的覆盖/静音列表会跟着变；这里不引入新 key。
+            return Some(NumberBombTimeout {
+                replies: vec![NumberBombReply::keyed(
+                    &templates::END_DONE,
+                    ReplyVars::new(),
+                )],
+            });
+        }
+        session.abandoned_rounds = session.abandoned_rounds.saturating_add(1);
         let player = session.players.get(session.turn)?.display.clone();
         let number = random_available(&mut self.rng, session);
         let mut replies = vec![NumberBombReply::keyed(
@@ -445,6 +497,7 @@ impl NumberBombService {
             turn: 0,
             timer: ActiveTimer::new(now),
             last_result: None,
+            abandoned_rounds: 0,
         });
         Ok(action(
             "lobby-created",
@@ -572,6 +625,7 @@ impl NumberBombService {
         session.turn = 0;
         session.last_result = None;
         session.timer.reset(now);
+        session.abandoned_rounds = 0;
         let player = session
             .players
             .first()
@@ -773,6 +827,8 @@ impl NumberBombService {
                 )],
             );
         }
+        // 真人猜测是最好的"还在场"证据：清零离场计数。
+        session.abandoned_rounds = 0;
         let replies = apply_guess(&self.config, session, number, now);
         let exploded = session.phase == Phase::Lobby;
         action(if exploded { "exploded" } else { "guessed" }, replies)
@@ -959,6 +1015,39 @@ mod tests {
             NumberBombService::with_seed(config(), 7),
             EntertainmentState::new(),
         )
+    }
+
+    /// 坐满房间并开局：全员离场兜底测试的公共前置。
+    fn fill_room_and_start(
+        service: &mut NumberBombService,
+        entertainment: &mut EntertainmentState,
+        now: Instant,
+    ) {
+        service
+            .handle_command(entertainment, "p1", "甲", &NumberBombCommand::Start, now)
+            .unwrap();
+        // 坐满上限，之后就再也没有人能 #加入。
+        let capacity = NumberBombConfig::default().max_players;
+        for index in 2..=capacity {
+            service
+                .handle_command(
+                    entertainment,
+                    &format!("p{index}"),
+                    &format!("玩家{index}"),
+                    &NumberBombCommand::Join,
+                    now,
+                )
+                .unwrap();
+        }
+        service
+            .handle_command(
+                entertainment,
+                "p1",
+                "甲",
+                &NumberBombCommand::StartGame,
+                now,
+            )
+            .unwrap();
     }
 
     fn text(reply: &NumberBombReply) -> String {
@@ -1657,7 +1746,9 @@ mod tests {
             .unwrap();
         let turn = service.session.as_ref().unwrap().turn;
         let later = now + Duration::from_secs(60);
-        let timeout = service.tick(later, true).expect("应触发回合超时");
+        let timeout = service
+            .tick(&mut entertainment, later, true)
+            .expect("应触发回合超时");
         assert!(timeout.replies.len() >= 2);
         assert!(text(&timeout.replies[0]).contains("自动猜"));
         let session = service.session.as_ref().unwrap();
@@ -1666,7 +1757,162 @@ mod tests {
         }
         // 暂停时不计时：同样的时长在 inactive 下不应再次触发。
         let paused = later + Duration::from_secs(120);
-        assert!(service.tick(paused, false).is_none());
+        assert!(service.tick(&mut entertainment, paused, false).is_none());
+    }
+
+    /// B07-P1-7 的残余窗口：满员且**全员离场**后必须释放娱乐互斥位。
+    ///
+    /// 房间刻意没有大厅超时，补偿设计是「参与者都能收尾」。但满员之后，
+    /// 既没人能 `#加入`（房间满），也没人能 `#结束`（要求结束者在局中），
+    /// 互斥位就再也放不掉了。这里钉住兜底：连续若干个回合无人操作即判定全员离场。
+    ///
+    /// 兜底恰恰发生在「没有任何人再操作」的状态，所以释放必须在 `tick` 内**就地**
+    /// 完成：留待「下一次入口兑现」等于永远不兑现，互斥位会占到进程退出。
+    #[test]
+    fn a_full_room_that_everyone_left_releases_the_entertainment_slot() {
+        let (mut service, mut entertainment) = service();
+        let now = now();
+        fill_room_and_start(&mut service, &mut entertainment, now);
+        assert_eq!(entertainment.active(), Some(EntertainmentKind::NumberBomb));
+
+        // 所有人都离开：只剩自动猜在推进。
+        let mut at = now;
+        let mut bailout = None;
+        for _ in 0..(ABANDON_ROUNDS + 1) {
+            at += Duration::from_secs(NumberBombConfig::default().turn_timeout_seconds);
+            if let Some(timeout) = service.tick(&mut entertainment, at, true) {
+                assert!(timeout.replies.iter().any(|reply| {
+                    let rendered = text(reply);
+                    rendered.contains("自动猜") || rendered.contains("已结束")
+                }));
+                if service.session.is_none() {
+                    bailout = Some(timeout);
+                    break;
+                }
+            }
+        }
+        let bailout = bailout.expect("满员且全员离场时必须在有限回合内收尾");
+        assert!(
+            bailout
+                .replies
+                .iter()
+                .any(|reply| text(reply).contains("已结束")),
+            "收尾必须广播一条「已结束」，否则大厅以为本局还在进行"
+        );
+
+        // 兜底发生在「没有任何人再操作」的状态：会话清掉后不会再有下一次入口
+        // 来兑现延迟释放，所以 tick 必须在返回前就把槽位清空。
+        assert_eq!(
+            entertainment.active(),
+            None,
+            "全员离场兜底必须在 tick 返回前释放娱乐互斥位"
+        );
+
+        // 后续玩家要能立刻重开（不再被自己的残留锁判成 occupied）。
+        let restarted = service
+            .handle_command(
+                &mut entertainment,
+                "p1",
+                "甲",
+                &NumberBombCommand::Start,
+                at,
+            )
+            .unwrap();
+        assert_eq!(
+            restarted.action, "lobby-created",
+            "兜底清掉的房间不能留下残留锁"
+        );
+        assert_eq!(entertainment.active(), Some(EntertainmentKind::NumberBomb));
+    }
+
+    /// 变异验证锚点：全员离场兜底必须在 `tick` 返回前清空娱乐槽。
+    ///
+    /// 故意不调用任何其它入口（不 handle_command、不 abort），这样把释放改回
+    /// 「只置闩、等下一次入口」时本测试必然变红。
+    #[test]
+    fn the_abandon_bailout_clears_the_slot_before_tick_returns() {
+        let (mut service, mut entertainment) = service();
+        let now = now();
+        fill_room_and_start(&mut service, &mut entertainment, now);
+        assert_eq!(entertainment.active(), Some(EntertainmentKind::NumberBomb));
+
+        let mut at = now;
+        let mut bailed_out = false;
+        for _ in 0..(ABANDON_ROUNDS + 1) {
+            at += Duration::from_secs(NumberBombConfig::default().turn_timeout_seconds);
+            if service.tick(&mut entertainment, at, true).is_some() && service.session.is_none() {
+                bailed_out = true;
+                break;
+            }
+        }
+        assert!(bailed_out, "满员且全员离场时必须在有限回合内收尾");
+        // 只看这一行：调用方还没做任何事，槽位就必须已经空了。
+        assert_eq!(
+            entertainment.active(),
+            None,
+            "全员离场兜底必须在 tick 返回前释放娱乐互斥位"
+        );
+    }
+
+    /// 兜底不能变成「有人暂离也整局消失」：真人猜测会清零离场计数。
+    #[test]
+    fn one_real_guess_keeps_the_room_alive_against_the_abandon_bailout() {
+        let (mut service, mut entertainment) = service();
+        let now = now();
+        service
+            .handle_command(
+                &mut entertainment,
+                "p1",
+                "甲",
+                &NumberBombCommand::Start,
+                now,
+            )
+            .unwrap();
+        service
+            .handle_command(
+                &mut entertainment,
+                "p2",
+                "乙",
+                &NumberBombCommand::Join,
+                now,
+            )
+            .unwrap();
+        service
+            .handle_command(
+                &mut entertainment,
+                "p1",
+                "甲",
+                &NumberBombCommand::StartGame,
+                now,
+            )
+            .unwrap();
+
+        let timeout_ms = Duration::from_secs(NumberBombConfig::default().turn_timeout_seconds);
+        let mut at = now;
+        for _ in 0..ABANDON_ROUNDS {
+            at += timeout_ms;
+            service
+                .tick(&mut entertainment, at, true)
+                .expect("每轮都应超时推进");
+            // 轮到谁猜一次都算「有人在场」。
+            let session = service.session.as_ref().expect("会话还在");
+            let key = session.players[session.turn].key.clone();
+            let number = session.lower;
+            service
+                .handle_command(
+                    &mut entertainment,
+                    &key,
+                    "在场玩家",
+                    &NumberBombCommand::Guess(number),
+                    at,
+                )
+                .unwrap();
+        }
+        assert!(
+            service.session.is_some(),
+            "有人真的在猜时不该被判定全员离场"
+        );
+        assert_eq!(entertainment.active(), Some(EntertainmentKind::NumberBomb));
     }
 
     #[test]

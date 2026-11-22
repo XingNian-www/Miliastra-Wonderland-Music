@@ -1,7 +1,17 @@
 use std::time::Instant;
 
 use super::PlayerStatus;
-use crate::features::reply_template::{ReplyVars, playback as templates};
+use crate::features::reply_template::{ReplyTemplate, ReplyVars, playback as templates};
+
+/// 渲染一条回复模板。业务层只声明模板与变量，覆盖文案由调用方（composition 层）提供。
+///
+/// `@状态`/`@歌词` 原来全部写死 `render(spec, None, ...)`，用户在配置中心改文案或
+/// 静音后完全不生效；这里把渲染入口显式传进来，默认实现保持内置文案。
+type TemplateRenderer<'a> = &'a mut dyn FnMut(&ReplyTemplate, &ReplyVars) -> String;
+
+fn default_render(spec: &ReplyTemplate, vars: &ReplyVars) -> String {
+    crate::features::reply_template::render(spec, None, vars).text
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct PlaybackSnapshot {
@@ -38,7 +48,12 @@ pub(crate) fn format_play_message(status: &PlayerStatus) -> String {
 ///
 /// 单独拆出来，是为了让"状态行模板"和"歌单前缀模板"共用同一批值：
 /// 前缀模板拿到的 {内容} 就是这里渲染出的整行。
-fn status_vars(status: &PlayerStatus, requester: &str, title: String) -> ReplyVars {
+fn status_vars(
+    status: &PlayerStatus,
+    requester: &str,
+    title: String,
+    render: TemplateRenderer<'_>,
+) -> ReplyVars {
     let state = match status.status.as_str() {
         "playing" => "播放",
         "paused" => "暂停",
@@ -49,12 +64,10 @@ fn status_vars(status: &PlayerStatus, requester: &str, title: String) -> ReplyVa
     let requester_text = if requester.is_empty() {
         String::new()
     } else {
-        crate::features::reply_template::render(
+        render(
             &templates::STATUS_REQUESTER,
-            None,
             &ReplyVars::new().with("点歌人", requester),
         )
-        .text
     };
     ReplyVars::new()
         .with("状态", state)
@@ -66,15 +79,16 @@ fn status_vars(status: &PlayerStatus, requester: &str, title: String) -> ReplyVa
 }
 
 pub(crate) fn format_status(status: &PlayerStatus) -> String {
-    format_status_with_budget(
-        status,
-        status.requester.trim(),
-        crate::text::chat_layout::CHAT_LAYOUT_BUDGET,
-    )
+    format_status_with_mode(status, None)
 }
 
 /// `@状态` 一行排版：曲名（含歌手）让位给前缀/进度/音量/点歌人后缀，整行 ≤ budget。
-fn format_status_with_budget(status: &PlayerStatus, requester: &str, budget: usize) -> String {
+fn format_status_with_budget(
+    status: &PlayerStatus,
+    requester: &str,
+    budget: usize,
+    render: TemplateRenderer<'_>,
+) -> String {
     let has_title = !optional_song_title(&status.name, &status.singer).is_empty();
     // 有歌 / 无歌用两张主模板：两种排版的冒号与空格位置不同，
     // 不能靠同一张模板加空变量凑出来。
@@ -84,16 +98,14 @@ fn format_status_with_budget(status: &PlayerStatus, requester: &str, budget: usi
         &templates::STATUS_WITHOUT_SONG
     };
     if !has_title {
-        let vars = status_vars(status, requester, String::new());
-        return crate::features::reply_template::render(spec, None, &vars).text;
+        let vars = status_vars(status, requester, String::new(), render);
+        return render(spec, &vars);
     }
     // 先渲染「曲名为空」的骨架，量出前后缀占的宽度，再给曲名分配剩余预算。
-    let skeleton = crate::features::reply_template::render(
-        spec,
-        None,
-        &status_vars(status, requester, String::new()),
-    )
-    .text;
+    let skeleton = {
+        let vars = status_vars(status, requester, String::new(), render);
+        render(spec, &vars)
+    };
     let title_budget = budget
         .saturating_sub(crate::text::display_width(&skeleton))
         .max(8);
@@ -107,7 +119,8 @@ fn format_status_with_budget(status: &PlayerStatus, requester: &str, budget: usi
         };
         crate::text::chat_layout::chat_track_label(&status.name, &artists, title_budget)
     };
-    crate::features::reply_template::render(spec, None, &status_vars(status, requester, title)).text
+    let vars = status_vars(status, requester, title, render);
+    render(spec, &vars)
 }
 
 /// @状态 文本。歌单模式下用 `[归属的歌单]` 前缀，并省略尾部的点歌人。
@@ -119,42 +132,59 @@ pub(crate) fn format_status_with_mode(
     status: &PlayerStatus,
     playlist_owner: Option<&str>,
 ) -> String {
+    let mut render = default_render;
+    format_status_with_mode_and_renderer(status, playlist_owner, &mut render)
+}
+
+/// 与 [`format_status_with_mode`] 相同，但覆盖文案与静音由调用方提供的渲染入口决定。
+pub(crate) fn format_status_with_mode_and_renderer(
+    status: &PlayerStatus,
+    playlist_owner: Option<&str>,
+    render: TemplateRenderer<'_>,
+) -> String {
     match playlist_owner {
         Some(owner) => {
             // 歌单模式用归属替代点歌人：清空 requester 渲染整行，
             // 再由前缀模板包一层，两处都能被用户改写。
             // 前缀本身也占显示宽度，内层曲名预算要把它扣掉，保证前缀与内容同条。
-            let prefix_skeleton = crate::features::reply_template::render(
+            let prefix_skeleton = render(
                 &templates::STATUS_PLAYLIST_PREFIX,
-                None,
                 &ReplyVars::new().with("歌单归属", owner).with("内容", ""),
-            )
-            .text;
+            );
             let inner_budget = crate::text::chat_layout::CHAT_LAYOUT_BUDGET
                 .saturating_sub(crate::text::display_width(&prefix_skeleton))
                 .max(8);
             let mut bare = status.clone();
             bare.requester.clear();
-            let inner = format_status_with_budget(&bare, "", inner_budget);
-            crate::features::reply_template::render(
+            let inner = format_status_with_budget(&bare, "", inner_budget, render);
+            render(
                 &templates::STATUS_PLAYLIST_PREFIX,
-                None,
                 &ReplyVars::new().with("歌单归属", owner).with("内容", inner),
             )
-            .text
         }
-        None => format_status(status),
+        None => format_status_with_budget(
+            status,
+            status.requester.trim(),
+            crate::text::chat_layout::CHAT_LAYOUT_BUDGET,
+            render,
+        ),
     }
 }
 
 pub(crate) fn format_lyrics(status: &PlayerStatus) -> String {
+    let mut render = default_render;
+    format_lyrics_with(status, &mut render)
+}
+
+/// 与 [`format_lyrics`] 相同，但走调用方的模板渲染入口（覆盖文案 / 静音）。
+pub(crate) fn format_lyrics_with(status: &PlayerStatus, render: TemplateRenderer<'_>) -> String {
     let text = status.lyric_line_text.trim();
     let spec = if text.is_empty() {
         &templates::LYRICS_EMPTY
     } else {
         &templates::LYRICS_LINE
     };
-    crate::features::reply_template::render(spec, None, &ReplyVars::new().with("歌词", text)).text
+    render(spec, &ReplyVars::new().with("歌词", text))
 }
 
 /// 播放时长/进度统一格式化：mm:ss。
@@ -196,7 +226,11 @@ pub(crate) fn song_title(name: &str, singer: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{PlayerStatus, format_status, format_status_with_mode};
+    use super::{
+        PlayerStatus, format_lyrics_with, format_status, format_status_with_mode,
+        format_status_with_mode_and_renderer,
+    };
+    use crate::features::reply_template::{ReplyTemplate, ReplyVars, playback as templates};
 
     #[test]
     fn status_line_templates_preserve_the_pre_split_output() {
@@ -282,6 +316,60 @@ mod tests {
             leaked.contains(uuid),
             "本层不做翻译，收到内部键就会泄露；调用方必须翻译后再传: {leaked}"
         );
+    }
+
+    /// B07-P1-6：格式化函数不能绕过调用方给的渲染入口。
+    ///
+    /// 旧实现全部写死 `render(spec, None, ...)`，面板覆盖与静音对 `@状态`/`@歌词`
+    /// 完全不生效。这里用探针渲染器断言每个模板都真的经过它。
+    #[test]
+    fn formatters_never_bypass_the_supplied_renderer() {
+        let status = PlayerStatus {
+            status: "playing".into(),
+            name: "歌".into(),
+            singer: "手".into(),
+            duration: 100.0,
+            progress: 1.0,
+            volume: 80,
+            requester: "点歌人".into(),
+            lyric_line_text: "第一行".into(),
+            ..Default::default()
+        };
+        let mut seen: Vec<&'static str> = Vec::new();
+        let plain_status;
+        let playlist_status;
+        let lyrics;
+        {
+            let mut render = |spec: &ReplyTemplate, _vars: &ReplyVars| {
+                seen.push(spec.key);
+                format!("<{}>", spec.key)
+            };
+            plain_status = format_status_with_mode_and_renderer(&status, None, &mut render);
+            playlist_status =
+                format_status_with_mode_and_renderer(&status, Some("甲"), &mut render);
+            lyrics = format_lyrics_with(&status, &mut render);
+        }
+
+        assert!(
+            plain_status.contains(templates::STATUS_WITH_SONG.key),
+            "普通状态行要经渲染入口：{plain_status}"
+        );
+        assert!(
+            playlist_status.contains(templates::STATUS_PLAYLIST_PREFIX.key),
+            "歌单前缀也要走覆盖入口：{playlist_status}"
+        );
+        for key in [
+            templates::STATUS_REQUESTER.key,
+            templates::STATUS_WITH_SONG.key,
+        ] {
+            assert!(seen.contains(&key), "格式器绕过了渲染入口：缺 {key}");
+        }
+
+        assert!(
+            lyrics.contains(templates::LYRICS_LINE.key),
+            "歌词也要走覆盖入口：{lyrics}"
+        );
+        assert!(seen.contains(&templates::LYRICS_LINE.key));
     }
 
     #[test]

@@ -7,6 +7,78 @@ fn debug_port(state: &HttpSharedState) -> Result<&dyn HttpDebugPort, AppError> {
         message: "调试接口未接线".into(),
     })
 }
+
+/// `image=` 读盘失败的**类别**：只用于给人看的文案，不含路径、不含错误链。
+///
+/// 分档的意义在于「调用方能不能自己修」：路径打错要能看出来，权限/格式另说。
+/// 三档都是**可自行修正的输入问题**，因此文案必须能指导下一步动作，
+/// 而不是一句「内部错误」把三种原因糊成一种。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ImageReadFailure {
+    /// 路径上没有这个文件（用户敲错路径最常见）。
+    NotFound,
+    /// 文件存在但读不到：权限不足、被别的进程占用、设备错误。
+    Unreadable,
+    /// 读到字节但不是能解码的图片：格式不支持、数据损坏、尺寸超限。
+    Undecodable,
+}
+
+/// `image=` 读盘失败的统一出口（决策 5-a：不得回传原始文件系统错误）。
+///
+/// 理由不是「错误链里带路径」——实测 `image::open`/`image::save` 的
+/// `io::Error` Display 只有 `No such file or directory (os error 2)`，不含路径。
+/// 真实理由有两条：
+///
+/// 1. **不把内部 IO 错误细节回传客户端**：错误链会暴露本机实现细节
+///    （哪个解码器、哪个 syscall、errcode），响应体只该给调用方能据以行动的类别。
+/// 2. **不把文案变成 API 契约**：一旦原样回传 `{error}`，调用方与脚本就会开始
+///    依赖错误原文的措辞，之后再想改就成了破坏性变更。
+///
+/// 完整错误链（含路径与 errcode）只进日志，供离线复现时定位。
+/// 状态码按实际原因给：文件不存在是 404，其余是 400。
+fn image_read_error(step: &str, error: &image::ImageError) -> AppError {
+    let failure = match error {
+        image::ImageError::IoError(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            ImageReadFailure::NotFound
+        }
+        image::ImageError::IoError(_) => ImageReadFailure::Unreadable,
+        _ => ImageReadFailure::Undecodable,
+    };
+    // 分级按「要不要人工介入」：404 是调用方路径打错，warn 即可；
+    // 其余（权限/格式/损坏）更像环境或数据问题，仍归 error。
+    // 与父层 `protocol.rs` 的 `<500 → warn` 口径保持一致，避免一次失败打两条 error。
+    if failure == ImageReadFailure::NotFound {
+        log::warn!("{step}：image= 指定的图片文件不存在，本次请求未执行；原因：{error:#}");
+    } else {
+        log::error!("{step}：读取 image= 指定的图片失败，本次请求未执行；原因：{error:#}");
+    }
+    AppError {
+        status: if failure == ImageReadFailure::NotFound {
+            404
+        } else {
+            400
+        },
+        message: match failure {
+            ImageReadFailure::NotFound => "指定的图片文件不存在",
+            ImageReadFailure::Unreadable => "指定的图片文件无法读取（权限或被占用）",
+            ImageReadFailure::Undecodable => "指定的图片文件无法解码为图片",
+        }
+        .into(),
+    }
+}
+
+/// `save=` 落盘失败的统一出口：同样是「不回传内部错误原文，只给可行动类别」。
+///
+/// 写盘失败是**服务端**问题（磁盘满、目录只读），所以是 500 + `error` 级；
+/// 与读路径的 404/400 分级不同，那些是调用方的输入问题。
+fn image_write_error(step: &str, error: &image::ImageError) -> AppError {
+    log::error!("{step}：测量帧保存为 PNG 失败，该帧未落盘；原因：{error:#}");
+    AppError {
+        status: 500,
+        message: "测量帧未能落盘（写入失败）".into(),
+    }
+}
+
 /// GET /debug/ui-state[?image=<路径>]：只读查询界面状态与判别证据。
 /// 未分类时返回 classified=false 并给出原因，**绝不用一个猜出来的状态充数**。
 ///
@@ -18,10 +90,8 @@ pub(super) fn debug_ui_state_route(
     state: &HttpSharedState,
 ) -> Result<String, AppError> {
     if let Some(path) = query_value(query, "image").filter(|value| !value.is_empty()) {
-        let image = image::open(std::path::Path::new(path)).map_err(|error| AppError {
-            status: 400,
-            message: format!("读取指定图片失败: {error}"),
-        })?;
+        let image = image::open(std::path::Path::new(path))
+            .map_err(|error| image_read_error("调试界面状态查询", &error))?;
         return classify_saved_frame(state, &image);
     }
     debug_port(state)?.ui_state_detail().map_err(command_error)
@@ -360,10 +430,8 @@ pub(super) fn debug_ui_catalogue_route(
     let image = match query_value(query, "image") {
         // `capture()` 返回 `Arc<DynamicImage>`，这里包一层保持两个分支同型。
         Some(path) if !path.is_empty() => Arc::new(
-            image::open(std::path::Path::new(path)).map_err(|error| AppError {
-                status: 400,
-                message: format!("读取指定图片失败: {error}"),
-            })?,
+            image::open(std::path::Path::new(path))
+                .map_err(|error| image_read_error("调试模板探针", &error))?,
         ),
         _ => debug_port(state)?.capture().map_err(command_error)?,
     };
@@ -394,9 +462,11 @@ pub(super) fn debug_ui_catalogue_route(
                     message: "保存路径的父目录不存在".to_string(),
                 });
             }
-            image.save(&path).map_err(|error| AppError {
-                status: 500,
-                message: format!("保存测量帧失败: {error}"),
+            // 写盘失败走与读盘同一个出口口径：只回可行动类别，不把
+            // `image::save` 的内部错误原文（syscall / errcode / 实现细节）
+            // 变成响应体与 API 契约。完整原因只进日志（决策 5-a）。
+            image.save(&path).map_err(|error| {
+                image_write_error("调试模板探针失败（步骤：把测量帧保存为 PNG）", &error)
             })?;
             Some(path.display().to_string())
         }
@@ -1264,6 +1334,90 @@ pub(super) fn debug_events_response(
 mod tests {
     use super::*;
     use image::{DynamicImage, GrayImage, Luma};
+
+    /// 决策 5-a：读盘失败只回可行动类别，真实错误原文（含路径/errcode）不得进响应体。
+    ///
+    /// **payload 必须是真实的错误，不能是测试自己编的字符串**。旧用例把
+    /// `/root/secret/frame.png` 当 `io::Error::new` 的 message 塞进去，而真实的
+    /// `io::Error` Display 只有 `No such file or directory (os error 2)`、不含路径——
+    /// 于是「响应里没有 secret」证明不了任何事：实现把 `{error}` 原样回传也照样过。
+    ///
+    /// 这里改成三种**真实**错误（目录当文件、文件不存在、坏字节），并把断言放在
+    /// `os error` 上：任何把错误原文拼进 `message` 的实现都会立刻变红。
+    #[test]
+    fn image_read_errors_never_echo_the_filesystem_path() {
+        let secret_dir = std::env::temp_dir().join("secret-frame-probe");
+        std::fs::create_dir_all(&secret_dir).expect("create probe dir");
+        let secret_path = secret_dir.join("frame.png");
+        std::fs::write(&secret_path, b"not a png at all").expect("write probe file");
+
+        // ① 真实 io::Error：把**目录**当图片读（EISDIR），错误链里带路径与 errcode。
+        let dir_error = image::open(&secret_dir).expect_err("目录不是图片");
+        let error = image_read_error("调试模板探针", &dir_error);
+        assert_eq!(error.status, 400, "读不出来的文件不是 404");
+        assert!(
+            !error.message.contains("secret-frame-probe")
+                && !error.message.contains("os error")
+                && !error.message.to_lowercase().contains("directory"),
+            "响应文案不得回传路径、errcode 或 errno 说明：{}",
+            error.message
+        );
+
+        // ② 真实的「文件不存在」：错误链里带的是用户给的路径。
+        let missing_path = secret_dir.join("nope-does-not-exist.png");
+        let missing = std::fs::read(&missing_path).expect_err("文件确实不存在");
+        let error = image_read_error("调试模板探针", &image::ImageError::IoError(missing));
+        assert_eq!(error.status, 404, "文件不存在按 404 报");
+        assert!(
+            !error.message.contains("secret-frame-probe")
+                && !error.message.contains("os error")
+                && !error.message.to_lowercase().contains("no such file"),
+            "响应文案不得回传路径或 errcode：{}",
+            error.message
+        );
+
+        // ③ 真实的可解码性失败：坏字节必须是「无法解码」，不能和「文件不存在」共用说法。
+        let undecodable = image::open(&secret_path).expect_err("坏字节不是图片");
+        let error = image_read_error("调试模板探针", &undecodable);
+        assert_eq!(error.status, 400);
+        assert!(
+            error.message.contains("解码"),
+            "格式/数据问题要给出可行动原因：{}",
+            error.message
+        );
+        assert!(
+            !error.message.contains("secret-frame-probe"),
+            "解码失败同样不得带路径：{}",
+            error.message
+        );
+
+        // ④ 三种原因的文案必须互不相同，否则用户分不清该修哪一步。
+        assert_ne!(error.message, "指定的图片文件不存在");
+        assert_ne!(error.message, "指定的图片文件无法读取（权限或被占用）");
+
+        let _ = std::fs::remove_dir_all(&secret_dir);
+    }
+
+    /// `save=` 写失败：同样是 500 + 可行动文案，不回传内部错误原文。
+    ///
+    /// 旧用例完全没有覆盖写盘分支，而它才是真的会写文件的那个。
+    /// 这里对「不存在的父目录」调用 `image::save` 取得**真实**的错误链。
+    #[test]
+    fn image_write_errors_never_echo_the_filesystem_path() {
+        let image = gray_image(&[[1, 2], [3, 4]]);
+        let blocked = std::env::temp_dir()
+            .join("no-such-parent-secret-dir")
+            .join("frame.png");
+        let error = image.save(&blocked).expect_err("父目录不存在时必须写失败");
+        let app_error = image_write_error("调试模板探针失败", &error);
+        assert_eq!(app_error.status, 500, "写盘失败是服务端问题");
+        assert!(
+            !app_error.message.contains("no-such-parent-secret-dir")
+                && !app_error.message.contains("os error"),
+            "响应文案不得回传路径或 errcode：{}",
+            app_error.message
+        );
+    }
 
     /// 同一幅画面必须给同一个指纹，否则它就不能把测量绑定到具体一帧。
     #[test]

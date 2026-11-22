@@ -908,6 +908,56 @@ fn memory_keeps_context_prunes_to_budget_and_forgets() {
     assert!(!memory.forget("甲", "甲").unwrap(), "第二次清空不再有内容");
 }
 
+/// 决策 5-b 的生产接线：遗忘级联必须**按人**清 trace，而不是整环清空。
+///
+/// 这条用例打的是「改回 `clear()` 会不会被发现」：全清之后别人的报文也会消失，
+/// `count == 1` 与「乙的报文仍在」两条断言同时变红。只测 `purge_player` 本身
+/// （`ai_trace` 里的单测）证明不了这条路真的被 `forget()` 调用。
+#[test]
+fn forgetting_a_player_purges_only_their_trace_entries() {
+    // trace 是进程级单例，必须与 `ai_trace` 的测试串行。
+    let _guard = crate::ai_trace::test_lock();
+    crate::ai_trace::clear_for_tests();
+
+    let memory = AiChatMemory::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+    // 先写一条要遗忘的记忆：`removed == 0` 时级联整段不执行，测不到接线。
+    memory.add_fact("甲", "喜欢晴天", 1).unwrap();
+
+    for name in ["甲", "乙"] {
+        crate::ai_trace::record(miliastra_kernel::ai::WireExchange {
+            wire_api: "ChatCompletions",
+            request: serde_json::json!({
+                "model": "m",
+                "messages": [
+                    {"role": "system", "content": "稳定人设"},
+                    {"role": "user", "content": format!("[{name}]:今天点什么歌")}
+                ],
+                "tools": []
+            }),
+            response: None,
+            error: None,
+            started_at_ms: 1_793_026_800_000,
+            elapsed: std::time::Duration::from_millis(100),
+        });
+    }
+
+    assert!(memory.forget("甲", "甲").unwrap(), "甲仍有记忆可清空");
+
+    let list: serde_json::Value =
+        serde_json::from_str(&crate::ai_trace::list_json()).expect("trace 列表是 JSON");
+    assert_eq!(
+        list["count"], 1,
+        "只应清掉甲的报文；整环 clear() 会把乙的一起丢掉：{list}"
+    );
+    // 列表只有摘要，正文要按 id 取详情才看得到（这正是要断言的东西）。
+    let id = list["entries"][0]["id"].as_u64().expect("条目 id");
+    let text = crate::ai_trace::entry_json(id).expect("条目详情");
+    assert!(text.contains("乙"), "别人的报文必须保留：{text}");
+    assert!(!text.contains("甲"), "被遗忘者的原文不得残留：{text}");
+
+    crate::ai_trace::clear_for_tests();
+}
+
 #[test]
 fn actors_are_isolated_from_each_other() {
     let memory = AiChatMemory::from_connection(Connection::open_in_memory().unwrap()).unwrap();

@@ -189,7 +189,7 @@ fn apply_reasoning_rules(
     Ok(Some(current))
 }
 
-/// 单次调用的可变参数：模型与思考强度。/// 单次调用的可变参数：模型与思考强度。
+/// 单次调用的可变参数：模型与思考强度。
 ///
 /// 每个调用点各自构造一个，因此"点歌用高思考、审核用低思考"这种组合不需要
 /// 全局开关，也不会互相影响。空字符串模型表示沿用 `ai.model`。
@@ -214,7 +214,11 @@ impl AiCallOptions {
 }
 
 /// 唯一的 AI 连接配置段。
-#[derive(Clone, Debug, Serialize, Deserialize)]
+///
+/// `Debug` 手写而不派生：`api_key` 是明文凭据，任何一次 `{:?}`（日志、断言、
+/// 错误链的上下文字段）都会把它写进日志文件。脱敏口径与同文件的
+/// [`ImageAttachment`] 一致——只暴露「有没有配」，不回显内容。
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AiConfig {
     pub provider: String,
@@ -239,6 +243,34 @@ pub struct AiConfig {
     pub reasoning_rules: Vec<ReasoningRule>,
 }
 
+/// 日志与调试输出里展示 API Key 的唯一口径。
+///
+/// 只回答「配了没有」，不回显任何字符——长度、前后缀同样属于凭据信息。
+fn redacted_api_key(api_key: &str) -> &'static str {
+    if api_key.trim().is_empty() {
+        "<未设置>"
+    } else {
+        "<已脱敏>"
+    }
+}
+
+impl fmt::Debug for AiConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AiConfig")
+            .field("provider", &self.provider)
+            .field("api_key", &redacted_api_key(&self.api_key))
+            .field("endpoint", &self.endpoint)
+            .field("responses_endpoint", &self.responses_endpoint)
+            .field("model", &self.model)
+            .field("http_proxy", &self.http_proxy)
+            .field("wire_api", &self.wire_api)
+            .field("extra_body", &self.extra_body)
+            .field("reasoning_rules", &self.reasoning_rules)
+            .finish()
+    }
+}
+
 impl Default for AiConfig {
     fn default() -> Self {
         Self {
@@ -256,7 +288,10 @@ impl Default for AiConfig {
 }
 
 /// 解析后的单次调用目标：三个功能拿到的都是同一套连接参数。
-#[derive(Clone, Debug)]
+///
+/// 与 [`AiConfig`] 同理手写 `Debug`：这个结构体会被带进错误上下文，
+/// 派生实现会把 `api_key` 明文写进日志。
+#[derive(Clone)]
 pub(crate) struct ResolvedAiTarget {
     pub(crate) provider: AiProvider,
     pub(crate) endpoint: String,
@@ -266,6 +301,21 @@ pub(crate) struct ResolvedAiTarget {
     pub(crate) extra_body: HashMap<String, Value>,
     /// 本次调用的思考强度；Unset 表示不发该字段。
     pub(crate) reasoning: ReasoningEffort,
+}
+
+impl fmt::Debug for ResolvedAiTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResolvedAiTarget")
+            .field("provider", &self.provider)
+            .field("endpoint", &self.endpoint)
+            .field("api_key", &redacted_api_key(&self.api_key))
+            .field("model", &self.model)
+            .field("wire_api", &self.wire_api)
+            .field("extra_body", &self.extra_body)
+            .field("reasoning", &self.reasoning)
+            .finish()
+    }
 }
 
 impl ResolvedAiTarget {
@@ -1696,6 +1746,16 @@ impl ToolSession {
         Ok(request)
     }
 
+    /// 本次工具请求随行的附加字段：用户 `extra_body` 与思考强度的合并结果。
+    ///
+    /// 必须走 [`merged_extra_body`]：`resolve_with` 已把 `ai_chat.reasoning`
+    /// 与 `ai.reasoning_rules` 解析进 `target.reasoning`，而思考强度**不在**
+    /// 请求体里，只能靠这份附加字段发出去。只用 `target.extra_body` 会让
+    /// AI 聊天主对话与识图子请求的思考强度配置 100% 静默失效。
+    fn request_extra_body(&self) -> HashMap<String, Value> {
+        merged_extra_body(&self.target)
+    }
+
     pub(crate) fn request(
         &mut self,
         runtime: &miliastra_kernel::ai::OpenAiRuntimeHandle,
@@ -1703,17 +1763,46 @@ impl ToolSession {
         timeout: std::time::Duration,
         allow_tools: bool,
     ) -> Result<AgentReply> {
+        let extra_body = self.request_extra_body();
+        let reasoning = self.target.reasoning;
+        let first = self.request_once(runtime, max_tokens, timeout, allow_tools, &extra_body);
+        match first {
+            // 与 `request_with_format` 同一套兜底：某些模型不接受思考强度字段，
+            // 会以 400 拒绝整个请求。只降级一次，避免掩盖真实错误。
+            Err(error)
+                if reasoning != ReasoningEffort::Unset
+                    && looks_like_reasoning_rejection(&error) =>
+            {
+                log::warn!(
+                    "模型「{}」不接受当前思考强度「{}」（步骤：工具调用请求），已去掉该字段自动重试一次；若重试仍失败则本轮对话失败：{error:#}",
+                    self.target.model,
+                    reasoning.as_wire_value().unwrap_or("未设置")
+                );
+                self.target.reasoning = ReasoningEffort::Unset;
+                let retried =
+                    self.request_once(runtime, max_tokens, timeout, allow_tools, &extra_body);
+                // 恢复调用点解析出的思考强度：同一个会话的后续轮次仍按原配置发出。
+                self.target.reasoning = reasoning;
+                retried
+            }
+            other => other,
+        }
+    }
+
+    fn request_once(
+        &mut self,
+        runtime: &miliastra_kernel::ai::OpenAiRuntimeHandle,
+        max_tokens: u32,
+        timeout: std::time::Duration,
+        allow_tools: bool,
+        extra_body: &HashMap<String, Value>,
+    ) -> Result<AgentReply> {
         let runtime = runtime.with_http_proxy(&self.http_proxy)?;
         match self.target.wire_api {
             WireApi::Responses => {
                 let request = self.responses_request(max_tokens, allow_tools)?;
                 let response = runtime
-                    .create_response(
-                        self.target.build_target()?,
-                        request,
-                        &self.target.extra_body,
-                        timeout,
-                    )?
+                    .create_response(self.target.build_target()?, request, extra_body, timeout)?
                     .wait()
                     .context("AI 工具请求失败")?;
                 if serde_json::to_value(&response)?["status"] != "completed" {
@@ -1731,12 +1820,7 @@ impl ToolSession {
                     serde_json::from_value(self.request_body(max_tokens, allow_tools)?)
                         .context("AI Chat Completions 工具请求无效")?;
                 let response = runtime
-                    .chat_completion(
-                        self.target.build_target()?,
-                        request,
-                        &self.target.extra_body,
-                        timeout,
-                    )?
+                    .chat_completion(self.target.build_target()?, request, extra_body, timeout)?
                     .wait()
                     .context("AI 工具请求失败")?;
                 let choice = response
@@ -2501,6 +2585,88 @@ mod tests {
         assert_eq!(
             merged_extra_body(&target)["reasoning"]["effort"],
             json!("minimal")
+        );
+    }
+
+    /// 回归：`ai_chat.reasoning` 必须真的随工具请求发出去。
+    ///
+    /// 思考强度不在请求体里，只能通过 `extra_body` 附加。工具会话曾经直接传
+    /// `target.extra_body`（用户手写部分），于是配置页标为 Live 的
+    /// `ai_chat.reasoning` 与 `ai.reasoning_rules` 在 AI 聊天主对话和 look
+    /// 识图里 100% 静默失效——只测 `merged_extra_body` 抓不到，因为漏的是调用点。
+    #[test]
+    fn tool_session_sends_the_resolved_reasoning_effort() {
+        let options = AiCallOptions::new("").with_reasoning(ReasoningEffort::High);
+
+        let responses = config("openai");
+        let session = ToolSession::with_history_options_and_image(
+            &responses,
+            &options,
+            "Persona",
+            Vec::new(),
+            "Question",
+            Vec::new(),
+            None,
+        )
+        .expect("responses session");
+        let extra = session.request_extra_body();
+        assert_eq!(
+            extra["reasoning"]["effort"],
+            json!("high"),
+            "Responses 工具请求必须带上思考强度，实际附加字段：{extra:?}"
+        );
+
+        let mut chat = config("openai");
+        chat.wire_api = WireApi::ChatCompletions;
+        let session = ToolSession::with_history_options_and_image(
+            &chat,
+            &options,
+            "Persona",
+            Vec::new(),
+            "Question",
+            Vec::new(),
+            None,
+        )
+        .expect("chat session");
+        let extra = session.request_extra_body();
+        assert_eq!(
+            extra["reasoning_effort"],
+            json!("high"),
+            "Chat Completions 工具请求必须带上思考强度，实际附加字段：{extra:?}"
+        );
+    }
+
+    /// 回归：配置与解析目标的 `Debug` 不得回显明文 API Key。
+    ///
+    /// `AiConfig` 会随错误上下文与断言进入日志；派生 `Debug` 会把 `api_key`
+    /// 原样写进日志文件，属于凭据泄露。这里只要求「看得见配了没有」。
+    #[test]
+    fn api_key_is_redacted_in_debug_output() {
+        let mut connection = config("openai");
+        connection.api_key = "sk-live-should-never-be-logged".to_string();
+        let text = format!("{connection:?}");
+        assert!(
+            !text.contains("sk-live-should-never-be-logged"),
+            "AiConfig 的调试输出不得包含明文 API Key，实际：{text}"
+        );
+        assert!(
+            text.contains("<已脱敏>"),
+            "脱敏字段必须写明「已脱敏」，否则读日志的人无法判断是否配了 key，实际：{text}"
+        );
+
+        let target = connection
+            .resolve_with(&AiCallOptions::new(""))
+            .expect("target");
+        let text = format!("{target:?}");
+        assert!(
+            !text.contains("sk-live-should-never-be-logged"),
+            "ResolvedAiTarget 的调试输出不得包含明文 API Key，实际：{text}"
+        );
+
+        let empty = AiConfig::default();
+        assert!(
+            format!("{empty:?}").contains("<未设置>"),
+            "未配置 key 时必须显示「未设置」，否则无法与「配了但脱敏」区分"
         );
     }
 

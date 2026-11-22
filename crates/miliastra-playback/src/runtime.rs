@@ -1054,6 +1054,9 @@ async fn run_commands(
                     Ok(completion) => completion
                         .result
                         .map(|receipt| {
+                            // 新曲确实开始播放：此刻才替换歌词状态，并取消旧曲
+                            // 仍在进行的歌词加载任务（避免为已切走的曲目空跑）。
+                            clear_lyric_state(&mut lyric_state);
                             let lyric_core = core.clone();
                             let generation = receipt.generation;
                             lyric_state = Some(LyricState::Loading {
@@ -1073,6 +1076,11 @@ async fn run_commands(
                         "playback resolution task failed: {error}"
                     ))),
                 };
+                if result.is_err() {
+                    // 新曲未起播：旧曲与其歌词状态保持原样。
+                    // 只记固定文案：错误正文可能含音源 URL/请求头，不得进日志。
+                    tracing::debug!("新曲未能起播，保留当前歌词状态");
+                }
                 let _ = play.reply.send(result);
                 continue;
             }
@@ -1133,7 +1141,10 @@ async fn run_commands(
                     &core,
                     "play request was superseded by a newer request",
                 );
-                clear_lyric_state(&mut lyric_state);
+                // 不在这里清歌词：新曲解析/加载可能失败，而失败时旧曲仍在播放。
+                // 无条件清空会让旧曲歌词永久消失（`toggle_lyrics` 还会返回
+                // NoActiveSession）。歌词状态只在「新曲真的起播」后替换
+                // （见 PlayCompleted 成功分支），失败路径保留旧歌词。
                 let resolver_locator = track.track_ref.resolver_locator.clone();
                 let play_core = core.clone();
                 let task_key = key.clone();
@@ -2242,6 +2253,48 @@ mod tests {
                 headers: BTreeMap::new(),
                 expires_at_epoch_ms: None,
             })
+        }
+    }
+
+    /// 可切换失败模式的假源：用于验证「切歌失败时旧曲歌词状态保留」。
+    struct ToggleFailSource {
+        fail_resolve: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl SourceAdapter for ToggleFailSource {
+        async fn search(
+            &self,
+            _spec: &SearchSpec,
+        ) -> Result<Vec<ProviderSearchCandidate>, CatalogError> {
+            Ok(Vec::new())
+        }
+
+        async fn resolve(
+            &self,
+            key: &SongKey,
+            _locator: Option<&crate::domain::ResolverLocator>,
+        ) -> Result<StreamSource, CatalogError> {
+            if key.id == "broken-track" && self.fail_resolve.load(Ordering::SeqCst) {
+                return Err(CatalogError::Unavailable("source is down".to_owned()));
+            }
+            Ok(StreamSource {
+                url: Url::parse("https://example.test/audio.m4a").unwrap(),
+                headers: BTreeMap::new(),
+                expires_at_epoch_ms: None,
+            })
+        }
+
+        async fn lyrics(
+            &self,
+            key: &SongKey,
+            _locator: Option<&crate::domain::ResolverLocator>,
+        ) -> Result<Option<TimedLyrics>, CatalogError> {
+            Ok(TimedLyrics::new(vec![TimedLyricLine {
+                start_ms: 1_000,
+                text: key.id.clone(),
+                translation: Some(format!("translated-{}", key.id)),
+            }]))
         }
     }
 
@@ -3551,6 +3604,64 @@ mod tests {
             handle.set_lyrics_translation(true),
             Err(PlaybackError::NoActiveSession)
         ));
+
+        runtime.shutdown().unwrap();
+    }
+
+    /// 回归（B19-P1-4）：新曲解析/起播失败时，旧曲歌词状态必须保留。
+    #[test]
+    fn failed_play_keeps_the_previous_lyrics_state() {
+        let fail_resolve = Arc::new(AtomicBool::new(false));
+        let runtime = test_runtime_with_catalog_and_lyrics_lead(
+            vec![(
+                ProviderId::QqMusic.to_string(),
+                Arc::new(ToggleFailSource {
+                    fail_resolve: fail_resolve.clone(),
+                }) as Arc<dyn SourceAdapter>,
+            )],
+            Arc::new(FakeEngine::new()),
+            CredentialStore::memory(),
+            Arc::new(RwLock::new(0.0)),
+        );
+        let handle = runtime.handle();
+
+        handle
+            .play(playable_track("track-1"))
+            .unwrap()
+            .wait()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let mut line = None;
+        while std::time::Instant::now() < deadline {
+            line = handle.snapshot().unwrap().lyric_line_text;
+            if line.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(line.as_deref(), Some("translated-track-1"));
+        assert!(handle.toggle_lyrics().is_ok());
+
+        // 新曲解析失败：旧曲仍在播放，歌词状态不得被清空。
+        fail_resolve.store(true, Ordering::SeqCst);
+        let failed = handle.play(playable_track("broken-track")).unwrap().wait();
+        assert!(failed.is_err(), "解析失败的播放请求必须失败");
+
+        // 失败路径不得让歌词状态消失（旧实现会走到 NoActiveSession）。
+        assert!(
+            handle.toggle_lyrics().is_ok(),
+            "切歌失败后 toggle_lyrics 不得返回 NoActiveSession"
+        );
+        assert_eq!(
+            handle.snapshot().unwrap().lyric_line_text.as_deref(),
+            Some("translated-track-1"),
+            "切歌失败后旧曲歌词必须继续可用"
+        );
+        // 旧曲仍在播放，track 不回退也不丢失。
+        assert_eq!(
+            handle.snapshot().unwrap().track,
+            Some(playable_track("track-1"))
+        );
 
         runtime.shutdown().unwrap();
     }

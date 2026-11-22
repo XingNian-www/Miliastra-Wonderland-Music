@@ -548,13 +548,18 @@ fn debug_http_read_only_actual_frame_mnn_evidence() {
     }
     let _restore = Restore(observer().enabled(), observer().state());
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let config = crate::config::AppConfig::load_from_root(
-        &root.join("tests/fixtures/config.full.yaml"),
-        root,
-    )
-    .unwrap();
+    // 这里原本用 `load_from_root(&root.join("tests/fixtures/config.full.yaml"), root)`：
+    // 它需要磁盘上的 YAML 文件，而 `tests/` 不入库，干净检出时该文件不存在。
+    // 因此配置源改为编译进二进制的 `bundled_config()`，再手动补上
+    // `load_from_root` 原本替我们做的两步路径解析（相对路径按 exe 根解析）。
+    let mut config = crate::config::bundled_config();
+    config.resolve_runtime_paths(root);
+    config.playback.normalize_audio_cache_paths(root);
     assert_eq!(config.ocr.min_confidence, 0.9);
-    assert_eq!(config.ocr.backend_priority, ["cpu"]);
+    // 断言随配置源改变：内置配置（与发布包 config.yaml 同源）的后端优先级是
+    // `[openvino, cpu]`（OpenVINO 优先、MNN CPU 兜底），旧夹具里是单一 `[cpu]`。
+    // 语义仍是"默认优先级最低档包含 CPU 兜底"，不是放宽断言。
+    assert_eq!(config.ocr.backend_priority, ["openvino", "cpu"]);
     let actual =
         image::open(root.join("technical-docs/actual-screenshot-test/live/live-01.png")).unwrap();
     let ui = crate::runtime::ui::UiRuntime::start_with_state_classifier(
@@ -6297,6 +6302,106 @@ mod memory_route_tests {
             assert!(!spec.mutating, "{path} 应为只读");
             assert!(spec.json, "{path} 应返回 JSON");
         }
+    }
+}
+
+/// 路由级回归（决策 5-a）：真实 HTTP 请求打到 `/debug/ui-catalogue`，
+/// 响应体不得出现 `image=` / `save=` 指定的路径或 `os error`。
+///
+/// helper 级用例只能证明 helper 没拼错误原文；真正会泄漏的地方是路由把它
+/// 交给 `AppError` 再经 `protocol.rs` 渲染成响应体。这里走完整链路。
+///
+/// `save=` 分支用「父目录存在但目标本身是个目录」制造真实的 EISDIR：
+/// `parent.is_dir()` 那道校验会放行，`image::save` 必然失败。
+mod debug_image_error_route_tests {
+    use super::{http_get, start_test_http_server, test_state};
+
+    #[test]
+    fn catalogue_image_errors_do_not_leak_paths_over_real_http() {
+        let mut state = test_state();
+        let server = start_test_http_server(&mut state, "secret");
+        let address = server.local_addr();
+
+        let missing = http_get(
+            address,
+            "/debug/ui-catalogue?image=/nonexistent/secret-probe/frame.png",
+            Some("secret"),
+        );
+        assert!(
+            missing.status_line.contains("404"),
+            "文件不存在应按 404 报，实际 {}",
+            missing.status_line
+        );
+        assert!(
+            !missing.body.contains("/nonexistent")
+                && !missing.body.contains("secret-probe")
+                && !missing.body.contains("os error")
+                && !missing.body.contains("No such file"),
+            "响应体不得回传路径或错误原文：{}",
+            missing.body
+        );
+
+        // save= 写失败：必须**先真的读到图**才会走到 save 分支，
+        // 所以这里先落一张真 PNG，再把 save 指向一个同名目录（真实 EISDIR）：
+        // `parent.is_dir()` 校验会放行，`image::save` 必然失败。
+        let root = std::env::temp_dir().join(format!("debug-save-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("create probe root");
+        let source = root.join("source.png");
+        image::DynamicImage::ImageLuma8(image::GrayImage::new(2, 2))
+            .save(&source)
+            .expect("write source png");
+        let blocked_target = root.join("blocked.png");
+        std::fs::create_dir(&blocked_target).expect("create dir at target path");
+        let body = http_get(
+            address,
+            &format!(
+                "/debug/ui-catalogue?image={}&save={}",
+                source.display(),
+                blocked_target.display()
+            ),
+            Some("secret"),
+        );
+        assert!(
+            body.status_line.contains("500"),
+            "写盘失败应是 500，实际 {}：{}",
+            body.status_line,
+            body.body
+        );
+        assert!(
+            !body.body.contains("debug-save-probe")
+                && !body.body.contains("os error")
+                && !body.body.contains("No such file")
+                && !body.body.contains("Is a directory"),
+            "save= 失败不得回传路径或 errcode：{}",
+            body.body
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        server.shutdown().expect("shutdown HTTP server");
+    }
+
+    /// `/debug/ui-state?image=` 走同一个出口，不能只有 catalogue 那条被覆盖。
+    #[test]
+    fn ui_state_image_errors_do_not_leak_paths_over_real_http() {
+        let mut state = test_state();
+        let server = start_test_http_server(&mut state, "secret");
+        let response = http_get(
+            server.local_addr(),
+            "/debug/ui-state?image=/nonexistent/secret-state/frame.png",
+            Some("secret"),
+        );
+        assert!(
+            response.status_line.contains("404"),
+            "文件不存在应按 404 报，实际 {}",
+            response.status_line
+        );
+        assert!(
+            !response.body.contains("/nonexistent")
+                && !response.body.contains("secret-state")
+                && !response.body.contains("os error"),
+            "响应体不得回传路径或错误原文：{}",
+            response.body
+        );
+        server.shutdown().expect("shutdown HTTP server");
     }
 }
 

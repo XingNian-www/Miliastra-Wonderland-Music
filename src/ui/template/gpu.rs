@@ -3,6 +3,8 @@
 use image::GrayImage;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant};
 
 use super::cpu::{GrayMatch, GrayMatcher, cpu_best_gray_match, cpu_best_gray_match_seeded, sad_at};
 
@@ -46,6 +48,51 @@ fn main_sad(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicAdd(&result_buf[gid.y * rw + gid.x], total);
 }
 "#;
+
+/// GPU 回读的最长等待时间。
+///
+/// TDR（驱动重置）、设备丢失或驱动 bug 都可能让 `map_async` 的回调永远不来；
+/// 没有上限时，逐帧分类线程会连同 `GPU_STATE` 全局锁一起永久挂起，
+/// 值守循环表现为“机器人不再响应”，且没有任何日志（B16-P1-5）。
+/// 超时后本次运行改走 CPU（见 [`gpu_best_position`]），不再尝试 GPU。
+pub(super) const GPU_READBACK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// 回读等待期间驱动 `poll` 的间隔：既能让回调尽快被调度，又不空转。
+pub(super) const GPU_READBACK_POLL_SLICE: Duration = Duration::from_millis(5);
+
+/// 等待 `map_async` 回调的三种结局。
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum MapWait<T> {
+    /// 回调到达（`T` 是驱动回调的返回值）。
+    Received(T),
+    /// 超过时限仍未到达。
+    TimedOut,
+    /// 发送端已断开（回调被丢弃）。
+    Disconnected,
+}
+
+/// 有界等待一次异步映射回调；每轮先驱动一次 `poll`，再短超时收包。
+///
+/// 把 `poll` 作为回调传进来，测试可以不建真实 wgpu 设备就验证“不会无限等待”。
+pub(super) fn wait_for_map_completion<T>(
+    receiver: &Receiver<T>,
+    mut poll: impl FnMut(),
+    timeout: Duration,
+) -> MapWait<T> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        poll();
+        match receiver.recv_timeout(GPU_READBACK_POLL_SLICE) {
+            Ok(value) => return MapWait::Received(value),
+            Err(RecvTimeoutError::Timeout) => {
+                if Instant::now() >= deadline {
+                    return MapWait::TimedOut;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => return MapWait::Disconnected,
+        }
+    }
+}
 
 /// 进程内复用的 GPU 匹配器：设备、管线与缓冲只创建一次。
 ///
@@ -358,8 +405,31 @@ impl GpuSearcher {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = sender.send(result);
         });
-        self.device.poll(wgpu::Maintain::Wait);
-        receiver.recv().ok()?.ok()?;
+        // 有界等待：驱动重置/设备丢失时回调可能永远不来，绝不能无界阻塞。
+        match wait_for_map_completion(
+            &receiver,
+            || {
+                let _ = self.device.poll(wgpu::Maintain::Poll);
+            },
+            GPU_READBACK_TIMEOUT,
+        ) {
+            MapWait::Received(Ok(())) => {}
+            MapWait::Received(Err(error)) => {
+                log::warn!("GPU 模板匹配回读失败（原因：{error}），本次运行改用 CPU 计算");
+                return None;
+            }
+            MapWait::TimedOut => {
+                log::warn!(
+                    "GPU 模板匹配回读超过 {} 秒仍未完成（驱动可能已重置或设备丢失），本次运行改用 CPU 计算",
+                    GPU_READBACK_TIMEOUT.as_secs()
+                );
+                return None;
+            }
+            MapWait::Disconnected => {
+                log::warn!("GPU 模板匹配回读回调被丢弃，本次运行改用 CPU 计算");
+                return None;
+            }
+        }
         let data = slice.get_mapped_range();
         let values: Vec<u32> = data
             .chunks_exact(4)
@@ -422,17 +492,28 @@ pub(super) fn gpu_best_position(
             }
         };
     }
-    let GpuState::Ready(searcher) = &mut *guard else {
+    let values = {
+        let GpuState::Ready(searcher) = &mut *guard else {
+            return None;
+        };
+
+        let input: Vec<u32> = haystack.as_raw().iter().map(|v| *v as u32).collect();
+        let needle: Vec<u32> = matcher.gray.as_raw().iter().map(|v| *v as u32).collect();
+        // 按位置数把模板行分片：位置越少，每个位置分到的线程越多，避免 GPU 欠载。
+        let chunks = (GPU_TARGET_THREADS / positions.max(1)).clamp(1, 256) as u32;
+        let chunk_rows = th.div_ceil(chunks);
+        let dims = [iw, ih, tw, th, 0, 0, chunks, chunk_rows];
+        searcher.search(&input, &needle, dims)
+    };
+    let Some(values) = values else {
+        // 回读失败/超时：把 GPU 置为不可用并释放设备（含可能仍挂起的映射），
+        // 后续帧直接走 CPU，不再让分类线程赌驱动的恢复速度。
+        log::warn!(
+            "GPU 模板匹配已停用：回读失败或超时，后续改用 CPU 计算（大区域匹配会比 GPU 慢）"
+        );
+        *guard = GpuState::Unavailable;
         return None;
     };
-
-    let input: Vec<u32> = haystack.as_raw().iter().map(|v| *v as u32).collect();
-    let needle: Vec<u32> = matcher.gray.as_raw().iter().map(|v| *v as u32).collect();
-    // 按位置数把模板行分片：位置越少，每个位置分到的线程越多，避免 GPU 欠载。
-    let chunks = (GPU_TARGET_THREADS / positions.max(1)).clamp(1, 256) as u32;
-    let chunk_rows = th.div_ceil(chunks);
-    let dims = [iw, ih, tw, th, 0, 0, chunks, chunk_rows];
-    let values = searcher.search(&input, &needle, dims)?;
 
     let rw = (iw - tw + 1) as usize;
     let mut best = u32::MAX;
@@ -460,4 +541,40 @@ pub(crate) fn best_gray_match(
         return cpu_best_gray_match_seeded(haystack, matcher, Some(GrayMatch { x, y, sad }));
     }
     cpu_best_gray_match(haystack, matcher)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// B16-P1-5：回调永远不来时必须按期限返回，不能永久阻塞分类线程。
+    #[test]
+    fn readback_wait_times_out_instead_of_blocking_forever() {
+        let (_sender, receiver) = std::sync::mpsc::channel::<()>();
+        let started = Instant::now();
+        let outcome = wait_for_map_completion(&receiver, || {}, Duration::from_millis(40));
+        assert_eq!(outcome, MapWait::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "有界等待必须按期限退出，实际耗时 {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn readback_wait_receives_the_driver_result() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(Ok::<(), wgpu::BufferAsyncError>(())).unwrap();
+        let outcome = wait_for_map_completion(&receiver, || {}, Duration::from_millis(500));
+        assert_eq!(outcome, MapWait::Received(Ok(())));
+    }
+
+    /// 设备丢失时回调可能被直接丢弃（发送端断开），也必须立即返回。
+    #[test]
+    fn readback_wait_reports_a_dropped_callback() {
+        let (sender, receiver) = std::sync::mpsc::channel::<()>();
+        drop(sender);
+        let outcome = wait_for_map_completion(&receiver, || {}, Duration::from_millis(500));
+        assert_eq!(outcome, MapWait::Disconnected);
+    }
 }

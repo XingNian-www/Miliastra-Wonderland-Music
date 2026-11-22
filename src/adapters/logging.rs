@@ -88,58 +88,57 @@ impl Log for FileLogger {
             format_prefix_at(record.level(), now),
             record.args()
         );
-        let mut files = match self.files.lock() {
-            Ok(files) => files,
-            Err(_) => {
-                self.write_fallback("日志文件锁已损坏，本条日志未写入文件");
-                return;
-            }
-        };
-        if let Err(error) =
-            files.rotate_if_needed(&self.log_dir, self.rotate_daily, self.retain_days, now)
-        {
-            self.write_fallback(&format!("日志轮转失败，继续写入当前文件: {error:#}"));
-        }
-        if is_timing_target(record.target()) {
-            // 性能日志写入失败**刻意静默**：
-            //
-            // 它是给脚本做性能分析的字段流，不是排障依据——真正需要排障时看主日志。
-            // 而且它与主日志同目录同磁盘，一旦磁盘写满，它会和主日志一起失败；
-            // 若这里也走 fallback，就变成「同一故障在 stderr 上重复两遍」，只会刷屏。
-            // 主日志那条 fallback 已经足以告知用户「日志写不进去了」。
-            let _ = files.timing.write_all(format!("{line}\n").as_bytes());
-            return;
-        }
-        // 敏感 target（如完整 Web 访问令牌）只进 TUI/stderr，文件日志不落盘。
+        // 敏感 target（如完整 Web 访问令牌）只进 TUI/stderr、**不落盘**。
+        // 判定必须发生在拿文件锁之前：这类日志根本不需要文件，没有理由排在全局
+        // 文件锁后面；而且锁一旦损坏，旧实现会走进「只写 stderr」的兜底，
+        // 于是这条敏感日志连 TUI 日志页都看不到。
         if is_file_hidden_target(record.target()) {
-            if let Ok(monitor) = self.monitor.lock()
-                && let Some(monitor) = monitor.as_ref()
-            {
-                monitor.push(line.clone());
-            }
-            if self.stderr.load(Ordering::Relaxed) {
-                let _ = std::io::stderr().write_all(format!("{line}\n").as_bytes());
-            }
+            self.push_monitor(&line);
+            self.write_stderr(&line);
             return;
         }
 
-        if !is_monitor_hidden_target(record.target())
-            && let Ok(monitor) = self.monitor.lock()
-            && let Some(monitor) = monitor.as_ref()
+        let timing = is_timing_target(record.target());
+        let mut fallback = None;
         {
-            monitor.push(line.clone());
+            let mut files = match self.files.lock() {
+                Ok(files) => files,
+                Err(_) => {
+                    self.write_fallback("日志文件锁已损坏，本条日志未写入文件");
+                    return;
+                }
+            };
+            if let Err(error) =
+                files.rotate_if_needed(&self.log_dir, self.rotate_daily, self.retain_days, now)
+            {
+                fallback = Some(format!("日志轮转失败，继续写入当前文件: {error:#}"));
+            }
+            if timing {
+                // 性能日志写入失败**刻意静默**：
+                //
+                // 它是给脚本做性能分析的字段流，不是排障依据——真正需要排障时看主日志。
+                // 而且它与主日志同目录同磁盘，一旦磁盘写满，它会和主日志一起失败；
+                // 若这里也走 fallback，就变成「同一故障在 stderr 上重复两遍」，只会刷屏。
+                // 主日志那条 fallback 已经足以告知用户「日志写不进去了」。
+                let _ = files.timing.write_all(format!("{line}\n").as_bytes());
+            } else if let Err(error) = files.main.write_all(format!("{line}\n").as_bytes()) {
+                // 主日志写不进去时，用户会在日志里看到「什么都没有」，
+                // 无法区分「没发生」与「没写进去」——而这正是最需要日志的时刻。
+                // 因此必须显式告知：写到大日志失败这件事本身要出现在 stderr/monitor 上。
+                fallback = Some(format!(
+                    "日志写入失败（步骤：追加到当日日志文件），本条及后续日志可能丢失；请检查磁盘空间与文件权限：{error:#}"
+                ));
+            }
+            // 文件锁在这里释放：monitor / stderr / 兜底都不该排在全局文件锁后面。
         }
-        if self.stderr.load(Ordering::Relaxed) {
-            // stderr 自身写失败不做任何补救：它是最后的出路，坏了就没有别的通道了。
-            let _ = std::io::stderr().write_all(format!("{line}\n").as_bytes());
+        if !timing && !is_monitor_hidden_target(record.target()) {
+            self.push_monitor(&line);
         }
-        if let Err(error) = files.main.write_all(format!("{line}\n").as_bytes()) {
-            // 主日志写不进去时，用户会在日志里看到「什么都没有」，
-            // 无法区分「没发生」与「没写进去」——而这正是最需要日志的时刻。
-            // 因此必须显式告知：写到大日志失败这件事本身要出现在 stderr 上。
-            self.write_fallback(&format!(
-                "日志写入失败（步骤：追加到当日日志文件），本条及后续日志可能丢失；请检查磁盘空间与文件权限：{error:#}"
-            ));
+        if !timing {
+            self.write_stderr(&line);
+        }
+        if let Some(message) = fallback {
+            self.write_fallback(&message);
         }
     }
 
@@ -162,15 +161,52 @@ impl FileLogger {
     /// 而这里没有级别过滤，不节流会把 stderr 刷爆、把真正有用的几行挤走。
     /// 窗口内的重复故障静默（第一次已经告诉过用户了），窗口过后再提示一次。
     fn write_fallback(&self, message: &str) {
-        if !self.stderr.load(Ordering::Relaxed) {
+        // 兜底出口有两个：stderr（启动早期与回退普通输出）和 monitor（TUI 日志页）。
+        // TUI 全屏启动后 stderr 会被 [`set_stderr`] 关闭，旧实现在这里直接返回，
+        // 结果「日志写不进文件」这条最关键的告警在 TUI 里彻底消失——用户看到日志页
+        // 一片空白，分不清「没发生」与「没写进去」。两个出口都不可用时才放弃。
+        let stderr_enabled = self.stderr.load(Ordering::Relaxed);
+        let monitor = self
+            .monitor
+            .lock()
+            .ok()
+            .and_then(|monitor| monitor.as_ref().cloned());
+        if !stderr_enabled && monitor.is_none() {
             return;
         }
         if !self.should_emit_fallback(Instant::now()) {
             return;
         }
-        let prefix = format_prefix_at(log::Level::Warn, SystemTime::now());
-        let _ = std::io::stderr()
-            .write_all(format!("{prefix} {message}；同类错误在 60 秒内不再重复\n").as_bytes());
+        let line = format!(
+            "{} {message}；同类错误在 60 秒内不再重复",
+            format_prefix_at(log::Level::Warn, SystemTime::now())
+        );
+        if stderr_enabled {
+            let _ = std::io::stderr().write_all(format!("{line}\n").as_bytes());
+        }
+        if let Some(monitor) = monitor {
+            monitor.push(line);
+        }
+    }
+
+    /// 把一条日志推到 TUI 日志页（monitor 未附加时静默跳过）。
+    ///
+    /// 调用点必须**不持有** `files` 锁：monitor 是单独的锁，且它不该被文件日志的
+    /// 全局串行点拖住。
+    fn push_monitor(&self, line: &str) {
+        if let Ok(monitor) = self.monitor.lock()
+            && let Some(monitor) = monitor.as_ref()
+        {
+            monitor.push(line.to_owned());
+        }
+    }
+
+    /// 写一行到 stderr（TUI 全屏启动后由 [`set_stderr`] 关闭）。
+    fn write_stderr(&self, line: &str) {
+        if self.stderr.load(Ordering::Relaxed) {
+            // stderr 自身写失败不做任何补救：它是最后的出路，坏了就没有别的通道了。
+            let _ = std::io::stderr().write_all(format!("{line}\n").as_bytes());
+        }
     }
 
     /// 兜底输出是否应当真正发生（节流判定）。
@@ -366,10 +402,27 @@ fn log_paths_for_day(log_dir: &Path, day: i64, rotate_daily: bool) -> Result<(Pa
 }
 
 fn cleanup_old_daily_logs(log_dir: &Path, today: i64, retain_days: u32) -> Result<()> {
+    cleanup_old_daily_logs_with(log_dir, today, retain_days, |path| {
+        fs::remove_file(path).with_context(|| format!("删除过期日志「{}」", path.display()))
+    })
+}
+
+/// 清理实现（`remove` 可注入仅为了单测失败路径）。
+///
+/// 单个文件删不掉（被占用、权限不足）不能中断其余文件的清理：旧实现在
+/// `fs::remove_file(&path)?` 处直接返回，一次占用就让后面所有过期日志继续堆着。
+/// 这里记下**第一个**错误并继续遍历，最后再交给调用方写日志。
+fn cleanup_old_daily_logs_with(
+    log_dir: &Path,
+    today: i64,
+    retain_days: u32,
+    mut remove: impl FnMut(&Path) -> Result<()>,
+) -> Result<()> {
     if retain_days == 0 {
         return Ok(());
     }
     let oldest_day = today - i64::from(retain_days.saturating_sub(1));
+    let mut first_error: Option<anyhow::Error> = None;
     for entry in
         fs::read_dir(log_dir).with_context(|| format!("读取日志目录「{}」", log_dir.display()))?
     {
@@ -390,12 +443,17 @@ fn cleanup_old_daily_logs(log_dir: &Path, today: i64, retain_days: u32) -> Resul
         else {
             continue;
         };
-        if day < oldest_day {
-            fs::remove_file(&path)
-                .with_context(|| format!("删除过期日志「{}」", path.display()))?;
+        if day < oldest_day
+            && let Err(error) = remove(&path)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
         }
     }
-    Ok(())
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 fn daily_log_day(name: &str) -> Option<i64> {
@@ -514,6 +572,40 @@ fn is_file_hidden_target(target: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::monitor::MonitorShared;
+
+    fn temporary_log_dir(name: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "miliastra-logging-{name}-{}-{suffix}",
+            std::process::id()
+        ))
+    }
+
+    /// 用真实文件 + 真实 monitor sink 构造日志器，供兜底/monitor 用例复用。
+    fn test_logger(log_dir: &Path, monitor: Option<MonitorLogSink>, stderr: bool) -> FileLogger {
+        let now = SystemTime::now();
+        let (main_path, timing_path) = log_paths_for_day(log_dir, local_day(now), false).unwrap();
+        FileLogger {
+            files: Mutex::new(LogFiles {
+                day: local_day(now),
+                main_path: main_path.clone(),
+                timing_path: timing_path.clone(),
+                main: open_append_file(&main_path, "日志").unwrap(),
+                timing: open_append_file(&timing_path, "性能日志").unwrap(),
+            }),
+            log_dir: log_dir.to_path_buf(),
+            rotate_daily: false,
+            retain_days: 1,
+            level: LevelFilter::Trace,
+            monitor: Mutex::new(monitor),
+            stderr: AtomicBool::new(stderr),
+            fallback_last_emitted: Mutex::new(None),
+        }
+    }
 
     /// 行前缀形状：`[月-日 时:分:秒] 级别`（**不含尾随空格**）。
     ///
@@ -775,6 +867,127 @@ mod tests {
             !logger.should_emit_fallback(Instant::now()),
             "窗口内第二次兜底必须被抑制"
         );
+    }
+
+    /// B01-P1-13 回归：某个过期日志删不掉（被占用/权限不足）时必须继续清理其余
+    /// 文件。旧实现在 `fs::remove_file(&path)?` 处直接返回，一次占用就让后面所有
+    /// 过期日志继续堆着。
+    #[test]
+    fn expired_log_cleanup_continues_after_a_failed_removal() {
+        let directory = temporary_log_dir("cleanup");
+        fs::create_dir_all(&directory).unwrap();
+        for stamp in ["2020-01-01", "2020-01-02", "2020-01-03"] {
+            fs::write(
+                directory.join(format!("miliastra-wonderland-music-{stamp}.log")),
+                b"old",
+            )
+            .unwrap();
+        }
+        let today = days_from_civil(2026, 7, 11).unwrap();
+        let mut attempted = Vec::new();
+        let error = cleanup_old_daily_logs_with(&directory, today, 1, |path| {
+            attempted.push(path.file_name().unwrap().to_owned());
+            anyhow::bail!("模拟删除失败")
+        })
+        .expect_err("删除失败必须报告给调用方");
+        assert_eq!(
+            attempted.len(),
+            3,
+            "单个文件删除失败不得中断其余清理，实际只尝试了 {attempted:?}: {error:#}"
+        );
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// B01-P1-13 回归：stderr 关闭（TUI 全屏）后，写文件失败这条兜底告警必须进
+    /// TUI 日志页；旧实现在 stderr 关闭时直接 return，告警彻底消失。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn write_failure_fallback_reaches_monitor_when_stderr_is_disabled() {
+        // /dev/full：任何写入都返回 ENOSPC，正好模拟磁盘满。
+        let Ok(device) = OpenOptions::new().write(true).open("/dev/full") else {
+            eprintln!("跳过：当前环境没有 /dev/full");
+            return;
+        };
+        let Ok(timing_device) = OpenOptions::new().write(true).open("/dev/full") else {
+            eprintln!("跳过：当前环境没有 /dev/full");
+            return;
+        };
+        let monitor = MonitorShared::new(20);
+        let now = SystemTime::now();
+        let logger = FileLogger {
+            files: Mutex::new(LogFiles {
+                day: local_day(now),
+                main_path: PathBuf::from("/dev/full"),
+                timing_path: PathBuf::from("/dev/full"),
+                main: device,
+                timing: timing_device,
+            }),
+            log_dir: PathBuf::from("/tmp"),
+            rotate_daily: false,
+            retain_days: 1,
+            level: LevelFilter::Trace,
+            monitor: Mutex::new(Some(monitor.log_sink())),
+            stderr: AtomicBool::new(false),
+            fallback_last_emitted: Mutex::new(None),
+        };
+        let message = "磁盘已满导致本条日志未写入文件";
+        let args = format_args!("{message}");
+        let record = log::Record::builder()
+            .args(args)
+            .level(log::Level::Info)
+            .target("miliastra_wonderland_music::test")
+            .build();
+        logger.log(&record);
+        let logs = monitor.snapshot().logs;
+        assert!(
+            logs.iter().any(|line| line.contains("日志写入失败")),
+            "stderr 关闭时兜底告警必须进 TUI 日志页: {logs:?}"
+        );
+        assert!(
+            logs.iter().any(|line| line.contains(message)),
+            "常规日志行也应在 monitor 中: {logs:?}"
+        );
+        monitor.shutdown();
+    }
+
+    /// B01-P1-13 回归：`is_file_hidden_target` 的判定必须在拿文件锁之前。
+    ///
+    /// 文件锁损坏（poisoned）时，这条不落盘的敏感日志仍应进 TUI 日志页；旧实现
+    /// 先抢文件锁，失败后走「只写 stderr」的兜底，禁用 stderr 的 TUI 里什么都看不到。
+    #[test]
+    fn hidden_target_reaches_monitor_even_when_the_file_lock_is_poisoned() {
+        let directory = temporary_log_dir("poisoned");
+        fs::create_dir_all(&directory).unwrap();
+        let monitor = MonitorShared::new(20);
+        let logger = test_logger(&directory, Some(monitor.log_sink()), false);
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = logger.files.lock().expect("锁未损坏时应当能拿到");
+            panic!("故意 panic，让 files 锁进入 poisoned 状态");
+        }));
+        assert!(poisoned.is_err(), "测试自身应当触发 panic");
+        assert!(logger.files.is_poisoned(), "files 锁应已损坏");
+        let message = "访问令牌刷新失败";
+        let args = format_args!("{message}");
+        let record = log::Record::builder()
+            .args(args)
+            .level(log::Level::Warn)
+            .target("web_token")
+            .build();
+        logger.log(&record);
+        let logs = monitor.snapshot().logs;
+        assert!(
+            logs.iter().any(|line| line.contains(message)),
+            "锁损坏时敏感 target 仍应进 TUI 日志页: {logs:?}"
+        );
+        let (main_path, _) =
+            log_paths_for_day(&directory, local_day(SystemTime::now()), false).unwrap();
+        let written = fs::read_to_string(&main_path).unwrap();
+        assert!(
+            !written.contains(message),
+            "敏感 target 不得落盘: {written}"
+        );
+        monitor.shutdown();
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

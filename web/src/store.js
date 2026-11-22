@@ -1,9 +1,10 @@
 import { reactive } from 'vue'
-import { AuthError, clearToken, getJson, readToken, request, requestJson, writeToken } from './api.js'
+import { AuthError, clearToken, getJson, migrateLegacyToken, readToken, request, requestJson, writeToken } from './api.js'
 import { friendlyError } from './util/format.js'
 
 export const state = reactive({
-  token: readToken(),
+  // 启动时做一次旧版 localStorage 副本的迁移/清理；之后令牌只来自 cookie / 内存。
+  token: migrateLegacyToken(),
   route: 'config',
   message: { text: '', kind: '' },
   busy: false,

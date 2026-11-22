@@ -1,4 +1,5 @@
 import { ref } from 'vue'
+import { state } from './store.js'
 
 export const ROUTES = [
   { key: 'overview', label: '总览', group: '监控', icon: '<rect x="3" y="3" width="7" height="9" rx="1.6"/><rect x="14" y="3" width="7" height="5" rx="1.6"/><rect x="14" y="12" width="7" height="9" rx="1.6"/><rect x="3" y="16" width="7" height="5" rx="1.6"/>' },
@@ -21,6 +22,116 @@ export const NAV_GROUPS = ['监控', '游戏', '智能', '系统']
 
 export const currentRoute = ref('config')
 
+/* ============================================================================
+ * 未保存修改的离开保护
+ *
+ * 页面有三种方式让守卫知道「我有未保存修改」，按优先级：
+ *   1. 主动注册：registerDirtySource(id, { label, dirty(), blocksNavigation? })。
+ *      站内切页（导航按钮 / 前进后退 / 手改 hash）由 confirmLeave() 先 confirm；
+ *      关标签刷新由 App.vue 的 beforeunload 读 hasUnsavedChanges()。
+ *      页面自己缓存了草稿、切页不会丢时可以传 blocksNavigation: false：
+ *      仍参与 beforeunload（刷新确实会丢），但不用假警告拦站内切页。
+ *   2. 写全局 state.dirty：只有当前路由在 STORE_DIRTY_ROUTES 里才采用，
+ *      避免别的页面留下的脏键把导航永久锁死（AI 配置页不需要改代码）。
+ *   3. 只在组件里挂 beforeunload（身份映射）：confirmLeave 派发一次合成事件探底，
+ *      见 pageProtectsUnload。
+ * 注意：第 3 种只能覆盖 beforeunload 已在管的那部分状态；页面里没进 beforeunload
+ * 判据的脏数据（例如身份页的 jsonDirty）仍然看不见，需要改那个页面。
+ * ========================================================================== */
+const dirtySources = new Map()
+
+/**
+ * 会把脏标记写进 store.state.dirty 的页面。
+ * 只有当前路由在这个集合里时，才拿 state.dirty 当兜底判据——否则「AI 配置页改完
+ * 没保存就离开」留下的脏键会让每一页都误报「有未保存修改」，把导航锁死。
+ */
+const STORE_DIRTY_ROUTES = new Set(['aiconfig', 'config'])
+
+/** 注册一个页面级脏标记来源；返回注销函数（组件卸载时调用）。 */
+export function registerDirtySource(id, source) {
+  if (!id || !source || typeof source.dirty !== 'function') return () => {}
+  dirtySources.set(id, source)
+  return () => {
+    if (dirtySources.get(id) === source) dirtySources.delete(id)
+  }
+}
+
+/** 有未保存修改的来源列表：`[{ id, label, count, blocksNavigation }]`；空数组表示干净。 */
+export function unsavedSources() {
+  const sources = []
+  for (const [id, source] of dirtySources) {
+    let count = 0
+    try {
+      count = Math.max(0, Number(source.dirty()) || 0)
+    } catch (error) {
+      // 页面状态异常不应该把用户锁死在当前页：当作干净处理，交给该页面自己的提示。
+      count = 0
+    }
+    if (count > 0) {
+      sources.push({
+        id,
+        label: source.label || id,
+        count,
+        blocksNavigation: source.blocksNavigation !== false,
+      })
+    }
+  }
+  if (sources.length) return sources
+  if (!STORE_DIRTY_ROUTES.has(currentRoute.value)) return []
+  const stored = Object.keys(state.dirty).length
+  if (!stored) return []
+  const route = ROUTES.find((item) => item.key === currentRoute.value)
+  return [{ id: 'store.dirty', label: route ? route.label : '当前页面', count: stored, blocksNavigation: true }]
+}
+
+export function hasUnsavedChanges() {
+  return unsavedSources().length > 0
+}
+
+/**
+ * 兜底探测：给「只在自己组件里注册 beforeunload」的页面（如身份映射）用。
+ *
+ * 不读 DOM、也不要求那些页面改代码：派发一个**合成的** beforeunload 事件，
+ * 有脏数据的页面会在自己的处理器里 `preventDefault()`，于是 defaultPrevented 为真。
+ * 合成事件不会弹出浏览器对话框，也不会真的卸载页面；处理器里只做 preventDefault。
+ * 递归保护：App.vue 的全局 beforeunload 也会走到这里，用 probing 短路避免无限递归。
+ */
+let probing = false
+
+function pageProtectsUnload() {
+  if (probing) return false
+  if (typeof window === 'undefined' || typeof window.dispatchEvent !== 'function') return false
+  if (typeof Event !== 'function') return false
+  probing = true
+  try {
+    const event = new Event('beforeunload', { cancelable: true })
+    window.dispatchEvent(event)
+    return event.defaultPrevented === true
+  } catch (error) {
+    return false
+  } finally {
+    probing = false
+  }
+}
+
+/** 离开当前页前的确认；返回 true 表示可以走。 */
+export function confirmLeave(nextRoute) {
+  const all = unsavedSources()
+  const sources = all.filter((source) => source.blocksNavigation)
+  const target = ROUTES.find((item) => item.key === nextRoute)
+  const where = target ? `「${target.label}」` : '其他页面'
+  if (sources.length) {
+    const labels = sources.map((source) => `「${source.label}」`).join('、')
+    return window.confirm(`${labels}有未保存的修改，离开到${where}后可能丢失。\n\n确定离开？`)
+  }
+  // 没有任何注册来源时才探底：注册过（哪怕不拦切页）的页面自己的状态已经问过了，
+  // 再去派发事件只会把「切页本来不会丢」的草稿也判成脏。
+  if (all.length || !pageProtectsUnload()) return true
+  const current = ROUTES.find((item) => item.key === currentRoute.value)
+  const label = current ? `「${current.label}」` : '当前页面'
+  return window.confirm(`${label}有未保存的修改，离开到${where}后可能丢失。\n\n确定离开？`)
+}
+
 export function routeFromHash() {
   const raw = String(location.hash || '').replace(/^#\/?/, '').split('?')[0]
   return ROUTES.some((route) => route.key === raw) ? raw : 'config'
@@ -32,8 +143,15 @@ export function applyRoute(route) {
   if (location.hash !== hash) history.replaceState(null, '', hash)
 }
 
-export function navigateTo(route) {
-  if (!ROUTES.some((item) => item.key === route)) return
+/**
+ * 程序内切页的唯一入口。
+ * 目标页有未保存修改时先 confirm；取消则保持原页（返回 false）。
+ * `options.force` 只给「确定要丢弃修改」的调用方用，常规页面不要传。
+ */
+export function navigateTo(route, options = {}) {
+  if (!ROUTES.some((item) => item.key === route)) return false
+  if (!options.force && route !== currentRoute.value && !confirmLeave(route)) return false
   currentRoute.value = route
   if (location.hash !== `#${route}`) location.hash = `#${route}`
+  return true
 }

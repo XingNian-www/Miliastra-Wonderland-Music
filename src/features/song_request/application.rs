@@ -901,7 +901,9 @@ impl SongRequestExecution<'_> {
         song: &SongCommand,
         include_configuration_hint: bool,
     ) -> Result<Option<ResolvedSongRequest>> {
-        let label = song_label(song);
+        // 回执/日志里给玩家看的名字：走统一的 `source_display_name`
+        // （备注优先、绝不外泄 UID/备注串），不是裸 `source_label`。
+        let label = self.source_display_name(song);
         if !self.require_ai_command()? {
             return Ok(None);
         }
@@ -1368,7 +1370,7 @@ impl SongRequestExecution<'_> {
                 Ok(picked) => picked,
                 Err(error) => {
                     self.report_player_search_failure(
-                        &song_label(song),
+                        &self.source_display_name(song),
                         "换源后的点歌候选搜索失败",
                         &error,
                     )?;
@@ -1383,9 +1385,10 @@ impl SongRequestExecution<'_> {
         let Some(picked) = picked else {
             // 换源后仍无音源时同样给出本地曲库推荐；本地推荐是独立流程，
             // 超时按「跳过」处理，不会自动播放。
+            let label = self.source_display_name(song);
             match self.prompt_without_online_candidate(
-                &song_label(song),
-                &format!("{}换源后仍无音源", song_label(song)),
+                &label,
+                &format!("{label}换源后仍无音源"),
                 &song.keyword,
                 self.source_allowed("bilibili"),
                 true,
@@ -1414,13 +1417,20 @@ impl SongRequestExecution<'_> {
                 }
             }
         };
-        let actions = if self.ai.enabled() {
+        // **`@换源` 路径同样只对有权玩家展示 `@AI`**（B09-P1-6）。
+        //
+        // 旧实现只判 `self.ai.enabled()`，与主搜索路径
+        // （`self.ai.enabled() && self.ai_command_allowed()`）不一致：没有 AI 权限
+        // 的玩家在换源候选里看到 `@AI`，点下去落到下面的默认取消分支，
+        // 静默什么也不发生——既没执行也没提示权限不足。
+        let allow_ai = self.ai.enabled() && self.ai_command_allowed();
+        let actions = if allow_ai {
             "@确认@跳过@换源@AI@选择"
         } else {
             "@确认@跳过@换源@选择"
         };
         let prompt = decision_track_line(
-            &format!("{}搜索到:", song_label(song)),
+            &format!("{}搜索到:", self.source_display_name(song)),
             &format!(",{actions}"),
             &picked.candidate,
         );
@@ -1428,7 +1438,7 @@ impl SongRequestExecution<'_> {
             &[prompt],
             &picked.candidate_snapshot,
             true,
-            self.ai.enabled(),
+            allow_ai,
             false,
             true,
         )?;
@@ -1472,8 +1482,19 @@ impl SongRequestExecution<'_> {
             SongRequestDecision::Ai if self.ai.enabled() && self.ai_command_allowed() => {
                 self.resolve_and_confirm_song_ai(song)
             }
+            // 玩家没有 AI 权限却点了 `@AI`：与主搜索路径一样**明确拒绝**，
+            // 而不是落进下面的通用取消分支静默返回（B09-P1-6）。
+            SongRequestDecision::Ai => {
+                if !self.ai_command_allowed() {
+                    self.require_ai_command()?;
+                }
+                log::info!(
+                    "点歌「{}」未执行：AI 点歌当前不可用（未启用或无权限）",
+                    song.keyword
+                );
+                Ok(None)
+            }
             SongRequestDecision::Stopped
-            | SongRequestDecision::Ai
             | SongRequestDecision::Select
             | SongRequestDecision::Cancelled
             | SongRequestDecision::LocalLibrary => {
@@ -2347,10 +2368,6 @@ fn alternate_music_source(source: &str) -> &'static str {
     } else {
         SongSource::Netease.as_str()
     }
-}
-
-fn song_label(song: &SongCommand) -> String {
-    source_label(&song.friend_username)
 }
 
 /// 来源前缀：好友私聊点歌保留「好友X」标识，但**不带冒号**——下游文案
@@ -3933,13 +3950,145 @@ mod tests {
         assert_eq!(source_label(""), "");
         assert_eq!(source_label("  "), "");
         assert_eq!(source_label("Alice"), "好友Alice ");
+        // `source_label` 只负责渲染**已归一化**的展示名；调用方必须先过
+        // `source_display_name`，不能直接把 `friend_username` 传进来。
         // 大厅命令的 friend_username 为空 → 结果直接是 `搜索到: …`。
-        assert_eq!(song_label(&command()), "");
+        //
+        // **不再有 `song_label`**（B09-P1-1）：它直接拿 `song.friend_username`
+        // 做前缀，而那是**数据身份**（参与 lock_key），外部聊天源下就是 9 位 UID、
+        // OCR 源下是随机备注串——渲染进大厅回执等于把内部键/备注串念给全大厅。
+        // 所有回执统一走 `SongRequestExecution::source_display_name`（记忆法：
+        // 显示名优先、绝不透传原始身份键），由 `friend_source_labels_never_leak_ids`
+        // 用端到端断言钉住。
+    }
+
+    /// B09-P1-1：私聊来源的点歌回执**不得**出现 UID / 备注串 / `id:`。
+    ///
+    /// 旧实现用 `song_label(song)`，它直接拿 `song.friend_username` 做前缀；
+    /// 而那是数据身份（参与 `lock_key`）：外部聊天源下是 9 位 UID，
+    /// OCR 源下是随机备注串。两者进了公屏回执，等于把内部键与备注串念给全大厅
+    /// （`identity-name-display-and-permission.md:103` 的红线）。
+    #[test]
+    fn friend_source_labels_never_leak_ids() {
+        let mut port =
+            FakePort::idle([Some(picked("晴天 - 周杰伦", "miliastra://track/qqmusic/1"))]);
+        let mut ctx = mapped_context();
+        ctx.message_type = "pink".to_string();
+        // 外部聊天源：主语是纯数字 UID，展示名是软件内显示名。
+        ctx.username = "900000001".to_string();
+        ctx.actor_display = "显示名甲".to_string();
         let friend = SongCommand {
-            friend_username: "Alice".to_string(),
+            friend_username: "900000001".to_string(),
             ..command()
         };
-        assert_eq!(song_label(&friend), "好友Alice ");
+
+        application()
+            .execute(&ctx, &friend, &mut port)
+            .expect("friend request");
+
+        let texts = port
+            .replies
+            .borrow()
+            .iter()
+            .cloned()
+            .chain(port.decision_prompts.borrow().iter().cloned())
+            .collect::<Vec<_>>();
+        assert!(!texts.is_empty(), "至少应有一条回执或决策提示");
+        for text in &texts {
+            assert!(
+                !text.contains("id:"),
+                "回执不得出现内部键标记 `id:`：{text}"
+            );
+            assert!(
+                !has_long_digit_run(text),
+                "回执不得出现 9 位以上连续数字（UID）：{text}"
+            );
+            assert!(
+                !text.contains("900000001"),
+                "回执不得出现发送者 UID：{text}"
+            );
+        }
+        assert!(
+            texts.iter().any(|text| text.contains("显示名甲")),
+            "私聊来源应改用软件显示名：{texts:?}"
+        );
+    }
+
+    /// B09-P1-6：`@换源` 路径必须先查 AI 权限再展示/接受 `@AI`。
+    ///
+    /// 旧实现只判 `self.ai.enabled()`，与主搜索路径
+    /// （`self.ai.enabled() && self.ai_command_allowed()`）不一致：没有 AI 权限的
+    /// 玩家在换源候选里看到 `@AI`，点下去落进通用取消分支，**静默**什么都不做。
+    #[test]
+    fn switch_source_path_hides_and_denies_ai_without_permission() {
+        // AI 必须处于**启用**状态：否则提示里天然没有 `@AI`，这条测试就测不到
+        // 「启用了但对这个玩家没权限」这个真实分支。
+        let app = SongRequestApplication::with_gateways(
+            Arc::new(RecordingAiGateway::default()),
+            Arc::new(DisabledReviewGateway),
+            20,
+            true,
+        );
+        // 第一次搜索选中后立刻换源；换源那次搜索再给一个候选。
+        let mut port = FakePort::idle([Some(picked("晴天", "miliastra://track/qqmusic/1"))]);
+        port.denied_sources.borrow_mut().clear();
+        *port.ai_denied.borrow_mut() = Some(("Alice".to_string(), false));
+        port.decisions =
+            VecDeque::from([SongRequestDecision::SwitchSource, SongRequestDecision::Ai]);
+        port.searches
+            .borrow_mut()
+            .push_back(Some(picked("晴天", "miliastra://track/netease/2")));
+
+        app.execute(&context(), &command(), &mut port)
+            .expect("switch-source flow");
+
+        // 换源路径的决策提示不得宣传 `@AI`。
+        let switch_prompts = port
+            .decision_prompts
+            .borrow()
+            .iter()
+            .filter(|prompt| prompt.contains("搜索到:"))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            switch_prompts.iter().any(|prompt| prompt.contains("换源")),
+            "换源路径应留下候选提示：{switch_prompts:?}"
+        );
+        for prompt in &switch_prompts {
+            assert!(
+                !prompt.contains("@AI"),
+                "无 AI 权限的玩家不该看到 @AI：{prompt}"
+            );
+        }
+        // 且 `allow_ai` 必须传 false：不允许提示里没有、底层却放行。
+        assert!(
+            port.decision_options
+                .borrow()
+                .iter()
+                .all(|(_, allow_ai, _, _)| !allow_ai),
+            "无权限时两次决策都必须传 allow_ai=false：{:?}",
+            port.decision_options.borrow()
+        );
+        assert!(
+            port.played.borrow().is_empty(),
+            "点了 @AI 也不该在没有权限时真的走 AI 点歌"
+        );
+    }
+
+    /// 9 位以上连续数字（UID 的形状）。用于回执泄露断言。
+    fn has_long_digit_run(text: &str) -> bool {
+        let mut run = 0usize;
+        for ch in text.chars() {
+            if ch.is_ascii_digit() {
+                run += 1;
+                if run >= 9 {
+                    return true;
+                }
+            } else {
+                run = 0;
+            }
+        }
+        false
     }
 
     /// 改前：大厅请求带 actor_display 时结果渲染成 `好友大厅玩家:搜索到:…`；

@@ -18,6 +18,38 @@ use std::time::{Duration, Instant};
 
 /// 歌单窗口一次推荐的曲目数（\`@歌单\` 用 \`@1\`~\`@5\` 选择）。
 pub(crate) const WINDOW_CANDIDATES: usize = 5;
+
+/// 按前缀切出命令参数；大小写与全半角不敏感，空白不影响。
+///
+/// 与 `chat_text::strip_ascii_case_prefix` 的区别：那条只折叠 ASCII 大小写，
+/// 不做全角折半角。OCR 会把 `ＱＱ` 读成全角，所以这里统一走
+/// `privacy.rs` 同款归一化后再比较前缀——**只在比较时归一化**，返回的仍是
+/// 原文切片，参数（歌单 ID）不因归一化被改写。
+fn strip_command_prefix(text: &str, prefix: &str) -> Option<String> {
+    let normalized_prefix = crate::text::normalize_chat_text(prefix).to_ascii_lowercase();
+    // 归一化会丢空白，所以要按字符逐个推进原文，找出"归一化后恰好是前缀"的边界。
+    let mut normalized = String::new();
+    let mut boundary = None;
+    for (offset, ch) in text.char_indices() {
+        let folded = crate::text::fold_wide_char(ch).unwrap_or(ch);
+        if folded.is_whitespace() {
+            continue;
+        }
+        for lower in folded.to_lowercase() {
+            normalized.push(lower);
+        }
+        if normalized.len() >= normalized_prefix.len() {
+            if normalized == normalized_prefix {
+                boundary = Some(offset + ch.len_utf8());
+            }
+            break;
+        }
+    }
+    let boundary = boundary?;
+    let rest = text[boundary..].trim();
+    (!rest.is_empty()).then(|| rest.to_owned())
+}
+
 /// 清空二次确认的有效期；超时后必须重新发起 \`@歌单清空\`。
 const CLEAR_CONFIRM_TTL: Duration = Duration::from_secs(60);
 /// 歌单窗口存活时间：超时后 @1~@5 不再生效。
@@ -115,13 +147,14 @@ impl PlaylistCommand {
         if envelope.prefix() != CommandPrefix::At {
             return None;
         }
-        // OCR 会吞掉空格，因此用去空白后的压缩文本精确匹配。
+        // OCR 会吞掉空格，因此用去空白后的压缩文本匹配。
+        //
+        // 大小写不敏感：游戏里玩家手打 `@导入qq歌单…` 完全合法，大小写不该
+        // 决定能不能用。这里走 `strip_command_prefix`（与 privacy/chat_text 同一套
+        // 归一化：丢空白 + 全角折半角 + ASCII 大小写折叠），但**输入参数保持原文**，
+        // 不把归一化后的文本当歌单 ID 用。
         let text = compact_command(envelope.command_text());
-        if let Some(input) = text
-            .strip_prefix("导入QQ歌单")
-            .filter(|value| !value.is_empty())
-        {
-            let input = input.to_owned();
+        if let Some(input) = strip_command_prefix(&text, "导入QQ歌单") {
             return Some(FeatureCommandMatch::new(
                 text,
                 envelope.command_text(),
@@ -132,12 +165,9 @@ impl PlaylistCommand {
             ));
         }
         // `导入网易云歌单` 是 `导入网易歌单` 的隐藏别名，不进帮助。
-        if let Some(input) = text
-            .strip_prefix("导入网易歌单")
-            .or_else(|| text.strip_prefix("导入网易云歌单"))
-            .filter(|value| !value.is_empty())
+        if let Some(input) = strip_command_prefix(&text, "导入网易歌单")
+            .or_else(|| strip_command_prefix(&text, "导入网易云歌单"))
         {
-            let input = input.to_owned();
             return Some(FeatureCommandMatch::new(
                 text,
                 envelope.command_text(),
@@ -317,6 +347,16 @@ pub(crate) mod owner_key {
     ///
     /// 只迁移能在身份映射里找到同名昵称的行；找不到的保留原样（读不到，
     /// 但数据不丢），等用户补配映射后下次启动再迁。
+    ///
+    /// 三条硬约束（原来都没有）：
+    /// 1. **整批一个事务**：中途失败不会留下"迁移了一半"的库，下次启动也不会
+    ///    因为半成品状态重复迁移。
+    /// 2. **`INSERT ... ON CONFLICT DO NOTHING`**：不能用 `UPDATE OR REPLACE`——
+    ///    后者在 `(owner, track_key)` 冲突时用**旧**的 `name:` 行覆盖已经存在的
+    ///    `id:<uuid>` 新行，而 `HashMap` 遍历顺序不定，等于随机丢掉用户新收藏的
+    ///    数据（曲目元数据会被回退成旧版本）。冲突时保留新行、丢弃旧行为准。
+    /// 3. **空 UUID 直接跳过**：`for_identity("")` 会生成裸 `"id:"`，把所有人的
+    ///    空映射行并进同一个归属键，等于把歌单混在一起。
     pub(crate) fn migrate_named_rows(
         connection: &rusqlite::Connection,
         nickname_to_uuid: &std::collections::HashMap<String, String>,
@@ -324,30 +364,102 @@ pub(crate) mod owner_key {
         if nickname_to_uuid.is_empty() {
             return Ok(0);
         }
+        let transaction = connection.unchecked_transaction()?;
         let mut migrated = 0usize;
         for (nickname, uuid) in nickname_to_uuid {
-            migrated += connection.execute(
-                "UPDATE OR REPLACE playlist_items
-                 SET owner = ?1
-                 WHERE owner = ?2",
-                rusqlite::params![
-                    for_identity(uuid),
-                    format!(
-                        "name:{}",
-                        crate::text::normalize_comparison_text(nickname.trim())
-                    ),
-                ],
-            )?;
-            // 兼容极早期未加前缀的裸昵称。
-            migrated += connection.execute(
-                "UPDATE OR REPLACE playlist_items
-                 SET owner = ?1
-                 WHERE owner = ?2",
-                rusqlite::params![for_identity(uuid), nickname.trim()],
-            )?;
+            if uuid.trim().is_empty() {
+                log::warn!(
+                    "歌单归属键迁移跳过一条空身份 UUID 的映射（步骤：按昵称查 UUID）；该昵称下的歌单保持原样，请在身份映射里补上真实 UUID 后重启"
+                );
+                continue;
+            }
+            let target = for_identity(uuid);
+            // 两种历史形态：`name:<归一化昵称>` 与极早期未加前缀的裸昵称。
+            for legacy in [
+                format!(
+                    "name:{}",
+                    crate::text::normalize_comparison_text(nickname.trim())
+                ),
+                nickname.trim().to_string(),
+            ] {
+                // 先把旧行整体搬到新键；已有同曲目的新行优先，旧行被丢弃。
+                migrated += transaction.execute(
+                    "INSERT INTO playlist_items (owner, track_key, track_json, added_at)
+                     SELECT ?1, track_key, track_json, added_at
+                     FROM playlist_items WHERE owner = ?2
+                     ON CONFLICT(owner, track_key) DO NOTHING",
+                    rusqlite::params![target, legacy],
+                )?;
+                transaction.execute(
+                    "DELETE FROM playlist_items WHERE owner = ?1",
+                    rusqlite::params![legacy],
+                )?;
+            }
         }
+        transaction.commit()?;
         Ok(migrated)
     }
+}
+
+/// 一次异步导入的终态；`Loading` 只可能在快照时被转成这几种之一。
+enum ImportCompletion {
+    TimedOut,
+    Failed,
+    TooLarge,
+    Ready(miliastra_playback::ImportedPlaylist),
+}
+
+impl ImportCompletion {
+    fn from_result(
+        result: std::result::Result<
+            miliastra_playback::ImportedPlaylist,
+            miliastra_playback::PlaybackError,
+        >,
+    ) -> Self {
+        match result {
+            Ok(playlist) if playlist.tracks.len() > MAX_IMPORT_TRACKS => Self::TooLarge,
+            Ok(playlist) => Self::Ready(playlist),
+            Err(_) => Self::Failed,
+        }
+    }
+}
+
+/// 导入预览文案：纯函数，便于脱离数据库单测。
+fn import_preview(
+    playlist: &miliastra_playback::ImportedPlaylist,
+    duplicate_count: usize,
+) -> Vec<PlaylistReply> {
+    let total = playlist.tracks.len();
+    let new_count = total.saturating_sub(duplicate_count);
+    let creator = playlist.creator.as_deref().unwrap_or("未知");
+    let provider = if playlist.provider == "qqmusic" {
+        "QQ音乐"
+    } else {
+        "网易云音乐"
+    };
+    let mut preview: Vec<PlaylistReply> = vec![
+        "歌单导入预览".to_owned().into(),
+        format!("{provider}: {}", chat_safe_text(&playlist.title, 34)).into(),
+        format!("创建者: {}", chat_safe_text(creator, 32)).into(),
+        format!("曲目: {total}首,新增{new_count}首,已收藏{duplicate_count}首").into(),
+    ];
+    preview.extend(
+        playlist
+            .tracks
+            .iter()
+            .take(3)
+            .enumerate()
+            .map(|(index, track)| {
+                PlaylistReply::from(format!(
+                    "示例{}: {} - {}",
+                    index + 1,
+                    chat_safe_text(&track.metadata.title, 22),
+                    chat_safe_text(&track_artists(track), 18)
+                ))
+            }),
+    );
+    preview.push("回复@确认导入或@取消导入.".to_owned().into());
+    preview
 }
 
 impl PlaylistApplication {
@@ -785,95 +897,101 @@ impl PlaylistApplication {
     }
 
     pub(crate) fn poll_import_completions(&self, now: Instant) -> Result<Vec<Vec<PlaylistReply>>> {
-        let mut imports = self
-            .state
-            .pending_imports
-            .lock()
-            .map_err(|_| anyhow!("歌单导入状态不可用"))?;
-        let mut completed = Vec::new();
-        for (owner, pending) in imports.iter_mut() {
-            match pending {
-                PendingPlaylistImport::Loading {
-                    operation,
-                    deadline,
-                } if *deadline <= now => {
-                    completed.push((owner.clone(), None));
-                }
-                PendingPlaylistImport::Loading { operation, .. } => {
-                    if let Some(result) = operation.try_wait() {
-                        completed.push((owner.clone(), Some(result)));
+        // 锁内只做"取快照 + 摘除已完成条目"：`try_wait` 不查库，也不做任何 I/O。
+        //
+        // 原来的写法在持锁期间逐条查库（`count_existing_tracks` 还要再取连接锁），
+        // 而任何一条 `?` 都会让整个函数提前返回——已经消费掉的异步结果随之丢失，
+        // 用户卡在 `Loading` 直到 5 分钟 `IMPORT_TTL` 超时。
+        let mut completed: Vec<(String, ImportCompletion)> = Vec::new();
+        let mut finished: Vec<String> = Vec::new();
+        {
+            let mut imports = self
+                .state
+                .pending_imports
+                .lock()
+                .map_err(|_| anyhow!("歌单导入状态不可用"))?;
+            for (owner, pending) in imports.iter_mut() {
+                match pending {
+                    PendingPlaylistImport::Loading {
+                        operation,
+                        deadline,
+                    } => {
+                        if *deadline <= now {
+                            completed.push((owner.clone(), ImportCompletion::TimedOut));
+                            finished.push(owner.clone());
+                        } else if let Some(result) = operation.try_wait() {
+                            completed.push((owner.clone(), ImportCompletion::from_result(result)));
+                            finished.push(owner.clone());
+                        }
                     }
+                    PendingPlaylistImport::Ready { deadline, .. } if *deadline <= now => {
+                        completed.push((owner.clone(), ImportCompletion::TimedOut));
+                        finished.push(owner.clone());
+                    }
+                    PendingPlaylistImport::Ready { .. } => {}
                 }
-                PendingPlaylistImport::Ready { deadline, .. } if *deadline <= now => {
-                    completed.push((owner.clone(), None));
-                }
-                PendingPlaylistImport::Ready { .. } => {}
+            }
+            for owner in &finished {
+                imports.remove(owner);
             }
         }
+        // 锁外逐条处理：单条失败只影响该 owner，其余条目继续。
         let mut replies = Vec::new();
-        for (owner, result) in completed {
-            match result {
-                None => {
-                    imports.remove(&owner);
-                    replies.push(vec![PlaylistReply::keyed(
-                        &templates::IMPORT_TIMEOUT,
-                        ReplyVars::new(),
-                    )]);
-                }
-                Some(Err(_)) => {
-                    imports.remove(&owner);
-                    replies.push(vec![PlaylistReply::keyed(
-                        &templates::IMPORT_FAILED,
-                        ReplyVars::new(),
-                    )]);
-                }
-                Some(Ok(playlist)) if playlist.tracks.len() > MAX_IMPORT_TRACKS => {
-                    imports.remove(&owner);
-                    replies.push(vec![PlaylistReply::keyed(
-                        &templates::IMPORT_TOO_LARGE,
-                        ReplyVars::new().with("上限", MAX_IMPORT_TRACKS.to_string()),
-                    )]);
-                }
-                Some(Ok(playlist)) => {
-                    let total = playlist.tracks.len();
-                    let duplicate_count = self.count_existing_tracks(&owner, &playlist.tracks)?;
-                    let new_count = total.saturating_sub(duplicate_count);
-                    let creator = playlist.creator.as_deref().unwrap_or("未知");
-                    let provider = if playlist.provider == "qqmusic" {
-                        "QQ音乐"
-                    } else {
-                        "网易云音乐"
-                    };
-                    let mut preview: Vec<PlaylistReply> = vec![
-                        "歌单导入预览".to_owned().into(),
-                        format!("{provider}: {}", chat_safe_text(&playlist.title, 34)).into(),
-                        format!("创建者: {}", chat_safe_text(creator, 32)).into(),
-                        format!("曲目: {total}首,新增{new_count}首,已收藏{duplicate_count}首")
-                            .into(),
-                    ];
-                    preview.extend(playlist.tracks.iter().take(3).enumerate().map(
-                        |(index, track)| {
-                            PlaylistReply::from(format!(
-                                "示例{}: {} - {}",
-                                index + 1,
-                                chat_safe_text(&track.metadata.title, 22),
-                                chat_safe_text(&track_artists(track), 18)
-                            ))
-                        },
-                    ));
-                    preview.push("回复@确认导入或@取消导入.".to_owned().into());
+        for (owner, completion) in completed {
+            replies.push(self.finish_import_completion(&owner, completion, now));
+        }
+        Ok(replies)
+    }
+
+    /// 处理一条已完成的导入；**永不返回错误**。
+    ///
+    /// 导入的异步结果已经被消费掉，这时再 `?` 出去等于把结果丢了。任何内部失败
+    /// （例如查重时数据库不可用）都折算成一条可读的失败回执，用户不会卡在 Loading。
+    fn finish_import_completion(
+        &self,
+        owner: &str,
+        completion: ImportCompletion,
+        now: Instant,
+    ) -> Vec<PlaylistReply> {
+        match completion {
+            ImportCompletion::TimedOut => vec![PlaylistReply::keyed(
+                &templates::IMPORT_TIMEOUT,
+                ReplyVars::new(),
+            )],
+            ImportCompletion::Failed => vec![PlaylistReply::keyed(
+                &templates::IMPORT_FAILED,
+                ReplyVars::new(),
+            )],
+            ImportCompletion::TooLarge => vec![PlaylistReply::keyed(
+                &templates::IMPORT_TOO_LARGE,
+                ReplyVars::new().with("上限", MAX_IMPORT_TRACKS.to_string()),
+            )],
+            ImportCompletion::Ready(playlist) => {
+                let duplicate_count = match self.count_existing_tracks(owner, &playlist.tracks) {
+                    Ok(count) => count,
+                    Err(error) => {
+                        log::error!(
+                            "歌单导入预览失败（步骤：统计已收藏曲目）；本次导入已放弃并回复失败提示，玩家可重新导入：{error:#}"
+                        );
+                        return vec![PlaylistReply::keyed(
+                            &templates::IMPORT_FAILED,
+                            ReplyVars::new(),
+                        )];
+                    }
+                };
+                let preview = import_preview(&playlist, duplicate_count);
+                if let Ok(mut imports) = self.state.pending_imports.lock() {
                     imports.insert(
-                        owner,
+                        owner.to_owned(),
                         PendingPlaylistImport::Ready {
                             playlist,
                             deadline: now + IMPORT_TTL,
                         },
                     );
-                    replies.push(preview);
                 }
+                preview
             }
         }
-        Ok(replies)
     }
 
     pub(crate) fn execute(
@@ -1396,6 +1514,107 @@ mod tests {
     use crate::features::command::CommandObservation;
     use miliastra_playback::{ProviderId, TrackKey, TrackMetadata, TrackRef};
 
+    /// 回归（B08-P1-8/6）：`poll_import_completions` 单条失败不能拖垮其余条目。
+    ///
+    /// 修复前持锁逐条查库，任一 `?` 直接返回：已消费的异步结果丢失，用户卡在
+    /// `Loading`。现在锁内只取快照，锁外逐条处理，失败折算成失败回执。
+    #[test]
+    fn import_poll_reports_per_owner_failures_without_dropping_other_results() {
+        let app = app();
+        let now = Instant::now();
+        // 甲：超时；乙：过期；丙：正常完成的候选（需要查库）。
+        app.state.pending_imports.lock().unwrap().insert(
+            "甲".to_owned(),
+            PendingPlaylistImport::Ready {
+                playlist: miliastra_playback::ImportedPlaylist {
+                    provider: "qqmusic".to_owned(),
+                    id: "1".to_owned(),
+                    title: "超时歌单".to_owned(),
+                    creator: None,
+                    tracks: vec![track("a")],
+                },
+                deadline: now - IMPORT_TTL,
+            },
+        );
+        app.state.pending_imports.lock().unwrap().insert(
+            "丙".to_owned(),
+            PendingPlaylistImport::Ready {
+                playlist: miliastra_playback::ImportedPlaylist {
+                    provider: "qqmusic".to_owned(),
+                    id: "2".to_owned(),
+                    title: "有效歌单".to_owned(),
+                    creator: Some("创建者".to_owned()),
+                    tracks: vec![track("b")],
+                },
+                deadline: now + IMPORT_TTL,
+            },
+        );
+        // 丙自己还收藏了 b：预览要报"已收藏1首"，说明查库确实在锁外正常跑完。
+        app.add_many("丙", &[track("b")], 1).unwrap();
+
+        let batches = app.poll_import_completions(now).unwrap();
+        assert_eq!(batches.len(), 1, "只有超时的甲产生终态: {batches:?}");
+        assert_eq!(
+            texts(batches.into_iter().next().unwrap()),
+            vec!["歌单导入已超时,请重新发起.".to_string()],
+            "超时应回可读的失败提示"
+        );
+        // 甲已从 pending 摘除，不再重复回复；丙仍留在 Ready 等 @确认导入。
+        let pending = app.state.pending_imports.lock().unwrap();
+        assert!(!pending.contains_key("甲"), "超时条目必须被摘除");
+        assert!(pending.contains_key("丙"), "未超时的条目必须保留");
+    }
+
+    /// 回归（B08-P1-4）：迁移必须保留 `id:` 新行，且空 UUID 不能生成裸 `id:` 键。
+    ///
+    /// 修复前用 `UPDATE OR REPLACE`：`(owner, track_key)` 冲突时旧 `name:` 行会
+    /// **覆盖**同曲目的 `id:<uuid>` 新行（元数据回退成旧值）；空 UUID 还会生成
+    /// 裸 `"id:"` 把所有人的歌单混进同一个归属键。
+    #[test]
+    fn migration_keeps_newer_identity_rows_and_skips_blank_uuids() {
+        let app = app();
+        let owner = owner_key::for_identity("uuid-1");
+        // 同一个 track_key 既有旧 name: 行（旧元数据），也有新的 id: 行（新元数据）。
+        app.add_many(
+            "name:小明",
+            &[track_from(ProviderId::QqMusic, "dup", "旧标题")],
+            1,
+        )
+        .unwrap();
+        app.add_many(
+            &owner,
+            &[track_from(ProviderId::QqMusic, "dup", "新标题")],
+            2,
+        )
+        .unwrap();
+        // 只有旧行存在的曲目仍应迁移过来。
+        app.add_many("name:小明", &[track("only-old")], 3).unwrap();
+
+        let mappings = std::collections::HashMap::from([
+            ("小明".to_string(), "uuid-1".to_string()),
+            ("无映射".to_string(), "   ".to_string()),
+        ]);
+        let migrated = app.migrate_to_identity_keys(&mappings).unwrap();
+        assert_eq!(migrated, 1, "只有真正搬过去的旧行才计入迁移数");
+
+        let items = app.items(&owner).unwrap();
+        let dup = items
+            .iter()
+            .find(|item| item.track_ref.key.id == "dup")
+            .expect("同曲目必须保留一行");
+        assert_eq!(
+            dup.metadata.title, "新标题",
+            "冲突时必须保留 id: 新行，不能被旧的 name: 行覆盖"
+        );
+        assert!(
+            items.iter().any(|item| item.track_ref.key.id == "only-old"),
+            "旧行仍要迁移到新键"
+        );
+        // 旧键与裸 `id:` 都不该残留。
+        assert_eq!(app.count("name:小明").unwrap(), 0, "旧 name: 行应被搬走");
+        assert_eq!(app.count("id:").unwrap(), 0, "空 UUID 不能生成裸 id: 键");
+    }
+
     struct FakePlayback {
         current: Option<PlayableTrack>,
         played: Vec<String>,
@@ -1645,6 +1864,43 @@ mod tests {
         assert_eq!(parsed("@取消导入"), Some(PlaylistCommand::CancelImport));
         // OCR 丢空格后仍可匹配。
         assert_eq!(parsed("@歌 单 随 机"), Some(PlaylistCommand::Random));
+    }
+
+    /// 回归（B08-P1-5）：`@导入QQ歌单` 必须大小写不敏感（含全角）。
+    #[test]
+    fn import_command_prefix_is_case_and_width_insensitive() {
+        for text in [
+            "@导入QQ歌单1000000001",
+            "@导入qq歌单1000000001",
+            "@导入Qq歌单1000000001",
+            // OCR 把字母读成全角。
+            "@导入ＱＱ歌单1000000001",
+            // OCR 吞掉空格。
+            "@导入 qq 歌单 1000000001",
+        ] {
+            assert_eq!(
+                parsed(text),
+                Some(PlaylistCommand::Import {
+                    provider: "qqmusic".to_owned(),
+                    input: "1000000001".to_owned()
+                }),
+                "{text} 应被识别为 QQ 歌单导入"
+            );
+        }
+        assert_eq!(
+            parsed("@导入网易云歌单2000000001"),
+            Some(PlaylistCommand::Import {
+                provider: "netease".to_owned(),
+                input: "2000000001".to_owned()
+            })
+        );
+        // 参数原样保留（归一化只用于比较前缀）。
+        assert_eq!(
+            strip_command_prefix("导入qq歌单1000000001", "导入QQ歌单").as_deref(),
+            Some("1000000001")
+        );
+        // 只有前缀、没有参数：不是合法导入。
+        assert_eq!(strip_command_prefix("导入qq歌单", "导入QQ歌单"), None);
     }
 
     #[test]

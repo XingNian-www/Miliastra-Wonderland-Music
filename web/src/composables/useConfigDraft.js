@@ -1,12 +1,20 @@
 // 配置中心：草稿状态与字段读写。
 //
 // 草稿是一个 reactive 的 `{ 段名: 段对象 }`，只保存「用户改过的值」；
-// 脏标记统一记在 state.dirty（全局面板状态），这样切页面回来还能续着改。
+// 脏标记写进 state.dirty（全局面板状态），由 useConfigForm 负责「只放本页脏段」，
+// 这样切页面回来还能续着改，别的页面保存时也不会把本页的脏标记一起清掉。
 // 组件不直接改草稿，一律走这里的 setFieldValue / resetField / restoreSectionDefaults。
 
 import { computed, reactive, ref } from 'vue'
 import { clearDirty, markDirty, nestedGet, state } from '../store.js'
-import { deepClone, fieldSegments, hasFieldDefault, setNested } from '../util/configSchema.js'
+import {
+  deepClone,
+  fieldSegments,
+  hasFieldDefault,
+  isSecretField,
+  secretClearValue,
+  setNested,
+} from '../util/configSchema.js'
 
 export function useConfigDraft(sections, activeSection) {
   const draft = reactive({})
@@ -91,12 +99,21 @@ export function useConfigDraft(sections, activeSection) {
     localErrors.value = {}
   }
 
-  /** 单字段恢复默认：只写草稿并标脏，必须再点保存才生效。 */
+  /**
+   * 单字段恢复默认：只写草稿并标脏，必须再点保存才生效。
+   *
+   * secret 字段没有可下发的默认值（后端不会把密钥明文放进 schema），「恢复默认」的
+   * 真实语义是清除已保存的密钥：后端只认 `{"__clear__": true}`，写空串 / null
+   * 都会被当成「保留旧值」，看起来恢复了其实没生效。标记常量只从 configSchema 取，
+   * 不要在这里自创。
+   */
   function resetField(field) {
     const section = activeSection.value
-    if (!section || !hasFieldDefault(field)) return false
+    if (!section) return false
+    const secret = isSecretField(field)
+    if (!secret && !hasFieldDefault(field)) return false
     const target = ensureSectionObject(section.name)
-    setNested(target, fieldSegments(field), deepClone(field.default))
+    setNested(target, fieldSegments(field), secret ? secretClearValue() : deepClone(field.default))
     markDirty(section.name)
     clearLocalError(field.path)
     return true
@@ -104,8 +121,9 @@ export function useConfigDraft(sections, activeSection) {
 
   /**
    * 整段按 schema 默认值重建（仍只写草稿）。
-   * 跳过三类字段：bootstrap（config.yaml 提供）、secret（恢复默认不能清空已保存密钥）、
-   * 父级对象本身是 null 的子字段（父对象整体关闭时不重建子项）。
+   * 跳过三类字段：bootstrap（config.yaml 提供）、secret（整段重建不能顺手清空已保存密钥，
+   * 清密钥只能走单字段的「清除 / 恢复默认」）、父级对象本身是 null 的子字段
+   * （父对象整体关闭时不重建子项）。
    */
   function restoreSectionDefaults(fields) {
     const section = activeSection.value
@@ -131,7 +149,12 @@ export function useConfigDraft(sections, activeSection) {
     localErrors.value = {}
   }
 
-  /** 放弃全部修改：脏标记、两类错误、草稿一起回到服务端最新值。 */
+  /**
+   * 放弃全部修改：脏标记、两类错误、草稿一起回到服务端最新值。
+   * 注意 clearDirty() 清的是整个 state.dirty；配置中心挂载期间 state.dirty 只包含
+   * 本页的脏段（见 useConfigForm 的 adoptDirtyScope / releaseDirtyScope），所以这里
+   * 不会误伤别的页面。
+   */
   function discardToConfig(config) {
     clearDirty()
     clearErrors()

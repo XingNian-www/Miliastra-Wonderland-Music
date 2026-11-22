@@ -452,7 +452,7 @@ impl Default for OcrConfig {
     fn default() -> Self {
         // 默认优先使用 OpenVINO（发布包内置运行时与 IR 模型），初始化失败时回退 MNN CPU；
         // CPU/MNN 后端要求 det_model/rec_model/charset 非空，因此两套模型都给出默认路径。
-        // 默认路径使用发布布局 deps/models/，与 config.full.yaml 的文件名一致。
+        // 默认路径使用发布布局 deps/models/，与发布包 config.yaml 的文件名一致。
         Self {
             det_model: Some(PathBuf::from("deps/models/PP-OCRv6_small_det.mnn")),
             rec_model: Some(PathBuf::from("deps/models/PP-OCRv6_small_rec.mnn")),
@@ -864,7 +864,7 @@ fn default_main_menu_template() -> PathBuf {
 impl Default for TemplateConfig {
     fn default() -> Self {
         // 模板路径默认使用发布布局 deps/assets/，文件名与
-        // tests/fixtures/config.full.yaml 及 assets/ 目录一致；
+        // src/config/test.full.yaml 及 assets/ 目录一致；
         // 全部非空才能通过 validate() 的路径校验。
         Self {
             panel_downsample_factors: std::collections::BTreeMap::new(),
@@ -930,6 +930,9 @@ impl TemplateConfig {
             (&self.pink_marker, "templates.pink_marker"),
             (&self.secondary_back, "templates.secondary_back"),
             (&self.secondary_hall, "templates.secondary_hall"),
+            // 千星主菜单锚点：挡住 secondary_back 在 ESC 菜单上的误判，
+            // 与其余必填模板一致，空值不能落库（否则运行期才在界面状态机失败）。
+            (&self.main_menu, "templates.main_menu"),
             (&self.world_wish, "templates.world_wish"),
             (&self.invite_view_star, "templates.invite_view_star"),
             (&self.invite_goto_hall, "templates.invite_goto_hall"),
@@ -1002,5 +1005,135 @@ impl TemplateConfig {
             validate_nonempty_path(path, field)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod template_validation_tests {
+    use std::path::PathBuf;
+
+    use super::TemplateConfig;
+
+    /// `templates.*` 的每个必填路径字段都必须被 `validate()` 覆盖：
+    /// 漏一个，空值就能绕过配置中心落库，直到运行期界面状态机加载模板才失败。
+    ///
+    /// 这里用「把单个字段置空 → 必须报出该字段名」逐字段验证，不依赖手写清单，
+    /// 因为缺陷恰恰是清单漏项（`main_menu` 在结构体里、在 schema 里，却不在校验里）。
+    #[test]
+    fn every_required_template_path_is_validated() {
+        // 字段名 → 置空用的 setter，覆盖 TemplateConfig 的全部必填 PathBuf 字段。
+        let fields: Vec<(&str, fn(&mut TemplateConfig))> = vec![
+            ("templates.blue_marker", |c| c.blue_marker = PathBuf::new()),
+            ("templates.yellow_marker", |c| {
+                c.yellow_marker = PathBuf::new()
+            }),
+            ("templates.pink_marker", |c| c.pink_marker = PathBuf::new()),
+            ("templates.secondary_back", |c| {
+                c.secondary_back = PathBuf::new()
+            }),
+            ("templates.secondary_hall", |c| {
+                c.secondary_hall = PathBuf::new()
+            }),
+            ("templates.main_menu", |c| c.main_menu = PathBuf::new()),
+            ("templates.world_wish", |c| c.world_wish = PathBuf::new()),
+            ("templates.invite_view_star", |c| {
+                c.invite_view_star = PathBuf::new()
+            }),
+            ("templates.invite_goto_hall", |c| {
+                c.invite_goto_hall = PathBuf::new()
+            }),
+            ("templates.invite_enter_hall", |c| {
+                c.invite_enter_hall = PathBuf::new()
+            }),
+            ("templates.friend_panel", |c| {
+                c.friend_panel = PathBuf::new()
+            }),
+            ("templates.friend_search_panel", |c| {
+                c.friend_search_panel = PathBuf::new()
+            }),
+            ("templates.friend_more_settings", |c| {
+                c.friend_more_settings = PathBuf::new()
+            }),
+            ("templates.friend_block_chat", |c| {
+                c.friend_block_chat = PathBuf::new()
+            }),
+            ("templates.friend_blacklist", |c| {
+                c.friend_blacklist = PathBuf::new()
+            }),
+            ("templates.confirm_button", |c| {
+                c.confirm_button = PathBuf::new()
+            }),
+            ("templates.confirm_message_random_hall", |c| {
+                c.confirm_message_random_hall = PathBuf::new()
+            }),
+            ("templates.confirm_message_return_teyvat", |c| {
+                c.confirm_message_return_teyvat = PathBuf::new()
+            }),
+            ("templates.confirm_message_block", |c| {
+                c.confirm_message_block = PathBuf::new()
+            }),
+            ("templates.secondary_chat_submit", |c| {
+                c.secondary_chat_submit = PathBuf::new()
+            }),
+            ("templates.qianxing_f2_hall_list", |c| {
+                c.qianxing_f2_hall_list = PathBuf::new()
+            }),
+            ("templates.qianxing_f2_invite_player", |c| {
+                c.qianxing_f2_invite_player = PathBuf::new()
+            }),
+            ("templates.qianxing_exit_menu", |c| {
+                c.qianxing_exit_menu = PathBuf::new()
+            }),
+            ("templates.qianxing_map_label", |c| {
+                c.qianxing_map_label = PathBuf::new()
+            }),
+            ("templates.qianxing_profile_page_wishlist", |c| {
+                c.qianxing_profile_page_wishlist = PathBuf::new()
+            }),
+            ("templates.qianxing_profile_page_wardrobe", |c| {
+                c.qianxing_profile_page_wardrobe = PathBuf::new()
+            }),
+            ("templates.teyvat_profile_adventure_rank", |c| {
+                c.teyvat_profile_adventure_rank = PathBuf::new()
+            }),
+            ("templates.teyvat_profile_world_level", |c| {
+                c.teyvat_profile_world_level = PathBuf::new()
+            }),
+            ("templates.teyvat_profile_add_friend", |c| {
+                c.teyvat_profile_add_friend = PathBuf::new()
+            }),
+            ("templates.qianxing_profile_domain_level", |c| {
+                c.qianxing_profile_domain_level = PathBuf::new()
+            }),
+            ("templates.qianxing_profile_add_friend", |c| {
+                c.qianxing_profile_add_friend = PathBuf::new()
+            }),
+            ("templates.qianxing_profile_view_profile", |c| {
+                c.qianxing_profile_view_profile = PathBuf::new()
+            }),
+        ];
+        for (field, clear) in fields {
+            let mut config = TemplateConfig::default();
+            clear(&mut config);
+            let error = config
+                .validate()
+                .expect_err("空模板路径必须被拒绝")
+                .to_string();
+            assert!(
+                error.contains(field),
+                "错误信息必须点名 {field}，实际：{error}"
+            );
+        }
+    }
+
+    /// 默认模板（含 `main_menu`）必须齐全，否则 `AppConfig::default()` 无法建库。
+    #[test]
+    fn default_template_config_passes_validation() {
+        let config = TemplateConfig::default();
+        config.validate().expect("默认模板配置必须通过校验");
+        assert!(
+            !config.main_menu.as_os_str().is_empty(),
+            "main_menu 必须有默认值"
+        );
     }
 }

@@ -414,12 +414,20 @@ impl AppServices {
                     ..Default::default()
                 });
             }
-            if let Some(hit) = find_unread_friend_hits(image, &unread_layout)
-                .into_iter()
-                .next()
-            {
+            // 外部源接管期间观察线程不发布任何聊天帧：此时检测红点只会排出一个
+            // 必然等到超时的未读任务（`ProcessSecondaryUnread` 即使 discard_only
+            // 也要等新鲜好友会话帧），红点清不掉还会反复重排队，清场永远完不成。
+            let initial_hit = initial_unread_clear_scan_hit(external_supplies_hall, || {
+                find_unread_friend_hits(image, &unread_layout)
+            });
+            if let Some(hit) = initial_hit {
                 self.queue_secondary_unread_task(hit, true)?;
                 return Ok(SecondaryListenerRoundOutcome::default());
+            }
+            if external_supplies_hall {
+                log::info!(
+                    "二级值守初始未读清场跳过屏幕红点检测：外部聊天源接管期间没有可用的聊天帧，未读任务只会等到超时"
+                );
             }
             *last_friend_bubble = latest_incoming_fingerprint(image)?;
             self.business
@@ -549,11 +557,31 @@ impl AppServices {
         };
         match outcome.residency() {
             UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryCurrentHall) => {}
+            // 本任务的契约是"处理后回到二级**当前大厅**"（收尾固定为
+            // `Fixed(Secondary(CurrentHall))`），值守的红点/未读位置也只对大厅会话
+            // 有意义。已确认落在**好友私聊**意味着没有回到大厅：既不能当作成功
+            // （否则值守会以为还在盯大厅），也不该说成"当前大厅"
+            // （`technical-docs/ui-task-return-design.md:24`）。如实报错，
+            // 由上层重试恢复任务。注：按当前 `residency_conclusion` 的规则，
+            // 该组合会先命中"确认会话与请求不一致"而报 `Failed`，此臂是防御性的。
+            UiResidencyOutcome::Confirmed(UiResidencyTarget::SecondaryConversation(_)) => {
+                return Err(anyhow!(
+                    "二级好友未读处理后在好友会话里，未回到当前大厅：会话归属需要重新确认"
+                ));
+            }
             UiResidencyOutcome::Confirmed(other) => {
                 return Err(anyhow!("二级好友未读驻留结果错误: {other:?}"));
             }
             UiResidencyOutcome::Failed(failure) => {
                 return Err(anyhow!("二级好友未读后恢复当前大厅失败：{failure}"));
+            }
+            // 本任务契约明确要求收尾回到二级**当前大厅**（`Fixed(CurrentHall)`）；
+            // 收尾若回答「不产生聊天驻留」，说明任务声明与调用方期望不一致，
+            // 不能当成功（否则值守会以为还在盯大厅）。
+            UiResidencyOutcome::NotApplicable => {
+                return Err(anyhow!(
+                    "二级好友未读处理任务未声明聊天驻留，无法确认回到当前大厅"
+                ));
             }
         }
 
@@ -656,7 +684,11 @@ impl AppServices {
                 sequence_floor: Some(floor),
                 baseline_cursor: None,
                 seen: std::collections::HashSet::new(),
-                screen_lock: DecisionScreenLock::default(),
+                // 与下面 OCR 回退路径同一条理由：外部源的 block 是统一哨兵坐标，
+                // 位置锁会把同文本的第二次决策永久判成「已消费」，让连续两次
+                // `@换一批` 的第二次被拒。外部源每条消息只投递一次，重复文本
+                // 就是用户真的又发了一次，必须用真正的 inert。
+                screen_lock: DecisionScreenLock::inert(),
                 _observation_session: observation_session,
             });
         }
@@ -1174,6 +1206,23 @@ mod tests {
 
     use super::*;
 
+    /// 回归：外部聊天源接管时，初始未读清场不得再查屏幕红点。
+    ///
+    /// 接管期间观察线程不发布聊天帧，红点检测排出的未读任务必然等到超时
+    /// （「fresh shared friend chat OCR did not arrive」），红点清不掉还会反复
+    /// 重排队，`initial_unread_clear` 永远完不成并阻塞就绪判定。这里用「一查就
+    /// panic」的闭包证明接管时**根本没查**。
+    #[test]
+    fn initial_unread_clear_skips_the_screen_scan_under_an_external_source() {
+        let hit =
+            initial_unread_clear_scan_hit(true, || panic!("外部聊天源接管时不得扫描屏幕红点"));
+        assert!(hit.is_none(), "接管时必须跳过屏幕红点检测");
+        assert!(
+            initial_unread_clear_scan_hit(false, Vec::new).is_none(),
+            "没有红点时同样没有待清条目"
+        );
+    }
+
     #[test]
     fn secondary_permission_check_reads_sender_before_rejecting_mapped_administrator() {
         use crate::features::identity::{IdentityAccess, IdentityConfig, IdentityMapping};
@@ -1473,4 +1522,88 @@ mod tests {
         tracker.commit(&current);
         assert!(tracker.preview_new_indexes(&current).is_empty());
     }
+
+    /// 回归（B02-P1-1）：外部源快路径的决策读者必须用 inert 屏幕锁。
+    ///
+    /// 外部消息的 block 是统一哨兵坐标；若这里用 `DecisionScreenLock::default()`，
+    /// 连续两次同文本决策（如 `@换一批`、`@换源`）的第二次会被位置锁判成
+    /// 「已消费」而永久拒绝，违反 MUST_READ §4 / `docs/playlist.md:35`
+    /// 「每次重抽重新获得完整 20 秒」。外部源每条消息只投递一次，
+    /// 重复文本就是用户真的又发了一次，必须两次都接受。
+    #[test]
+    fn external_decision_reader_accepts_two_identical_decision_texts() {
+        use crate::observation::chat::{ChatIdentity, ChatScope, ChatTimeline, VisualSessionId};
+        use miliastra_kernel::chat_source::{
+            ChatChannel, ExternalChatMessage, ExternalSender, GameUid,
+        };
+
+        let shared = ChatTimeline::new();
+        let observations = ChatObservationShared::new();
+        let observation_session = observations.begin_exclusive().unwrap();
+        // 与 `begin_chat_decision_reader_until` 的外部源快路径同一组字段：
+        // 按业务范围绑定、序号水位、无屏幕游标、屏幕锁为 inert。
+        let subscriber = shared.subscribe_scoped(ChatScope::hall()).unwrap();
+        let mut reader = ChatDecisionReader {
+            listener_mode: ChatListenerMode::Primary,
+            subscriber,
+            chat: ChatIdentity::SecondaryHall,
+            scope: ChatScope::hall(),
+            any_conversation: false,
+            settled_conversations: std::collections::HashSet::new(),
+            baseline_at: Instant::now(),
+            sequence_floor: Some(0),
+            baseline_cursor: None,
+            seen: std::collections::HashSet::new(),
+            screen_lock: DecisionScreenLock::inert(),
+            _observation_session: observation_session,
+        };
+        let decision = |sequence: u64| ExternalChatMessage {
+            sequence,
+            sent_at: None,
+            channel: ChatChannel::current_hall(),
+            hall_id: None,
+            sender: ExternalSender::new(Some("甲".to_string()), Some(GameUid::from_u32(1001))),
+            to_uid: None,
+            text: "@换一批".to_string(),
+        };
+        shared
+            .inject_external(
+                Instant::now(),
+                VisualSessionId::new(u64::MAX),
+                "test",
+                None,
+                vec![decision(1), decision(2)],
+            )
+            .unwrap();
+
+        let received = reader.read_messages().unwrap();
+        assert_eq!(
+            received.len(),
+            2,
+            "两条外部决策都应进入窗口，实际 {} 条",
+            received.len()
+        );
+        assert!(reader.accept_once(&received[0]), "第一次决策必须生效");
+        assert!(
+            reader.accept_once(&received[1]),
+            "同文本第二次决策也必须生效：外部源每条消息只投递一次，重复文本是用户真的又发了一次"
+        );
+    }
+}
+
+/// 初始未读清场该不该查屏幕红点。
+///
+/// 外部聊天源接管期间观察线程不发布聊天帧，`ProcessSecondaryUnread` 即使
+/// `discard_only` 也要等「新鲜好友会话帧」，必然超时报
+/// 「fresh shared friend chat OCR did not arrive before timeout」；红点清不掉
+/// 还会反复重排队，`initial_unread_clear` 迟迟完不成，同时阻塞就绪判定。
+/// 因此接管时直接跳过屏幕检测，交给外部源自己的私聊链路。
+fn initial_unread_clear_scan_hit(
+    external_supplies_hall: bool,
+    hits: impl FnOnce() -> Vec<UnreadFriendHit>,
+) -> Option<UnreadFriendHit> {
+    if external_supplies_hall {
+        return None;
+    }
+    hits().into_iter().next()
 }

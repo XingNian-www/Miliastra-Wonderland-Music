@@ -95,13 +95,13 @@
             <div class="config-field-side">
               <span class="config-effect" :class="effectClass(field)">{{ effectText(field.effect) }}</span>
               <button
-                v-if="hasDefault(field)"
+                v-if="hasDefault(field) || isSecretField(field)"
                 class="btn small ghost"
                 type="button"
-                title="恢复为 schema 默认值（尚未保存）"
+                :title="resetActionTitle(field)"
                 @click="resetField(field)"
               >
-                恢复默认
+                {{ resetActionLabel(field) }}
               </button>
             </div>
             <div class="config-field-foot">
@@ -160,6 +160,7 @@ import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { requestJson } from '../api.js'
 import { clearDirty, nestedCloneSet, nestedGet, saveSections, state, loadConfig, toast } from '../store.js'
 import { stripSecretMask } from '../util/format.js'
+import { isSecretField, secretClearValue } from '../util/configSchema.js'
 import FieldControl from '../components/FieldControl.vue'
 import FieldError from '../components/FieldError.vue'
 import AiMemoryPanel from '../components/AiMemoryPanel.vue'
@@ -331,10 +332,28 @@ function hasDefault(field) {
   return field.default !== undefined && field.default !== null && field.source !== 'bootstrap'
 }
 
+function resetActionLabel(field) {
+  return isSecretField(field) ? '清除' : '恢复默认'
+}
+
+function resetActionTitle(field) {
+  return isSecretField(field)
+    ? '标记清除已保存的密钥（保存后生效；空串只会被后端当成保留旧值）'
+    : '恢复为 schema 默认值（尚未保存）'
+}
+
 function resetField(field) {
-  if (!hasDefault(field)) return
-  if (!window.confirm(`将「${field.label || field.path}」恢复为 schema 默认值（尚未保存）？`)) return
-  updateField(field, clone(field.default))
+  const secret = isSecretField(field)
+  // secret 字段即使没有 schema 默认值也必须能清除；非 secret 仍只在有默认值时显示。
+  if (!secret && !hasDefault(field)) return
+  const label = field.label || field.path
+  const prompt = secret
+    ? `将「${label}」标记为清除已保存的密钥？保存后才会清空。`
+    : `将「${label}」恢复为 schema 默认值（尚未保存）？`
+  if (!window.confirm(prompt)) return
+  // 后端只认 {"__clear__": true}：写空串会被当成「保留旧值」，看起来恢复默认实际没生效。
+  updateField(field, secret ? secretClearValue() : clone(field.default))
+  if (secret) toast('已标记清除该密钥，保存后生效', 'ok')
 }
 
 function kindOf(field) {

@@ -77,6 +77,12 @@ struct RunningBackgroundLyrics {
 /// 后台歌词线程的名字。固定值，因为进程里只有这一条。
 const BACKGROUND_LYRICS_THREAD_NAME: &str = "background-lyrics";
 
+/// 后台歌词输出在延迟队列里的标识键。
+///
+/// 队列用它做两件事：同一首歌里新歌词顶掉还没发出去的旧歌词，
+/// 以及投递前认出「这条是歌词，需要按模板渲染」。
+const BACKGROUND_LYRICS_KEY: &str = "lyrics";
+
 impl BackgroundLyricsWorker {
     pub(super) fn new() -> Self {
         Self {
@@ -252,6 +258,21 @@ pub(super) fn start_background_lyrics(
     })
 }
 
+/// 构造一条待发送的后台歌词消息。
+///
+/// 队列里只放**原始歌词行**：模板覆盖与静音属于投递前才该求值的配置，
+/// 由 [`render_background_lyrics_text`] 在真正发送前经组装层渲染入口处理。
+/// 如果在这里先调 `format_lyrics`，用户对「歌词」模板的覆盖/静音就被绕过了
+/// （B07-P1-6 的后台残留）。
+fn background_lyrics_message(status: &PlayerStatus, formal_epoch: u64) -> DeferredChatMessage {
+    DeferredChatMessage {
+        text: status.lyric_line_text.clone(),
+        target: DeferredChatTarget::CurrentHall,
+        background_key: Some(BACKGROUND_LYRICS_KEY.to_string()),
+        formal_epoch: Some(formal_epoch),
+    }
+}
+
 fn run_background_lyrics(
     player: PlayerController<PlayerRuntimeBackend, BusinessPlaybackStateAdapter>,
     task_engine: TaskEngineHandle,
@@ -308,12 +329,7 @@ fn run_background_lyrics(
                     break;
                 }
                 if lyric_tracker.observe(&status) {
-                    let message = DeferredChatMessage {
-                        text: crate::features::playback::format_lyrics(&status),
-                        target: DeferredChatTarget::CurrentHall,
-                        background_key: Some("lyrics".to_string()),
-                        formal_epoch: Some(scheduler.formal_epoch()),
-                    };
+                    let message = background_lyrics_message(&status, scheduler.formal_epoch());
                     match task_engine.enqueue_deferred(message) {
                         Ok(EnqueueOutcome::Added) => {}
                         Ok(EnqueueOutcome::DroppedMessage) => {
@@ -489,6 +505,62 @@ fn command_reply_is_muted(config_store: &crate::config::SharedConfigStore, key: 
     crate::features::reply_template::is_muted(&replies, key)
 }
 
+/// 组装层唯一的模板渲染入口（延迟发送线程使用）：查静音 → 查覆盖 → 渲染。
+///
+/// 与立即发送路径同一契约：静音判定在渲染入口完成，调用方必须处理 `None`。
+fn render_template_with_store(
+    config_store: &crate::config::SharedConfigStore,
+    spec: &crate::features::reply_template::ReplyTemplate,
+    vars: &crate::features::reply_template::ReplyVars,
+) -> Option<String> {
+    if command_reply_is_muted(config_store, spec.key) {
+        return None;
+    }
+    // 覆盖只来自命令面板保存的行；配置中心不再提供回复文案入口。
+    let override_text = command_reply_override(config_store, spec.key);
+    let rendered = crate::features::reply_template::render(spec, override_text.as_deref(), vars);
+    if !rendered.missing.is_empty() {
+        log::warn!(
+            "回复模板「{}」缺少变量 {}，这些位置已按空串渲染，玩家会看到内容缺一段",
+            spec.key,
+            super::delivery::missing_vars_label(&rendered.missing)
+        );
+    }
+    Some(rendered.text)
+}
+
+/// 后台歌词投递前的模板渲染：队列里只保存原始歌词行，这里用与前台 `@歌词`
+/// 完全相同的 [`crate::features::playback::format_lyrics_with`] 求值，
+/// 因此面板覆盖生效；被静音时返回 `None`，调用方据此整条不投递（绝不发空消息）。
+///
+/// `render` 是组装层渲染入口。传 `None` 表示调用方没有配置入口（独立复用处），
+/// 此时按内置文案渲染——产物与前台 [`crate::features::playback::format_lyrics`]
+/// 完全一致，和 `PlaybackExecutionPort::render_reply` 的默认实现同一约定。
+fn render_background_lyrics_text(
+    line: &str,
+    render: Option<
+        &mut dyn FnMut(
+            &crate::features::reply_template::ReplyTemplate,
+            &crate::features::reply_template::ReplyVars,
+        ) -> Option<String>,
+    >,
+) -> Option<String> {
+    // 歌词格式化只读 `lyric_line_text`；其余字段不参与，用默认值承载形状即可。
+    let status = PlayerStatus {
+        lyric_line_text: line.to_string(),
+        ..PlayerStatus::default()
+    };
+    let Some(render) = render else {
+        return Some(crate::features::playback::format_lyrics(&status));
+    };
+    let mut template = |spec: &crate::features::reply_template::ReplyTemplate,
+                        vars: &crate::features::reply_template::ReplyVars| {
+        render(spec, vars).unwrap_or_default()
+    };
+    let text = crate::features::playback::format_lyrics_with(&status, &mut template);
+    if text.is_empty() { None } else { Some(text) }
+}
+
 impl DeferredChatSender {
     /// 按模板渲染一条文案；被静音时返回 None。
     ///
@@ -498,21 +570,7 @@ impl DeferredChatSender {
         spec: &crate::features::reply_template::ReplyTemplate,
         vars: &crate::features::reply_template::ReplyVars,
     ) -> Option<String> {
-        if command_reply_is_muted(&self.config_store, spec.key) {
-            return None;
-        }
-        // 覆盖只来自命令面板保存的行；配置中心不再提供回复文案入口。
-        let override_text = command_reply_override(&self.config_store, spec.key);
-        let rendered =
-            crate::features::reply_template::render(spec, override_text.as_deref(), vars);
-        if !rendered.missing.is_empty() {
-            log::warn!(
-                "回复模板「{}」缺少变量 {}，这些位置已按空串渲染，玩家会看到内容缺一段",
-                spec.key,
-                super::delivery::missing_vars_label(&rendered.missing)
-            );
-        }
-        Some(rendered.text)
+        render_template_with_store(&self.config_store, spec, vars)
     }
 
     fn render_reply_text(
@@ -670,10 +728,25 @@ impl DeferredChatSender {
 
             match item {
                 DeferredChatItem::Message(message) => {
-                    let text = self
-                        .live_configs
-                        .identity
-                        .replace_display_names(&message.text);
+                    // 后台歌词在队列里只带原始歌词行，投递前才经组装层渲染入口求值：
+                    // 这样面板对「歌词」模板的覆盖/静音和前台 `@歌词` 一样生效。
+                    let body = if message.background_key.as_deref() == Some(BACKGROUND_LYRICS_KEY) {
+                        let rendered = render_background_lyrics_text(
+                            &message.text,
+                            Some(&mut |spec, vars| {
+                                render_template_with_store(&self.config_store, spec, vars)
+                            }),
+                        );
+                        let Some(rendered) = rendered else {
+                            log::debug!("后台歌词模板被静音，本条不投递");
+                            drop(sending);
+                            continue;
+                        };
+                        rendered
+                    } else {
+                        message.text
+                    };
+                    let text = self.live_configs.identity.replace_display_names(&body);
                     // 普通回复同样可能超过聊天单条显示宽度（超过会被游戏截断）：
                     // 走 ChatOutput 的自动换行入口——超宽才按 80 宽切段并批量发送，
                     // 短文本仍是单条。段间间隔与批量发送同源，不另造硬编码节奏。
@@ -1189,6 +1262,117 @@ mod tests {
         );
         assert!(!command_reply_is_muted(&store, spec.key));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// 建一个只写「歌词」命令那一组回复的配置库；`rows` 为空表示命令级静音。
+    ///
+    /// 返回共享句柄与临时根目录：库文件句柄在句柄里，清理放在用例末尾。
+    fn lyrics_reply_store(
+        rows: Vec<crate::config::StoredReply>,
+    ) -> (crate::config::SharedConfigStore, std::path::PathBuf) {
+        use crate::config::{BootstrapConfig, ConfigStore, HttpConfig, LoggingConfig};
+        use std::collections::BTreeMap;
+
+        let root = std::env::temp_dir().join(format!("deferred-lyrics-{}", uuid::Uuid::new_v4()));
+        let database_path = root.join("deps/data/playback.sqlite3");
+        std::fs::create_dir_all(database_path.parent().unwrap()).unwrap();
+        let bootstrap = BootstrapConfig {
+            database_path: database_path.clone(),
+            http: HttpConfig::default(),
+            logging: LoggingConfig::default(),
+        };
+        let mut store = ConfigStore::open(&database_path, &root, bootstrap).unwrap();
+        let command_id = crate::features::reply_template::command_reply_entry_for_key(
+            crate::features::reply_template::playback::LYRICS_LINE.key,
+        )
+        .expect("歌词模板必须登记命令归属")
+        .id
+        .to_string();
+        store
+            .save_reply_templates(0, &BTreeMap::from([(command_id, rows)]))
+            .unwrap();
+        (Arc::new(Mutex::new(store)), root)
+    }
+
+    /// B07-P1-6 残留：延迟队列只保留原始歌词行，渲染推迟到投递前。
+    ///
+    /// 如果这里改回 `format_lyrics(&status)`（内置文案先渲染好再入队），
+    /// 下面的覆盖断言就会变红——那正是被修复的绕过路径。
+    #[test]
+    fn background_lyrics_queue_only_the_raw_line() {
+        let status = PlayerStatus {
+            lyric_line_text: "第一行".to_string(),
+            ..PlayerStatus::default()
+        };
+
+        let message = background_lyrics_message(&status, 7);
+
+        assert_eq!(
+            message.text, "第一行",
+            "队列里必须只有原始歌词行：先渲染内置文案会绕过用户覆盖"
+        );
+        assert_eq!(
+            message.background_key.as_deref(),
+            Some(BACKGROUND_LYRICS_KEY)
+        );
+        assert_eq!(message.formal_epoch, Some(7));
+        assert_eq!(message.target, DeferredChatTarget::CurrentHall);
+    }
+
+    /// B07-P1-6 残留：后台歌词和前台 `@歌词` 走同一条渲染入口，覆盖文案生效。
+    #[test]
+    fn background_lyrics_follow_command_panel_overrides() {
+        let spec = crate::features::reply_template::playback::LYRICS_LINE;
+        let (store, root) = lyrics_reply_store(vec![crate::config::StoredReply {
+            key: spec.key.to_string(),
+            text: "后台歌词:{歌词}".to_string(),
+        }]);
+        let mut render =
+            |spec: &crate::features::reply_template::ReplyTemplate,
+             vars: &crate::features::reply_template::ReplyVars| {
+                render_template_with_store(&store, spec, vars)
+            };
+
+        assert_eq!(
+            render_background_lyrics_text("第一行", Some(&mut render)).as_deref(),
+            Some("后台歌词:第一行"),
+            "后台歌词必须经过面板覆盖文案，不能直接用内置 format_lyrics"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// B07-P1-6 残留：模板被静音时后台歌词整条不投递，绝不发空消息。
+    #[test]
+    fn background_lyrics_are_not_delivered_when_muted() {
+        let (store, root) = lyrics_reply_store(Vec::new());
+        let mut render =
+            |spec: &crate::features::reply_template::ReplyTemplate,
+             vars: &crate::features::reply_template::ReplyVars| {
+                render_template_with_store(&store, spec, vars)
+            };
+
+        assert_eq!(
+            render_background_lyrics_text("第一行", Some(&mut render)),
+            None,
+            "静音时后台歌词整条不投递，调用方不能发出空消息"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// 没有配置入口时退回内置文案：产物必须与前台 `format_lyrics` 逐字一致，
+    /// 两条路径不能各写一份歌词默认文案。
+    #[test]
+    fn background_lyrics_fall_back_to_the_builtin_text_without_a_render_entry() {
+        let status = PlayerStatus {
+            lyric_line_text: "第一行".to_string(),
+            ..PlayerStatus::default()
+        };
+
+        assert_eq!(
+            render_background_lyrics_text("第一行", None),
+            Some(crate::features::playback::format_lyrics(&status)),
+            "没有渲染入口时应与前台内置文案逐字一致"
+        );
     }
 
     #[test]

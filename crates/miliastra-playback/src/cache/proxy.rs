@@ -1,11 +1,13 @@
 //! 本地 HTTP 代理服务器：把缓存内容以 HTTP 流喂给解码器。
 //!
 //! - 完整文件：标准 `200`/`206` + Content-Length，支持 Range。
-//! - 下载中：无 Range 时以 `200` + chunked 边下边播；非零 Range 返回 `416`。
+//! - 下载中：先确认下载能产出首块数据，再回 `200` + chunked 边下边播；
+//!   等待窗口内拿不到数据（槽位饱和/源站失败）时回 `503` + `Retry-After`，
+//!   绝不先写 `200` 再让客户端等到超时断流。非零 Range 返回 `416`。
 //! - 仅监听 127.0.0.1，只处理 GET `/audio/{hash}`。
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -13,7 +15,7 @@ use tokio::sync::watch;
 
 use crate::cache::{
     CacheError, CacheInner, DownloadHandle, EntryState, PROXY_PATH_PREFIX,
-    download::{DownloadView, start_download, wait_for_bytes},
+    download::{DownloadPriority, DownloadView, start_download, wait_for_bytes},
 };
 
 /// 单次响应读文件/写 socket 的块大小。
@@ -26,6 +28,8 @@ const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// 响应写入超时：慢/停读客户端不应无限挂住连接任务。
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// 点播下载失效后重新申请槽位的最多次数（防止失败源站导致忙重试）。
+const MAX_ON_DEMAND_REACQUIRE: u8 = 2;
 
 pub(crate) async fn spawn_proxy_server(
     inner: Arc<CacheInner>,
@@ -142,7 +146,7 @@ async fn handle_connection(inner: Arc<CacheInner>, mut stream: TcpStream) -> std
         write_simple(&mut stream, "404 Not Found", "").await?;
         return Ok(());
     };
-    let Some(view) = start_download(&inner, &hash).await else {
+    let Some(view) = start_download(&inner, &hash, DownloadPriority::OnDemand).await else {
         write_simple(&mut stream, "404 Not Found", "").await?;
         return Ok(());
     };
@@ -172,7 +176,7 @@ async fn handle_connection(inner: Arc<CacheInner>, mut stream: TcpStream) -> std
                 &inner,
                 &mut stream,
                 &hash,
-                &handle,
+                handle,
                 head.range_start,
                 head.range_end,
             )
@@ -195,6 +199,19 @@ fn path_hash(path: &str) -> Option<String> {
 async fn write_simple(stream: &mut TcpStream, status: &str, body: &str) -> std::io::Result<()> {
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await
+}
+
+/// 下载尚未产出数据（槽位饱和/源站失败）时在写出响应头之前返回 503。
+///
+/// `Retry-After` 让客户端/上层可以把这当作可重试的暂时不可用，而不是
+/// 「已开始的 200 流被截断」——后者会被解码器判成 `UnexpectedEof`。
+async fn write_unavailable(stream: &mut TcpStream) -> std::io::Result<()> {
+    let body = "audio cache download is not ready";
+    let response = format!(
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nRetry-After: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(response.as_bytes()).await
@@ -343,12 +360,80 @@ async fn serve_complete_chunked(
     Ok(())
 }
 
+/// 首块数据就绪情况。
+enum StreamReadiness {
+    /// 已有字节可读（可能仍在下载）。
+    Ready(DownloadHandle),
+    /// 下载已整体完成，直接从完整文件服务。
+    Complete(u64),
+    /// 源站失败：不写响应头，由调用方以连接错误表达（绝不伪装成干净的 chunked EOF）。
+    SourceFailed,
+    /// 等待窗口内没有产出数据（槽位饱和/排队）：写出响应头之前返回 503。
+    Unavailable,
+}
+
+/// 在写出 `200` 之前等待下载产出首块数据。
+///
+/// 代理一旦发出 `200 + chunked` 就只能靠闭连接表达失败，客户端会看到
+/// `UnexpectedEof`。因此这里先把「能不能开始流」判定完：
+/// - 已有字节 → 立即开始；
+/// - 下载完成 → 按完整文件服务（带 Content-Length）；
+/// - 下载被放弃（预取让位）/失败 → 以点播优先级重新申请槽位；
+/// - 超过 `seek_wait_timeout` 仍无数据 → 交给调用方返回 503。
+async fn await_stream_ready(
+    inner: &Arc<CacheInner>,
+    hash: &str,
+    mut handle: DownloadHandle,
+) -> StreamReadiness {
+    let deadline = Instant::now() + (inner.limits)().seek_wait_timeout;
+    let mut reacquired = 0_u8;
+    loop {
+        if handle.bytes.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            return StreamReadiness::Ready(handle);
+        }
+        if handle.failed.load(std::sync::atomic::Ordering::SeqCst) {
+            // 源站确实失败：保持既有语义——不写响应头，让客户端看到明确的连接错误。
+            return StreamReadiness::SourceFailed;
+        }
+        if handle.finished.load(std::sync::atomic::Ordering::SeqCst) {
+            // 下载在产出数据前被放弃（预取让位/信号量关闭）：条目已回到 Idle，
+            // 按点播优先级重新申请，保证点播不会等待一个不会启动的下载任务。
+            reacquired = reacquired.saturating_add(1);
+            if reacquired > MAX_ON_DEMAND_REACQUIRE {
+                return StreamReadiness::Unavailable;
+            }
+            match start_download(inner, hash, DownloadPriority::OnDemand).await {
+                Some(DownloadView::Complete { bytes }) => return StreamReadiness::Complete(bytes),
+                Some(DownloadView::InProgress(next)) => {
+                    handle = next;
+                    continue;
+                }
+                None => return StreamReadiness::SourceFailed,
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return StreamReadiness::Unavailable;
+        }
+        // 有进展/失败/结束都会唤醒；超时后回到循环顶部复查状态。
+        let _ = wait_for_bytes(&handle, 1, remaining).await;
+        if Instant::now() >= deadline
+            && handle.bytes.load(std::sync::atomic::Ordering::SeqCst) == 0
+            && !handle.failed.load(std::sync::atomic::Ordering::SeqCst)
+            && !handle.finished.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            // 排队等不到槽位（不是源站失败）：明确 503，而不是先 200 再断流。
+            return StreamReadiness::Unavailable;
+        }
+    }
+}
+
 /// 边下边播：chunked 传输。`range_start` 未下载到位时等待下载推进。
 async fn serve_streaming(
-    inner: &CacheInner,
+    inner: &Arc<CacheInner>,
     stream: &mut TcpStream,
     hash: &str,
-    handle: &DownloadHandle,
+    handle: DownloadHandle,
     range_start: Option<u64>,
     _range_end: Option<u64>,
 ) -> std::io::Result<()> {
@@ -358,48 +443,42 @@ async fn serve_streaming(
         write_range_not_satisfiable(stream, None).await?;
         return Ok(());
     }
+    // 先判定能否开始流，再写响应头：槽位饱和时明确 503，而不是 200 后断流。
+    let handle = match await_stream_ready(inner, hash, handle).await {
+        StreamReadiness::Ready(handle) => handle,
+        StreamReadiness::Complete(bytes) => {
+            return serve_complete(inner, stream, hash, bytes, None, None).await;
+        }
+        StreamReadiness::Unavailable => {
+            log::debug!("缓存下载在等待窗口内没有产出数据，代理返回 503: {hash}");
+            return write_unavailable(stream).await;
+        }
+        StreamReadiness::SourceFailed => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "缓存下载在产出数据前失败，代理响应不完整",
+            ));
+        }
+    };
+    let part_path = inner
+        .config
+        .directory
+        .join(crate::cache::cache_file_name(hash, false));
+    let mut file = match tokio::fs::File::open(&part_path).await {
+        Ok(file) => file,
+        Err(_) => {
+            // 首块数据之后下载刚好完成并改名：尚未写响应头，按完整文件服务。
+            let Some(total) = crate::cache::complete_file_size(&inner.config.directory, hash)
+            else {
+                return write_unavailable(stream).await;
+            };
+            return serve_complete(inner, stream, hash, total, None, None).await;
+        }
+    };
     let head = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
     write_all_with_timeout(stream, head.as_bytes()).await?;
 
-    let mut file = loop {
-        match tokio::fs::File::open(
-            inner
-                .config
-                .directory
-                .join(crate::cache::cache_file_name(hash, false)),
-        )
-        .await
-        {
-            Ok(file) => break file,
-            Err(_) => {
-                // 下载任务可能尚未创建 .part 文件，或刚完成已改名：
-                // 检查注册表，完成则从 .complete 以 chunked 续传（响应头已发出）。
-                let state = inner
-                    .entries
-                    .read()
-                    .await
-                    .get(hash)
-                    .map(|entry| entry.state.clone());
-                if !matches!(state, Some(EntryState::Downloading(_))) {
-                    return serve_complete_chunked(inner, stream, hash, start).await;
-                }
-                // 等待下载推进后再试。
-                let progressed = wait_for_bytes(
-                    handle,
-                    start as usize + 1,
-                    (inner.limits)().seek_wait_timeout,
-                )
-                .await;
-                if !progressed {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "缓存下载未产生数据，代理响应不完整",
-                    ));
-                }
-            }
-        }
-    };
-    let mut next_read_offset = start as usize;
+    let mut next_read_offset = 0_usize;
     let mut buffer = vec![0u8; IO_CHUNK_SIZE];
     loop {
         // 读当前已下载的部分。
@@ -420,7 +499,7 @@ async fn serve_streaming(
             continue;
         }
         // 等待下载推进或完成。
-        let progressed = wait_for_bytes(handle, next_read_offset + 1, STALL_TIMEOUT).await;
+        let progressed = wait_for_bytes(&handle, next_read_offset + 1, STALL_TIMEOUT).await;
         if !progressed {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,

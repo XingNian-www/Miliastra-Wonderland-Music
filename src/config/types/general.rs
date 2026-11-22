@@ -210,7 +210,7 @@ fn default_world_wish_rect() -> RectConfig {
 impl Default for ScreenConfig {
     fn default() -> Self {
         // 默认值与 WindowConfig 的 1920x1080 一致，区域沿用完整配置模板
-        // （tests/fixtures/config.full.yaml）的坐标，保证 AppConfig::default()
+        // （src/config/test.full.yaml）的坐标，保证 AppConfig::default()
         // 能通过 validate() 的尺寸一致性和画布内校验。
         Self {
             expected_width: 1920,

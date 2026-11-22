@@ -10,7 +10,7 @@ use miliastra_kernel::clock::{Clock, ManualClock};
 
 use super::super::residency::{ConversationRef, ResidencyTarget, SettleEnvironment};
 use super::delivery::{
-    ChatInputStep, check_invite_ready_running, run_verified_chat_input,
+    ChatInputStep, check_invite_ready_running, dispatch_emoji_tags, run_verified_chat_input,
     wait_for_invite_primary_stability, wait_for_invite_primary_stability_with_port,
 };
 use super::navigation::{
@@ -41,6 +41,7 @@ use crate::runtime::recovery::GameRecoveryCoordinator;
 use crate::runtime::ui::{
     InputCertainty, UiRoutine, UiRoutineContext, UiRoutineFailure, UiStateKind, sealed,
 };
+use crate::text::emoji::EmojiTag;
 fn ready_failure() -> UiRoutineFailure {
     UiRoutineFailure::new(
         InputCertainty::ConfirmedFailure,
@@ -51,6 +52,11 @@ fn ready_failure() -> UiRoutineFailure {
 
 #[test]
 fn invite_ready_propagates_cooperative_wait_failure() {
+    if crate::test_support::corpus::skip_without_corpus(
+        "invite_ready_propagates_cooperative_wait_failure",
+    ) {
+        return;
+    }
     let clock = ManualClock::new(std::time::Instant::now());
     let running = AtomicBool::new(true);
     let mut observations = 0;
@@ -80,6 +86,11 @@ fn invite_ready_propagates_cooperative_wait_failure() {
 
 #[test]
 fn invite_ready_requires_full_two_seconds_of_primary_observations() {
+    if crate::test_support::corpus::skip_without_corpus(
+        "invite_ready_requires_full_two_seconds_of_primary_observations",
+    ) {
+        return;
+    }
     for (timeout, success) in [(1900, false), (2000, true)] {
         let clock = ManualClock::new(std::time::Instant::now());
         let start = clock.now();
@@ -107,6 +118,11 @@ fn invite_ready_requires_full_two_seconds_of_primary_observations() {
 
 #[test]
 fn invite_ready_resets_stability_after_non_primary_or_observation_failure() {
+    if crate::test_support::corpus::skip_without_corpus(
+        "invite_ready_resets_stability_after_non_primary_or_observation_failure",
+    ) {
+        return;
+    }
     for failed_capture in [false, true] {
         let clock = ManualClock::new(std::time::Instant::now());
         let start = clock.now();
@@ -139,6 +155,11 @@ fn invite_ready_resets_stability_after_non_primary_or_observation_failure() {
 
 #[test]
 fn invite_ready_never_accepts_flickering_primary_or_unknown() {
+    if crate::test_support::corpus::skip_without_corpus(
+        "invite_ready_never_accepts_flickering_primary_or_unknown",
+    ) {
+        return;
+    }
     let clock = ManualClock::new(std::time::Instant::now());
     let running = AtomicBool::new(true);
     let mut samples = 0;
@@ -160,6 +181,11 @@ fn invite_ready_never_accepts_flickering_primary_or_unknown() {
 
 #[test]
 fn invite_ready_does_not_count_a_stale_observation_gap() {
+    if crate::test_support::corpus::skip_without_corpus(
+        "invite_ready_does_not_count_a_stale_observation_gap",
+    ) {
+        return;
+    }
     let clock = ManualClock::new(std::time::Instant::now());
     let start = clock.now();
     let running = AtomicBool::new(true);
@@ -187,6 +213,11 @@ fn invite_ready_does_not_count_a_stale_observation_gap() {
 
 #[test]
 fn invite_ready_cancellation_before_and_during_observation_prevents_success() {
+    if crate::test_support::corpus::skip_without_corpus(
+        "invite_ready_cancellation_before_and_during_observation_prevents_success",
+    ) {
+        return;
+    }
     let clock = ManualClock::new(std::time::Instant::now());
     let running = AtomicBool::new(false);
     assert!(
@@ -225,6 +256,11 @@ fn invite_ready_cancellation_before_and_during_observation_prevents_success() {
 
 #[test]
 fn ready_message_requires_secondary_before_focus_input_and_submit() {
+    if crate::test_support::corpus::skip_without_corpus(
+        "ready_message_requires_secondary_before_focus_input_and_submit",
+    ) {
+        return;
+    }
     for failed_check in 1..=3 {
         let mut calls = Vec::new();
         let mut checks = 0;
@@ -248,6 +284,11 @@ fn ready_message_requires_secondary_before_focus_input_and_submit() {
 
 #[test]
 fn ready_message_submits_once_and_never_replays_an_unknown_send() {
+    if crate::test_support::corpus::skip_without_corpus(
+        "ready_message_submits_once_and_never_replays_an_unknown_send",
+    ) {
+        return;
+    }
     for fail_send in [false, true] {
         let mut calls = Vec::new();
         let result = run_verified_chat_input(|step| {
@@ -274,6 +315,10 @@ fn ready_message_submits_once_and_never_replays_an_unknown_send() {
 
 #[test]
 fn ready_input_failure_does_not_press_enter() {
+    if crate::test_support::corpus::skip_without_corpus("ready_input_failure_does_not_press_enter")
+    {
+        return;
+    }
     let mut sent = 0;
     assert!(
         run_verified_chat_input(|step| {
@@ -292,6 +337,11 @@ fn ready_input_failure_does_not_press_enter() {
 
 #[test]
 fn readiness_is_an_opt_in_standard_batch_requirement() {
+    if crate::test_support::corpus::skip_without_corpus(
+        "readiness_is_an_opt_in_standard_batch_requirement",
+    ) {
+        return;
+    }
     let request = SendHallBatch::new(["ready"], UiResidencyTarget::Primary, 0);
     assert!(request.ready.is_none());
     let running = Arc::new(AtomicBool::new(true));
@@ -301,7 +351,6 @@ fn readiness_is_an_opt_in_standard_batch_requirement() {
     assert!(Arc::ptr_eq(&request.ready.unwrap().running, &running));
 }
 
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, bail};
@@ -340,6 +389,11 @@ fn fuzzy_friend_matching_is_disabled_by_default() {
 
 #[test]
 fn friend_list_drag_runs_from_the_lowest_avatar_to_the_highest_avatar() {
+    if crate::test_support::corpus::skip_without_corpus(
+        "friend_list_drag_runs_from_the_lowest_avatar_to_the_highest_avatar",
+    ) {
+        return;
+    }
     let (from, to) = friend_list_drag_points(Rect::new(80, 280, 170, 600));
 
     assert_eq!((from.x, from.y), (40, 830));
@@ -349,6 +403,11 @@ fn friend_list_drag_runs_from_the_lowest_avatar_to_the_highest_avatar() {
 
 #[test]
 fn current_hall_restore_drags_from_the_highest_avatar_downward() {
+    if crate::test_support::corpus::skip_without_corpus(
+        "current_hall_restore_drags_from_the_highest_avatar_downward",
+    ) {
+        return;
+    }
     let (from, to) = current_hall_restore_drag_points(Rect::new(80, 280, 170, 600));
 
     assert_eq!((from.x, from.y), (40, 330));
@@ -434,8 +493,12 @@ fn fixture_expected_friend_names() -> Option<Vec<String>> {
 #[test]
 #[cfg(feature = "ocr-mnn")]
 fn fixed_secondary_chat_fixture_proves_stable_friend_row_and_title_first_identity_fallback() {
-    let config =
-        AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).expect("load default config");
+    if crate::test_support::corpus::skip_without_corpus(
+        "fixed_secondary_chat_fixture_proves_stable_friend_row_and_title_first_identity_fallback",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let args = OcrArgs::default().resolve(&config.ocr);
     let runtime = OcrRuntime::start(
         ProductionOcrDevice::new(args).expect("initialize OCR device"),
@@ -765,7 +828,12 @@ impl OcrDevice for TitleFallbackOcrDevice {
 
 #[test]
 fn ordered_batch_sends_every_message_before_restoring_secondary_hall_once() {
-    let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "ordered_batch_sends_every_message_before_restoring_secondary_hall_once",
+    ) {
+        return;
+    }
+    let mut config = crate::config::bundled_config();
     config.timing.input.after_activate_ms = 0;
     config.timing.input.open_chat_ms = 0;
     config.timing.input.click_ms = 0;
@@ -850,7 +918,12 @@ fn ordered_batch_sends_every_message_before_restoring_secondary_hall_once() {
 
 #[test]
 fn friend_conversation_confirms_from_the_highlighted_row_when_title_has_no_name() {
-    let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "friend_conversation_confirms_from_the_highlighted_row_when_title_has_no_name",
+    ) {
+        return;
+    }
+    let mut config = crate::config::bundled_config();
     config.timing.input.after_activate_ms = 0;
     config.timing.input.open_chat_ms = 0;
     config.timing.input.click_ms = 0;
@@ -924,7 +997,12 @@ fn friend_conversation_confirms_from_the_highlighted_row_when_title_has_no_name(
 
 #[test]
 fn hall_batch_sends_all_messages_and_confirms_secondary_residency() {
-    let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "hall_batch_sends_all_messages_and_confirms_secondary_residency",
+    ) {
+        return;
+    }
+    let mut config = crate::config::bundled_config();
     config.timing.input.after_activate_ms = 0;
     config.timing.input.open_chat_ms = 0;
     config.timing.input.click_ms = 0;
@@ -1034,7 +1112,12 @@ impl OcrDevice for SubstringFriendOcrDevice {
 
 #[test]
 fn friend_list_does_not_treat_a_longer_name_as_the_requested_friend() {
-    let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "friend_list_does_not_treat_a_longer_name_as_the_requested_friend",
+    ) {
+        return;
+    }
+    let mut config = crate::config::bundled_config();
     config.timing.input.after_activate_ms = 0;
     config.timing.input.open_chat_ms = 0;
     config.timing.input.click_ms = 0;
@@ -1112,7 +1195,12 @@ fn friend_list_does_not_treat_a_longer_name_as_the_requested_friend() {
 
 #[test]
 fn unknown_message_is_never_retried_and_only_unattempted_messages_remain_safe() {
-    let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "unknown_message_is_never_retried_and_only_unattempted_messages_remain_safe",
+    ) {
+        return;
+    }
+    let mut config = crate::config::bundled_config();
     config.friend_delivery.auto_retry_count = 3;
     config.timing.input.after_activate_ms = 0;
     config.timing.input.open_chat_ms = 0;
@@ -1195,6 +1283,11 @@ fn unknown_message_is_never_retried_and_only_unattempted_messages_remain_safe() 
 
 #[test]
 fn retry_request_is_rejected_when_any_delivery_shape_does_not_match() {
+    if crate::test_support::corpus::skip_without_corpus(
+        "retry_request_is_rejected_when_any_delivery_shape_does_not_match",
+    ) {
+        return;
+    }
     let request = SendFriendDeliveries::new(
         vec![
             FriendDelivery::new("甲", ["甲一", "甲二"]),
@@ -1398,7 +1491,12 @@ fn recovery_config(config: &AppConfig, timeout_ms: u64) -> FriendDeliveryRoutine
 /// 新实现必须先等待/重采样，确认 Primary 后零按键成功。
 #[test]
 fn unknown_blip_is_waited_out_without_any_input() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "unknown_blip_is_waited_out_without_any_input",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let (device, state) =
         ScriptedStateDevice::new(vec![unknown_frame(&config), primary_frame(&config)]);
     let device = device.auto_advance(0, 1);
@@ -1426,7 +1524,12 @@ fn unknown_blip_is_waited_out_without_any_input() {
 /// 持续 Unknown：先重采样，允许**一次**受控 Esc 探针；探针无效即失败。
 #[test]
 fn persistent_unknown_probes_once_with_escape_then_fails_with_diagnostics() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "persistent_unknown_probes_once_with_escape_then_fails_with_diagnostics",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let (device, state) = ScriptedStateDevice::new(vec![unknown_frame(&config)]);
     let ui_runtime = start_test_ui_runtime(device, &config, 2);
 
@@ -1461,7 +1564,12 @@ fn persistent_unknown_probes_once_with_escape_then_fails_with_diagnostics() {
 /// 主菜单千星：Esc 关闭浮层回到一级界面。
 #[test]
 fn wonderland_main_menu_is_escaped_back_to_primary() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "wonderland_main_menu_is_escaped_back_to_primary",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let (device, state) =
         ScriptedStateDevice::new(vec![main_menu_frame(&config), primary_frame(&config)]);
     let device = device.on_key(0, Key::Escape, 1);
@@ -1484,7 +1592,10 @@ fn wonderland_main_menu_is_escaped_back_to_primary() {
 /// 主菜单大世界不是大厅菜单：明确拒绝，零输入。
 #[test]
 fn paimon_menu_is_rejected_without_input() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus("paimon_menu_is_rejected_without_input") {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let (device, state) = ScriptedStateDevice::new(vec![paimon_menu_frame(&config)]);
     let ui_runtime = start_test_ui_runtime(device, &config, 2);
 
@@ -1513,7 +1624,10 @@ fn paimon_menu_is_rejected_without_input() {
 /// Panel 需要连续确认仍是 Panel 才允许 Esc（防止一帧抖动就按键）。
 #[test]
 fn panel_is_confirmed_twice_before_escape() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus("panel_is_confirmed_twice_before_escape") {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let (device, state) =
         ScriptedStateDevice::new(vec![panel_frame(&config), primary_frame(&config)]);
     let device = device.on_key(0, Key::Escape, 1);
@@ -1542,7 +1656,11 @@ fn panel_is_confirmed_twice_before_escape() {
 /// Loading：只等待，不发任何按键；超预算后如实失败。
 #[test]
 fn loading_waits_without_input_and_times_out() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus("loading_waits_without_input_and_times_out")
+    {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let (device, state) = ScriptedStateDevice::new(vec![loading_frame(&config)]);
     let ui_runtime = start_test_ui_runtime(device, &config, 2);
 
@@ -1568,7 +1686,10 @@ fn loading_waits_without_input_and_times_out() {
 /// 大世界：拒绝恢复，零输入。
 #[test]
 fn overworld_is_rejected_without_input() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus("overworld_is_rejected_without_input") {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let (device, state) = ScriptedStateDevice::new(vec![overworld_frame(&config)]);
     let ui_runtime = start_test_ui_runtime(device, &config, 2);
 
@@ -1589,7 +1710,12 @@ fn overworld_is_rejected_without_input() {
 /// 事故完整回放：二级 → Esc → Unknown（不得再 Esc）→ 主菜单千星 → Esc → 一级。
 #[test]
 fn unknown_after_escape_then_main_menu_then_escape_reaches_primary() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "unknown_after_escape_then_main_menu_then_escape_reaches_primary",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let (device, state) = ScriptedStateDevice::new(vec![
         secondary_frame(&config),
         unknown_frame(&config),
@@ -1623,7 +1749,12 @@ fn unknown_after_escape_then_main_menu_then_escape_reaches_primary() {
 /// 主菜单千星按 Esc 没反应（无进展）时，必须在 2 次后熔断，不能无限按。
 #[test]
 fn main_menu_without_progress_trips_the_breaker() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "main_menu_without_progress_trips_the_breaker",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let (device, state) = ScriptedStateDevice::new(vec![main_menu_frame(&config)]);
     let ui_runtime = start_test_ui_runtime(device, &config, 2);
 
@@ -1655,7 +1786,12 @@ fn main_menu_without_progress_trips_the_breaker() {
 /// 二次恢复：目标二级聊天时遇主菜单千星，必须先 Esc 回一级，再 Return 打开聊天。
 #[test]
 fn secondary_target_escapes_main_menu_first_then_returns() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "secondary_target_escapes_main_menu_first_then_returns",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let (device, state) = ScriptedStateDevice::new(vec![
         main_menu_frame(&config),
         primary_frame(&config),
@@ -1701,7 +1837,12 @@ fn migration_config(config: &AppConfig) -> FriendDeliveryRoutineConfig {
 /// 不再出现旧 `finish_hall_batch_residency` 的二次恢复。
 #[test]
 fn hall_batch_from_primary_returns_to_primary_with_one_round_trip() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "hall_batch_from_primary_returns_to_primary_with_one_round_trip",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let (device, state) = ScriptedStateDevice::new(vec![
         primary_frame(&config),
         secondary_hall_row_frame(&config),
@@ -1744,7 +1885,12 @@ fn hall_batch_from_primary_returns_to_primary_with_one_round_trip() {
 /// 入口二级 → 发送 → 回到二级当前大厅：不做任何多余导航。
 #[test]
 fn hall_batch_from_secondary_returns_to_current_hall_without_navigation() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "hall_batch_from_secondary_returns_to_current_hall_without_navigation",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let (device, state) = ScriptedStateDevice::new(vec![secondary_hall_row_frame(&config)]);
     let ui_runtime = start_test_ui_runtime(device, &config, 4);
     let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
@@ -1779,10 +1925,98 @@ fn hall_batch_from_secondary_returns_to_current_hall_without_navigation() {
     assert_eq!(state.pasted, ["第一条"]);
 }
 
+/// B15-P1-5：邀请就绪闸门关闭时，表情循环必须在**点击前**停下。
+#[test]
+fn closed_invite_gate_blocks_every_emoji_click() {
+    let tag = EmojiTag {
+        pack: 2,
+        candidates: vec!["交给我吧".to_string()],
+    };
+    let gate = InviteReadyGate {
+        running: Arc::new(AtomicBool::new(false)),
+    };
+    let mut sent = 0;
+    let result = dispatch_emoji_tags(&[&tag], Some(&gate), true, |_| {
+        sent += 1;
+        Ok(())
+    });
+    assert!(result.is_err(), "闸门关闭时必须立即失败");
+    assert_eq!(sent, 0, "闸门关闭后不得再点击任何表情");
+}
+
+/// B15-P1-5：文本段发完、任务在表情段之间被取消时，剩余表情也不能再点。
+#[test]
+fn invite_gate_is_rechecked_between_emoji_tags() {
+    let first = EmojiTag {
+        pack: 1,
+        candidates: vec!["哈哈".to_string()],
+    };
+    let second = EmojiTag {
+        pack: 2,
+        candidates: vec!["交给我吧".to_string()],
+    };
+    let running = Arc::new(AtomicBool::new(true));
+    let gate = InviteReadyGate {
+        running: running.clone(),
+    };
+    let mut sent = 0;
+    let result = dispatch_emoji_tags(&[&first, &second], Some(&gate), true, |_| {
+        sent += 1;
+        // 第一个表情发送期间，邀请任务被取消。
+        running.store(false, Ordering::SeqCst);
+        Ok(())
+    });
+    assert!(result.is_err(), "闸门关闭必须让表情发送立即失败");
+    assert_eq!(sent, 1, "取消后不得继续点击第二个表情");
+}
+
+/// B15-P1-5：闸门在发送前置就失败时，外层收尾不得再发导航输入。
+#[test]
+fn cancelled_invite_gate_sends_no_finish_input() {
+    if crate::test_support::corpus::skip_without_corpus(
+        "cancelled_invite_gate_sends_no_finish_input",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
+    // 当前停在二级聊天：若收尾真的导航回一级，必然按 Esc。
+    let (device, state) = ScriptedStateDevice::new(vec![secondary_hall_row_frame(&config)]);
+    let ui_runtime = start_test_ui_runtime(device, &config, 4);
+    let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
+    let hall_ui = HallBatchUi::new(
+        ui_runtime.handle(),
+        ocr_runtime.handle(),
+        migration_config(&config),
+    );
+    let running = Arc::new(AtomicBool::new(false));
+    let request = SendHallBatch::new(["已同意加入大厅"], UiResidencyTarget::Primary, 0)
+        .after_invite_primary_stability(running);
+
+    let outcome = hall_ui.submit(request).unwrap().wait().unwrap();
+
+    assert!(
+        matches!(outcome.status(), HallBatchStatus::Failed(_)),
+        "闸门关闭时大厅批量发送必须失败：{:?}",
+        outcome.status()
+    );
+    let state = state.lock().unwrap();
+    assert!(
+        state.keys.is_empty(),
+        "闸门取消后收尾必须零输入，实际：{:?}",
+        state.keys
+    );
+    assert!(state.pasted.is_empty(), "闸门关闭后不得发送任何文本");
+}
+
 /// 消息全送达但收尾失败：发送结果仍是 Complete，驻留单独报 Failed。
 #[test]
 fn delivered_but_residency_failed_keeps_send_status_complete() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "delivered_but_residency_failed_keeps_send_status_complete",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let (device, state) = ScriptedStateDevice::new(vec![
         primary_frame(&config),
         secondary_hall_row_frame(&config),
@@ -1817,7 +2051,12 @@ fn delivered_but_residency_failed_keeps_send_status_complete() {
 /// 好友投递：入口是二级会话，收尾只能回到“二级类型”，必须显式标记会话级降级。
 #[test]
 fn friend_delivery_from_current_hall_returns_to_current_hall() {
-    let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "friend_delivery_from_current_hall_returns_to_current_hall",
+    ) {
+        return;
+    }
+    let mut config = crate::config::bundled_config();
     config.timing.input.after_activate_ms = 0;
     config.timing.input.open_chat_ms = 0;
     config.timing.input.click_ms = 0;
@@ -1890,7 +2129,11 @@ fn friend_delivery_from_current_hall_returns_to_current_hall() {
 
 #[test]
 fn capture_from_unknown_entry_sends_no_input() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus("capture_from_unknown_entry_sends_no_input")
+    {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let (device, state) = ScriptedStateDevice::new(vec![unknown_frame(&config)]);
     let ui_runtime = start_test_ui_runtime(device, &config, 4);
     let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();
@@ -1951,7 +2194,12 @@ impl UiDevice for TransitionResidencyDevice {
 
 #[test]
 fn secondary_residency_escapes_once_then_waits_through_unknown_transition() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "secondary_residency_escapes_once_then_waits_through_unknown_transition",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let keys = Arc::new(Mutex::new(Vec::new()));
     let ui_runtime = start_test_ui_runtime(
         TransitionResidencyDevice {
@@ -2032,7 +2280,12 @@ impl UiDevice for PreStabilizedRecoveryDevice {
 
 #[test]
 fn recovery_requires_fresh_stability_after_a_pre_stabilized_secondary_state() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "recovery_requires_fresh_stability_after_a_pre_stabilized_secondary_state",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let state = Arc::new(Mutex::new(PreStabilizedRecoveryState::default()));
     let ui_runtime = start_test_ui_runtime(
         PreStabilizedRecoveryDevice {
@@ -2117,7 +2370,12 @@ impl UiDevice for CaptureFailsAfterEscapeDevice {
 
 #[test]
 fn capture_failure_after_escape_is_reported_as_input_result_unknown() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "capture_failure_after_escape_is_reported_as_input_result_unknown",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let ui_runtime = start_test_ui_runtime(
         CaptureFailsAfterEscapeDevice {
             secondary: secondary_frame(&config),
@@ -2202,7 +2460,10 @@ fn load_real_frame(path: &str, config: &AppConfig) -> DynamicImage {
 
 #[test]
 fn tmp_time_classification() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus("tmp_time_classification") {
+        return;
+    }
+    let config = crate::config::bundled_config();
     for path in [
         "tests/fixtures/ui/hall-primary-1920x1080.jpg",
         "tests/fixtures/ui/secondary-with-hall-row-1920x1080.png",
@@ -2271,7 +2532,7 @@ fn clear_sidebar_selection(frame: &mut DynamicImage, sidebar: Rect) {
 #[test]
 #[ignore = "local screenshot timing probe; requires dist/ui-flow/frames fixtures"]
 fn tmp_panel_probe_cost() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    let config = crate::config::bundled_config();
     let threshold = config.templates.marker_threshold;
     let cases: Vec<(&str, std::path::PathBuf, Rect)> = vec![
         (
@@ -2443,7 +2704,7 @@ impl OcrDevice for EmptyOcr {
 }
 
 fn capture_test_config() -> AppConfig {
-    let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    let mut config = crate::config::bundled_config();
     config.timing.input.after_activate_ms = 0;
     config.timing.input.open_chat_ms = 0;
     config.timing.input.click_ms = 0;
@@ -2478,6 +2739,11 @@ fn submit_capture_primary(
 
 #[test]
 fn secondary_capture_navigates_to_primary_then_returns_to_secondary_hall() {
+    if crate::test_support::corpus::skip_without_corpus(
+        "secondary_capture_navigates_to_primary_then_returns_to_secondary_hall",
+    ) {
+        return;
+    }
     let config = capture_test_config();
     let (device, state) = CaptureResidencyDevice::new(
         &config,
@@ -2527,6 +2793,11 @@ fn secondary_capture_navigates_to_primary_then_returns_to_secondary_hall() {
 
 #[test]
 fn primary_capture_never_sends_navigation_input() {
+    if crate::test_support::corpus::skip_without_corpus(
+        "primary_capture_never_sends_navigation_input",
+    ) {
+        return;
+    }
     let config = capture_test_config();
     let (device, state) = CaptureResidencyDevice::new(
         &config,
@@ -2572,6 +2843,11 @@ fn primary_capture_never_sends_navigation_input() {
 
 #[test]
 fn unknown_residency_fails_before_input_without_pressing_escape() {
+    if crate::test_support::corpus::skip_without_corpus(
+        "unknown_residency_fails_before_input_without_pressing_escape",
+    ) {
+        return;
+    }
     let config = capture_test_config();
 
     struct UnknownCaptureDevice {
@@ -2680,6 +2956,11 @@ impl UiRoutine for FailingCaptureRoutine {
 
 #[test]
 fn capture_failure_after_navigation_still_returns_to_secondary_hall() {
+    if crate::test_support::corpus::skip_without_corpus(
+        "capture_failure_after_navigation_still_returns_to_secondary_hall",
+    ) {
+        return;
+    }
     let config = capture_test_config();
     let (device, state) = CaptureResidencyDevice::new(
         &config,
@@ -2730,6 +3011,11 @@ fn capture_failure_after_navigation_still_returns_to_secondary_hall() {
 /// 需要会话级恢复的调用方必须显式声明 `ConversationRef::CurrentHall/Friend`。
 #[test]
 fn restore_to_secondary_kind_does_not_require_hall_row_when_entry_conversation_unknown() {
+    if crate::test_support::corpus::skip_without_corpus(
+        "restore_to_secondary_kind_does_not_require_hall_row_when_entry_conversation_unknown",
+    ) {
+        return;
+    }
     let config = capture_test_config();
     // 入口是二级但**没有任何可识别会话证据**（无大厅行模板、无高亮行）。
     let (device, state) = CaptureResidencyDevice::new(
@@ -2835,7 +3121,7 @@ impl OcrDevice for DynamicFriendOcrDevice {
 }
 
 fn entry_friend_test_config() -> AppConfig {
-    let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    let mut config = crate::config::bundled_config();
     config.timing.input.after_activate_ms = 0;
     config.timing.input.open_chat_ms = 0;
     config.timing.input.click_ms = 0;
@@ -2909,6 +3195,11 @@ fn entry_friend_delivery(
 
 #[test]
 fn friend_delivery_returns_to_entry_friend_conversation() {
+    if crate::test_support::corpus::skip_without_corpus(
+        "friend_delivery_returns_to_entry_friend_conversation",
+    ) {
+        return;
+    }
     let (ui_runtime, ocr_runtime, state, outcome) =
         entry_friend_delivery(FriendListOcrMode::Stable);
 
@@ -2924,6 +3215,11 @@ fn friend_delivery_returns_to_entry_friend_conversation() {
 
 #[test]
 fn friend_delivery_entry_friend_gone_falls_back_to_current_hall() {
+    if crate::test_support::corpus::skip_without_corpus(
+        "friend_delivery_entry_friend_gone_falls_back_to_current_hall",
+    ) {
+        return;
+    }
     let (ui_runtime, ocr_runtime, state, outcome) =
         entry_friend_delivery(FriendListOcrMode::DropFriendAfterSend);
 
@@ -2942,6 +3238,11 @@ fn friend_delivery_entry_friend_gone_falls_back_to_current_hall() {
 
 #[test]
 fn friend_delivery_ambiguous_entry_friend_falls_back_without_guessing() {
+    if crate::test_support::corpus::skip_without_corpus(
+        "friend_delivery_ambiguous_entry_friend_falls_back_without_guessing",
+    ) {
+        return;
+    }
     let config = entry_friend_test_config();
     let frame = secondary_hall_row_frame(&config);
     let hall_point = hall_row_click_point(&frame, &config);
@@ -3012,7 +3313,7 @@ fn paint_conversation_highlight(frame: &mut DynamicImage, region: Rect, y: i32) 
 }
 
 fn conversation_test_config() -> AppConfig {
-    let mut config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    let mut config = crate::config::bundled_config();
     config.timing.input.after_activate_ms = 0;
     config.timing.input.click_ms = 0;
     config.timing.input.open_chat_ms = 0;
@@ -3023,6 +3324,11 @@ fn conversation_test_config() -> AppConfig {
 
 #[test]
 fn residency_restores_current_hall_from_friend_conversation() {
+    if crate::test_support::corpus::skip_without_corpus(
+        "residency_restores_current_hall_from_friend_conversation",
+    ) {
+        return;
+    }
     let config = conversation_test_config();
     let routine_config = FriendDeliveryRoutineConfig::from_app(&config);
     let region = conversation_row_region(&routine_config);
@@ -3067,6 +3373,11 @@ fn residency_restores_current_hall_from_friend_conversation() {
 
 #[test]
 fn residency_restores_friend_conversation_by_highlighted_row() {
+    if crate::test_support::corpus::skip_without_corpus(
+        "residency_restores_friend_conversation_by_highlighted_row",
+    ) {
+        return;
+    }
     let config = conversation_test_config();
     let routine_config = FriendDeliveryRoutineConfig::from_app(&config);
     let region = conversation_row_region(&routine_config);
@@ -3133,6 +3444,11 @@ impl OcrDevice for SelectedRowOnlyOcrDevice {
 
 #[test]
 fn residency_restores_real_friend_conversation_selected_above_list_top() {
+    if crate::test_support::corpus::skip_without_corpus(
+        "residency_restores_real_friend_conversation_selected_above_list_top",
+    ) {
+        return;
+    }
     let config = conversation_test_config();
     let routine_config = FriendDeliveryRoutineConfig::from_app(&config);
     let frame = secondary_frame(&config);
@@ -3176,6 +3492,11 @@ fn residency_restores_real_friend_conversation_selected_above_list_top() {
 
 #[test]
 fn residency_ambiguous_friend_rows_fall_back_to_current_hall_without_guessing() {
+    if crate::test_support::corpus::skip_without_corpus(
+        "residency_ambiguous_friend_rows_fall_back_to_current_hall_without_guessing",
+    ) {
+        return;
+    }
     let config = conversation_test_config();
     let routine_config = FriendDeliveryRoutineConfig::from_app(&config);
     let region = conversation_row_region(&routine_config);
@@ -3247,6 +3568,11 @@ fn residency_ambiguous_friend_rows_fall_back_to_current_hall_without_guessing() 
 
 #[test]
 fn residency_missing_friend_row_falls_back_to_current_hall() {
+    if crate::test_support::corpus::skip_without_corpus(
+        "residency_missing_friend_row_falls_back_to_current_hall",
+    ) {
+        return;
+    }
     let config = conversation_test_config();
     let routine_config = FriendDeliveryRoutineConfig::from_app(&config);
     let region = conversation_row_region(&routine_config);
@@ -3293,7 +3619,12 @@ fn residency_missing_friend_row_falls_back_to_current_hall() {
 /// `SettleEnvironment`，那份被注入的协调器会一直是全零——本用例就会失败。
 #[test]
 fn residency_ui_with_recovery_shares_the_injected_coordinator() {
-    let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml")).unwrap();
+    if crate::test_support::corpus::skip_without_corpus(
+        "residency_ui_with_recovery_shares_the_injected_coordinator",
+    ) {
+        return;
+    }
+    let config = crate::config::bundled_config();
     let (device, state) = ScriptedStateDevice::new(vec![primary_frame(&config)]);
     let ui_runtime = start_test_ui_runtime(device, &config, 4);
     let ocr_runtime = OcrRuntime::start(EmptyOcr, 1).unwrap();

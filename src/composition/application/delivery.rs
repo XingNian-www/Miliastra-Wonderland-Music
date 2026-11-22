@@ -1,4 +1,5 @@
 use super::*;
+use crate::features::friend_delivery::FriendBatchFailure;
 
 /// 日志里的缺失变量名：用「」包住并按顿号串起，避免打印 Vec 的调试格式。
 ///
@@ -346,7 +347,11 @@ impl AppServices {
         let timeout = std::time::Duration::from_secs(reply.timeout_seconds.max(1));
         // 不能在持有 UI 租约时干等网络。
         let _scan_permit = self.ui.coordinator.permit_scans_for_current_thread();
-        crate::config::ai::request_json(
+        // **必须走纯文本通道**：模板要的是一句自然语言聊天文本，提示词里既没有
+        // `json` 要求、返回值也不做 JSON 解析。`request_json` 会强制
+        // response_format=JsonObject：严格接口下必然 400（表现为 `{AI回复}`
+        // 位置永远空着），兼容接口下会把整段 JSON 原样发进游戏大厅。
+        crate::config::ai::request_plain_text(
             &self.business.ai_chat_openai,
             &self.business.ai_connection,
             &crate::config::ai::AiCallOptions {
@@ -509,6 +514,60 @@ impl AppServices {
     }
 }
 
+/// 一次好友批量投递的骨架：渲染、剔除静音、发送，并把失败重试项对回原始条目。
+///
+/// **配对必须在这一个循环里完成**。先过滤出「要发的消息」，失败时再拿
+/// **未过滤**的 `deliveries` 去 `zip` 那份缩减后的列表，会从第一条静音条目
+/// 开始整体错位：轻则报「重试项匹配不到原始投递」，重则把另一个玩家的模板
+/// 当成重试对象重新发一遍。
+///
+/// 返回值：`Ok(None)` 表示全部送达（或整批静音、无可发送）；`Ok(Some(..))`
+/// 是仍需重试的原始条目与失败原因。
+fn deliver_friend_batch<T: Clone>(
+    deliveries: &[T],
+    mut render: impl FnMut(&T) -> Option<String>,
+    recipient_of: impl Fn(&T) -> &str,
+    send: impl FnOnce(&[FriendMessage]) -> Result<FriendBatchOutcome>,
+) -> Result<Option<(Vec<T>, FriendBatchFailure)>> {
+    // 一条原始条目配一条渲染后的正文：静音条目（None）在这里被剔除，
+    // 剩下每一项都还记得自己来自哪一条原始投递。
+    let mut pairs: Vec<(T, String)> = Vec::with_capacity(deliveries.len());
+    for delivery in deliveries {
+        if let Some(message) = render(delivery) {
+            pairs.push((delivery.clone(), message));
+        }
+    }
+    if pairs.is_empty() {
+        // 整批都被静音：没有要发的东西，对调用方算「已处理」。
+        return Ok(None);
+    }
+    let messages = pairs
+        .iter()
+        .map(|(delivery, message)| FriendMessage::new(recipient_of(delivery), message.as_str()))
+        .collect::<Vec<_>>();
+    match send(&messages)? {
+        FriendBatchOutcome::Complete => Ok(None),
+        FriendBatchOutcome::Failed { retryable, failure } => {
+            let mut retryable_deliveries = Vec::with_capacity(retryable.len());
+            for failed in retryable {
+                let position = pairs
+                    .iter()
+                    .position(|(delivery, message)| {
+                        recipient_of(delivery) == failed.recipient() && message == failed.message()
+                    })
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "好友批量投递的重试项匹配不到原始投递条目，本次重试已中止；重试项与静音过滤后的待发列表必须一一对应"
+                        )
+                    })?;
+                let (delivery, _) = pairs.remove(position);
+                retryable_deliveries.push(delivery);
+            }
+            Ok(Some((retryable_deliveries, failure)))
+        }
+    }
+}
+
 impl CardGameDeliveryPort for AppServicesPort<'_> {
     fn verify_friend(&self, player: &str, message: &str) -> Result<bool> {
         self.send_unique_friend_message(player, message)
@@ -537,49 +596,21 @@ impl CardGameDeliveryPort for AppServicesPort<'_> {
         &self,
         deliveries: &[LandlordPrivateDelivery],
     ) -> Result<crate::features::card_games::CardGameFriendBatchOutcome> {
-        let rendered = deliveries
-            .iter()
-            .map(|delivery| {
-                let message = match delivery.template.as_ref() {
-                    Some(template) => self.render_card_game_template(template),
-                    None => Some(delivery.message.clone()),
-                };
-                // 静音的条目整条剔除：不该出现在好友批次里。
-                message.map(|message| (delivery.player.clone(), message))
-            })
-            .collect::<Vec<_>>();
-        // 静音条目已被剔除；后续投递与重试只针对实际要发的那些。
-        let rendered: Vec<_> = rendered.into_iter().flatten().collect();
-        let messages = rendered
-            .iter()
-            .map(|(player, message)| FriendMessage::new(player, message))
-            .collect::<Vec<_>>();
-        match self.send_friend_delivery_batch(&messages)? {
-            FriendBatchOutcome::Complete => {
-                Ok(crate::features::card_games::CardGameFriendBatchOutcome::Complete)
-            }
-            FriendBatchOutcome::Failed { retryable, failure } => {
-                let mut remaining = deliveries.iter().cloned().zip(rendered).collect::<Vec<_>>();
-                let mut retryable_templates = Vec::with_capacity(retryable.len());
-                for failed in retryable {
-                    let position = remaining
-                        .iter()
-                        .position(|(delivery, message)| {
-                            delivery.player == failed.recipient() && message.1 == failed.message()
-                        })
-                        .ok_or_else(|| {
-                            anyhow!("card-game retry payload did not match its original delivery")
-                        })?;
-                    retryable_templates.push(remaining.remove(position).0);
-                }
-                Ok(
-                    crate::features::card_games::CardGameFriendBatchOutcome::Failed {
-                        retryable: retryable_templates,
-                        failure,
-                    },
-                )
-            }
-        }
+        use crate::features::card_games::CardGameFriendBatchOutcome;
+        // 静音条目在配对阶段整条剔除；重试项仍然对回它自己的原始投递。
+        let outcome = deliver_friend_batch(
+            deliveries,
+            |delivery| match delivery.template.as_ref() {
+                Some(template) => self.render_card_game_template(template),
+                None => Some(delivery.message.clone()),
+            },
+            |delivery| delivery.player.as_str(),
+            |messages| self.send_friend_delivery_batch(messages),
+        )?;
+        Ok(match outcome {
+            None => CardGameFriendBatchOutcome::Complete,
+            Some((retryable, failure)) => CardGameFriendBatchOutcome::Failed { retryable, failure },
+        })
     }
 
     fn send_friend_batch(
@@ -667,38 +698,152 @@ impl UndercoverDeliveryPort for AppServicesPort<'_> {
         deliveries: &[crate::features::undercover::UndercoverFriendDelivery],
     ) -> Result<crate::features::undercover::UndercoverFriendBatchOutcome> {
         use crate::features::undercover::UndercoverFriendBatchOutcome;
-        let rendered = deliveries
-            .iter()
-            .filter_map(|delivery| {
-                self.render_undercover_reply(&delivery.reply)
-                    .map(|message| (delivery.recipient.clone(), message))
-            })
-            .collect::<Vec<_>>();
-        let messages = rendered
-            .iter()
-            .map(|(recipient, message)| FriendMessage::new(recipient, message))
-            .collect::<Vec<_>>();
-        match self.send_friend_delivery_batch(&messages)? {
-            FriendBatchOutcome::Complete => Ok(UndercoverFriendBatchOutcome::Complete),
-            FriendBatchOutcome::Failed { retryable, failure } => {
-                let mut remaining = deliveries.iter().cloned().zip(rendered).collect::<Vec<_>>();
-                let mut keyed_retryable = Vec::with_capacity(retryable.len());
-                for failed in retryable {
-                    let position = remaining
-                        .iter()
-                        .position(|(delivery, (_, message))| {
-                            delivery.recipient == failed.recipient() && message == failed.message()
-                        })
-                        .ok_or_else(|| {
-                            anyhow!("keyed friend retry payload did not match its original message")
-                        })?;
-                    keyed_retryable.push(remaining.remove(position).0);
-                }
-                Ok(UndercoverFriendBatchOutcome::Failed {
-                    retryable: keyed_retryable,
-                    failure,
-                })
+        // 与牌类批次同一条骨架：静音剔除与重试对齐必须在同一个循环里完成。
+        let outcome = deliver_friend_batch(
+            deliveries,
+            |delivery| self.render_undercover_reply(&delivery.reply),
+            |delivery| delivery.recipient.as_str(),
+            |messages| self.send_friend_delivery_batch(messages),
+        )?;
+        Ok(match outcome {
+            None => UndercoverFriendBatchOutcome::Complete,
+            Some((retryable, failure)) => {
+                UndercoverFriendBatchOutcome::Failed { retryable, failure }
             }
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::deliver_friend_batch;
+    use crate::features::card_games::LandlordPrivateDelivery;
+    use crate::features::friend_delivery::{
+        FriendBatchFailure, FriendBatchFailureKind, FriendBatchOutcome, FriendMessage,
+    };
+
+    fn private_delivery(player: &str, message: &str) -> LandlordPrivateDelivery {
+        LandlordPrivateDelivery {
+            player: player.to_string(),
+            message: message.to_string(),
+            template: None,
         }
+    }
+
+    fn confirmed_unsent(failed: FriendMessage) -> FriendBatchOutcome {
+        FriendBatchOutcome::Failed {
+            retryable: vec![failed],
+            failure: FriendBatchFailure::new(FriendBatchFailureKind::ConfirmedUnsent, "测试失败"),
+        }
+    }
+
+    /// 回归：批次里有静音条目时，重试项必须仍指向它自己的原始投递。
+    ///
+    /// 旧实现先过滤出「要发的消息」，失败时再用**未过滤**的 `deliveries` 做
+    /// `zip`。只要中间有一条静音，后面全体左移：这条用例里第三个玩家会被
+    /// 错配成第二个（静音的）玩家的投递，重试就把别人的模板发给另一个人。
+    #[test]
+    fn muted_entries_do_not_shift_the_retry_alignment() {
+        let deliveries = vec![
+            private_delivery("甲", "第一条"),
+            private_delivery("乙", "静音那条"),
+            private_delivery("丙", "第三条"),
+        ];
+        let sent = std::cell::RefCell::new(Vec::<FriendMessage>::new());
+        let outcome = deliver_friend_batch(
+            &deliveries,
+            // 乙被静音：整条剔除。
+            |delivery| (delivery.player != "乙").then(|| delivery.message.clone()),
+            |delivery| delivery.player.as_str(),
+            |messages| {
+                sent.borrow_mut().extend(messages.iter().cloned());
+                Ok(confirmed_unsent(FriendMessage::new("丙", "第三条")))
+            },
+        )
+        .expect("批量投递骨架不应报错");
+
+        let sent = sent.borrow();
+        let sent_pairs = sent
+            .iter()
+            .map(|message| (message.recipient(), message.message()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sent_pairs,
+            vec![("甲", "第一条"), ("丙", "第三条")],
+            "静音条目必须整条剔除，实际送达：{sent_pairs:?}"
+        );
+
+        let (retryable, _failure) = outcome.expect("有可重试失败时必须返回重试项");
+        assert_eq!(
+            retryable
+                .iter()
+                .map(|delivery| (delivery.player.as_str(), delivery.message.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("丙", "第三条")],
+            "重试项必须是「丙」自己的投递，不能被静音条目挤偏"
+        );
+    }
+
+    /// 整批静音时不提交空批次：一次发送都不该发生。
+    #[test]
+    fn a_fully_muted_batch_sends_nothing() {
+        let deliveries = vec![private_delivery("甲", "第一条")];
+        let outcome = deliver_friend_batch(
+            &deliveries,
+            |_delivery| None,
+            |delivery| delivery.player.as_str(),
+            |_messages| panic!("整批静音时不得提交任何好友投递"),
+        )
+        .expect("整批静音不是错误");
+        assert!(outcome.is_none(), "整批静音时对调用方算「已处理」");
+    }
+
+    /// 重试项必须能在待发列表里找到原条目，否则宁可报错也不能错配。
+    #[test]
+    fn a_retry_item_without_an_original_is_rejected() {
+        let deliveries = vec![private_delivery("甲", "第一条")];
+        let error = deliver_friend_batch(
+            &deliveries,
+            |delivery| Some(delivery.message.clone()),
+            |delivery| delivery.player.as_str(),
+            |_messages| Ok(confirmed_unsent(FriendMessage::new("甲", "另一条"))),
+        )
+        .expect_err("重试项对不上原始投递时必须报错");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("匹配不到原始投递条目"),
+            "错误必须说明重试项与原始投递对不上，实际：{text}"
+        );
+    }
+
+    /// 接线锁定：`{AI回复}` 必须走纯文本通道。
+    ///
+    /// 这条路径的回归不会报错、不会 panic，只会让含 `{AI回复}` 的模板在严格
+    /// 接口上 100% 400、在兼容接口上把整段 JSON 发进游戏大厅，因此只能盯源码：
+    /// 生成函数里必须是 `request_plain_text`，不得出现 `request_json`。
+    #[test]
+    fn ai_reply_generation_uses_the_plain_text_channel() {
+        const SOURCE: &str = include_str!("delivery.rs");
+        let body = SOURCE
+            .split("fn generate_ai_reply(")
+            .nth(1)
+            .expect("必须保留 generate_ai_reply");
+        let body = &body[..body.find("\n    }").expect("函数体必须闭合")];
+        // 注释里**必须**留着 `request_json` 这个词（那是这条缺陷的由来），
+        // 所以只看代码行。
+        let code = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("request_plain_text"),
+            "生成 {{AI回复}} 内容必须走 request_plain_text，实际函数体：{code}"
+        );
+        assert!(
+            !code.contains("request_json"),
+            "生成 {{AI回复}} 内容不得走 request_json（会强制 JSON 输出），实际函数体：{code}"
+        );
     }
 }

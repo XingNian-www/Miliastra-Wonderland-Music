@@ -39,7 +39,11 @@ impl ApplicationRuntime {
         let timeline = self.ui.chat_timeline.clone();
         let external_chat = self.shared.external_chat.clone();
         let running = Arc::clone(&self.shared.running);
-        let draining = Arc::clone(&self.shared.http_reload.draining());
+        // 只把**句柄容器**带进线程，不预先克隆某个具体 Arc：HTTP 面板在
+        // `lifecycle.rs` 之后才启动，启动时才把占位替换成真实闸门（见
+        // `HttpReloadGates::attach`）。启动前克隆一份的话，本线程会永远盯着
+        // 占位，`draining.load()` 恒为 false，配置重载排空信号永远传不进来。
+        let draining_gate = ReloadDrainingGate::new(self.shared.http_reload.clone());
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let initial_interval = live_configs.snapshot().timing.loop_idle_ms.max(1);
@@ -103,7 +107,7 @@ impl ApplicationRuntime {
                             continue;
                         }
                     };
-                    if draining.load(AtomicOrdering::Acquire)
+                    if draining_gate.is_draining()
                         || !running.load(AtomicOrdering::Acquire)
                         || worker_stop.load(AtomicOrdering::Acquire)
                     {
@@ -315,6 +319,31 @@ fn capture_satisfies_refresh(captured_at: Instant, refresh: Option<Instant>) -> 
     refresh.is_none_or(|requested_at| captured_at >= requested_at)
 }
 
+/// 观察线程持有的「配置重载排空」读取器。
+///
+/// 只保存**句柄容器**（[`HttpReloadGates`] 自身是 Arc 包装，可克隆），
+/// 每次读取时才向容器要当前真实句柄。HTTP 面板在观察线程启动**之后**
+/// 才由 `lifecycle.rs` 建起来，建好时 [`HttpReloadGates::attach`] 会把
+/// 本地占位替换成真实闸门。若在构造时就把某个 `Arc<AtomicBool>` 存下来，
+/// 这里会永远盯着占位（恒 false），排空期间本线程仍会继续截图 / OCR
+/// （B03-P1-1）。
+///
+/// 「HTTP 未启动」仍然视为未排空：`detached()` 占位就是 false，语义不变。
+struct ReloadDrainingGate {
+    http_reload: HttpReloadGates,
+}
+
+impl ReloadDrainingGate {
+    fn new(http_reload: HttpReloadGates) -> Self {
+        Self { http_reload }
+    }
+
+    /// 当前是否正在为配置重载排空；HTTP 未启动时占位恒为 false。
+    fn is_draining(&self) -> bool {
+        self.http_reload.draining().load(AtomicOrdering::Acquire)
+    }
+}
+
 /// 聊天区变化门控的两个阈值。
 ///
 /// 入参必须是**当前** live 快照（`live_configs.snapshot()`），而不是启动期
@@ -335,6 +364,48 @@ mod tests {
     use crate::observation::chat::{
         hash_region, passive_secondary_identity, passive_sender, recognize_passive_hall,
     };
+
+    /// 回归（B03-P1-1）：HTTP 闸门在观察线程启动**之后**才 attach，
+    /// 线程必须在每次需要时重新取句柄，才能看到真实 draining。
+    ///
+    /// 旧实现是在线程启动前 `Arc::clone(&http_reload.draining())`：那一刻
+    /// HTTP 还没启动，克隆到的是占位 Arc，之后真实句柄置位也永远不会影响它。
+    #[test]
+    fn reload_draining_sees_a_gate_attached_after_the_observer_started() {
+        let gates = HttpReloadGates::detached();
+        // 模拟旧实现：线程启动时克隆一份（HTTP 尚未启动，只能拿到占位）。
+        let cloned_before_start = gates.draining();
+        // 新实现：线程只持有容器，读取时才现取当前句柄。
+        let draining_gate = ReloadDrainingGate::new(gates.clone());
+        assert!(!draining_gate.is_draining(), "HTTP 未启动时必须视为未排空");
+
+        let real = Arc::new(AtomicBool::new(false));
+        gates.attach(Arc::new(AtomicUsize::new(0)), Arc::clone(&real));
+        assert!(
+            !draining_gate.is_draining(),
+            "真实句柄刚接上、还没置位时仍不得视为排空"
+        );
+
+        real.store(true, AtomicOrdering::Release);
+        assert!(
+            draining_gate.is_draining(),
+            "attach 之后置位的真实 draining 必须被现取句柄看到"
+        );
+        assert!(
+            !cloned_before_start.load(AtomicOrdering::Acquire),
+            "启动前克隆的占位永远不会变化——这正是 B03-P1-1 的旧行为"
+        );
+    }
+
+    #[test]
+    fn reload_draining_keeps_the_detached_placeholder_false() {
+        let detached = HttpReloadGates::detached();
+        let gate = ReloadDrainingGate::new(detached.clone());
+        for _ in 0..3 {
+            assert!(!gate.is_draining());
+        }
+        assert!(!detached.is_attached());
+    }
 
     fn reference_hash_region(
         image: &DynamicImage,

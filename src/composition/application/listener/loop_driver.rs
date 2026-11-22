@@ -68,6 +68,27 @@ pub(in crate::composition::application) fn screen_size_warning_enabled(config: &
     config.screen.warn_on_size_mismatch
 }
 
+/// 一级值守的就绪证据：本帧确实取得过一级聊天区的识别结果。
+///
+/// - 屏幕 OCR：`chat == PrimaryHall` 是最充分的证据（一级区真的被识别并发布）；
+/// - 外部聊天源：文档规定外部帧没有屏幕桶（`chat = None`），此时只要帧里
+///   确实带回了识别出的消息，就说明聊天观察管线正常工作，同样算取得证据；
+/// - 外部源接管时观察线程按设计不发布 OCR 帧（内容由 WS 供给），`latest()`
+///   恒为 None，因此 `external_supplies_hall` 是等价的「识别结果已在供给」；
+/// - 其余一律不算：没有帧、空帧、二级/好友桶都不能伪装成一级扫描。
+///   识别失败或根本不在聊天界面时宁可就绪晚一拍，也不能伪造就绪。
+pub(in crate::composition::application) fn primary_scan_ready_evidence(
+    snapshot: Option<&crate::observation::chat::ChatTimelineSnapshot>,
+    external_supplies_hall: bool,
+) -> Option<ListenerReadyEvidence> {
+    let scanned_this_frame = snapshot.is_some_and(|snapshot| match snapshot.chat.as_ref() {
+        Some(ChatIdentity::PrimaryHall) => true,
+        None => !snapshot.messages.is_empty(),
+        Some(_) => false,
+    });
+    (scanned_this_frame || external_supplies_hall).then_some(ListenerReadyEvidence::PrimaryScan)
+}
+
 pub(in crate::composition::application) fn load_persisted_chat_listener_mode(
     playback_state_path: &Path,
 ) -> Result<Option<ChatListenerMode>> {
@@ -1166,11 +1187,18 @@ impl AppServices {
                                     secondary_identity = None;
                                 }
                                 // Recognition is supplied independently, even while this navigation loop is blocked.
-                                if self.ui.chat_timeline.latest()?.is_some_and(|snapshot| {
-                                    snapshot.chat.as_ref() == Some(&ChatIdentity::PrimaryHall)
-                                }) {
-                                    listener_ready_evidence =
-                                        Some(ListenerReadyEvidence::PrimaryScan);
+                                //
+                                // 外部源接管时观察线程按设计不发布 OCR 帧（内容由 WS 供给），
+                                // `latest()` 恒为 None，文档也明确外部帧 `chat = None`。
+                                // 因此证据要按「本帧确实拿到了识别结果」判，而不是只认屏幕桶：
+                                // 外部源在线等价于一级聊天观察已就绪，与二级分支的
+                                // `ocr_confirms_secondary || external_supplies_hall` 对齐。
+                                let latest = self.ui.chat_timeline.latest()?;
+                                if let Some(evidence) = primary_scan_ready_evidence(
+                                    latest.as_ref(),
+                                    self.shared.external_chat.supplies_hall_messages(),
+                                ) {
+                                    listener_ready_evidence = Some(evidence);
                                 }
                             }
                             Ok((ui_state, Some(UiStateKind::Secondary))) => {
@@ -1602,5 +1630,111 @@ impl AppServices {
             ResidencyPurpose::IndependentRecovery("值守切换失败回退一级"),
         );
         Err(anyhow!("切换{}失败，已回退一级值守", target.label()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geometry::Rect;
+    use crate::observation::chat::{
+        BubbleSequence, ChatScope, ChatTimelineMessage, ChatTimelineSnapshot,
+        ObservedChatMessageId, SourceId, VisualSessionId,
+    };
+    use std::sync::Arc;
+
+    fn snapshot(
+        chat: Option<ChatIdentity>,
+        messages: Vec<ChatTimelineMessage>,
+    ) -> ChatTimelineSnapshot {
+        ChatTimelineSnapshot {
+            visual_session: VisualSessionId::new(1),
+            captured_at: Instant::now(),
+            chat: chat.clone(),
+            scope: ChatScope::hall(),
+            source: if chat.is_some() {
+                SourceId::ocr()
+            } else {
+                SourceId::external("test")
+            },
+            messages,
+        }
+    }
+
+    /// 外部聊天源的一帧：文档规定 `chat = None`，消息带服务端序号。
+    fn external_message() -> ChatTimelineMessage {
+        ChatTimelineMessage {
+            id: ObservedChatMessageId::from_source(
+                SourceId::external("test"),
+                VisualSessionId::new(1),
+                ChatIdentity::PrimaryHall,
+                BubbleSequence::new(1),
+            ),
+            text: "@帮助".to_string(),
+            sender: None,
+            raw_sender: None,
+            message_type: "blue".to_string(),
+            block: Rect::new(0, 0, 0, 0),
+            is_new: true,
+            account: None,
+            source_sequence: 1,
+        }
+    }
+
+    #[test]
+    fn primary_scan_evidence_accepts_ocr_primary_even_without_messages() {
+        let frame = snapshot(Some(ChatIdentity::PrimaryHall), Vec::new());
+        assert_eq!(
+            primary_scan_ready_evidence(Some(&frame), false),
+            Some(ListenerReadyEvidence::PrimaryScan)
+        );
+    }
+
+    /// 回归（B02-P1-7）：外部帧 `chat = None`，只要本帧确实带回了识别结果，
+    /// 一级值守仍要拿到 `PrimaryScan` 证据。
+    #[test]
+    fn primary_scan_evidence_accepts_a_chatless_frame_with_recognition_results() {
+        let frame = snapshot(None, vec![external_message()]);
+        assert_eq!(
+            primary_scan_ready_evidence(Some(&frame), false),
+            Some(ListenerReadyEvidence::PrimaryScan)
+        );
+    }
+
+    /// 不伪造证据：`chat = None` 的空帧（识别失败/没有结果）不能算一级扫描。
+    #[test]
+    fn primary_scan_evidence_rejects_a_chatless_frame_without_results() {
+        let empty = snapshot(None, Vec::new());
+        assert_eq!(primary_scan_ready_evidence(Some(&empty), false), None);
+        assert_eq!(primary_scan_ready_evidence(None, false), None);
+    }
+
+    /// 二级区/好友桶/未知桶即使带消息也不是一级扫描，不能拿来伪造就绪。
+    #[test]
+    fn primary_scan_evidence_rejects_other_screen_buckets() {
+        for chat in [
+            ChatIdentity::SecondaryHall,
+            ChatIdentity::Unknown,
+            ChatIdentity::PublicChannel,
+            ChatIdentity::Friend(Arc::from("Alice")),
+        ] {
+            let frame = snapshot(Some(chat), vec![external_message()]);
+            assert_eq!(primary_scan_ready_evidence(Some(&frame), false), None);
+        }
+    }
+
+    /// 外部源接管期间观察线程不发布 OCR 帧（`latest()` 恒为 None），
+    /// 但在线供给大厅消息等价于识别结果已就绪，与二级分支的判据对齐。
+    #[test]
+    fn external_hall_supply_is_ready_without_an_ocr_snapshot() {
+        assert_eq!(
+            primary_scan_ready_evidence(None, true),
+            Some(ListenerReadyEvidence::PrimaryScan)
+        );
+        let empty = snapshot(None, Vec::new());
+        assert_eq!(
+            primary_scan_ready_evidence(Some(&empty), true),
+            Some(ListenerReadyEvidence::PrimaryScan)
+        );
     }
 }

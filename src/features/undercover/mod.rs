@@ -1285,6 +1285,12 @@ impl UndercoverGame {
             }
         };
         if !ended {
+            // 阶段超时推进后必须刷新活动时间。
+            //
+            // 旧实现只写回 phase：`last_activity` 仍是上一阶段的旧时间戳（已超过
+            // 超时阈值），调度器下一次 tick 会立刻判定新阶段也超时；此时新一轮
+            // 的 `votes`/`descriptions` 必然为空，直接以「无人获胜」终结整局。
+            game.last_activity = now;
             self.state = GameState::Playing(game);
         }
         deliveries
@@ -2277,6 +2283,63 @@ mod tests {
         assert!(settled.iter().any(|delivery| matches!(delivery,
             UndercoverDelivery::KeyedHallBatch(lines)
                 if lines.first().is_some_and(|line| line.render_default().contains("谁是卧底结束")))));
+    }
+
+    /// B10-P0-2：阶段超时推进后必须刷新 `last_activity`。
+    ///
+    /// 旧实现只写回 phase，新阶段沿用上一阶段的旧时间戳，调度器下一次 tick
+    /// （0ms 后）立刻再超时；此时 votes 为空，直接以「无人获胜」终结整局。
+    #[test]
+    fn phase_timeout_advance_refreshes_activity_and_does_not_chain_time_out() {
+        let now = Instant::now();
+        let mut game = enabled_game(30);
+        game.create("甲", UndercoverMode::Single, now).unwrap();
+        for player in ["乙", "丙", "丁"] {
+            game.join(player, now).unwrap();
+        }
+        let deliveries = game
+            .start(UndercoverWordPair::new("苹果", "梨"), now)
+            .unwrap();
+        let players = deliveries
+            .iter()
+            .filter_map(|delivery| match delivery {
+                UndercoverDelivery::KeyedFriend(delivery) => Some((
+                    delivery.recipient.clone(),
+                    delivery.reply.render_default().contains("梨"),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        game.complete_delivery(now).unwrap();
+        // 三人描述、一名**平民**挂机：tick 触发描述超时，把挂机者淘汰并推进到投票阶段。
+        // 必须挑平民：淘汰卧底会直接分出胜负、整局结束，测不到「推进后不再连环超时」。
+        let silent = players
+            .iter()
+            .find(|(_, undercover)| !*undercover)
+            .map(|(player, _)| player.clone())
+            .expect("single mode has civilians");
+        for (index, (player, _)) in players
+            .iter()
+            .filter(|(player, _)| player != &silent)
+            .enumerate()
+        {
+            game.describe(player, &format!("描述{index}"), now).unwrap();
+        }
+
+        let transition = game.tick(now + std::time::Duration::from_secs(180));
+        assert!(
+            game.is_active(),
+            "描述超时推进不应结束整局: {:?}",
+            delivery_default_text(&transition)
+        );
+
+        // 同一时刻再 tick：新阶段不能立刻连环超时。
+        let again = game.tick(now + std::time::Duration::from_secs(180));
+        assert!(
+            game.is_active(),
+            "推进后的新阶段不能在 0ms 后再次超时: {:?}",
+            delivery_default_text(&again)
+        );
     }
 
     #[test]

@@ -1131,7 +1131,10 @@ impl PendingTask {
             Self::Command(pending) if pending.routed.message_type == "控制台" => {
                 format!("控制台命令: {}", pending.routed.raw)
             }
-            Self::Command(pending) => pending.routed.raw.clone(),
+            // 标签会原样进 INFO/ERROR 日志（`tasks.rs` 的「待处理任务已完成/失败」），
+            // 不能再像以前那样直接返回 `routed.raw`：私聊投票原文、好友管理命令里的
+            // 昵称与游戏 UID、私聊点歌拼进 raw 的发送者都会随日志落盘。
+            Self::Command(pending) => private_safe_command_log(&pending.routed),
             Self::AdvanceQueue { reason } => format!("自动出队({})", reason),
             Self::ConsoleChat { text, prefix } => {
                 format!("控制台发言: {}{}", prefix, text)
@@ -1322,6 +1325,16 @@ struct ChatDecisionReader {
     _observation_session: ChatObservationExclusiveGuard,
 }
 
+/// 被跳过的会话首帧里，每条消息在 `seen` 中的定位旁路记录前缀。
+///
+/// 为什么塞进 `seen` 而不是给 `ChatDecisionReader` 加字段：该结构体在
+/// `secondary_chat.rs` / `playlist_window.rs` / 测试里都以完整字段字面量构造，
+/// 新增字段会强迫那些文件同步改动。用 `seen` 存一条不可与真实正文混淆的旁路记录，
+/// 可以在只改 `application.rs` 的前提下保存“这条气泡在首帧的 y”。
+const SKIPPED_FRAME_MARKER_PREFIX: &str = "\u{1}skipped-frame\u{1}";
+/// 与 `DecisionScreenLock` 一致的位置容差：同一条气泡允许 8px OCR 抖动。
+const SKIPPED_FRAME_POSITION_TOLERANCE_PX: i32 = 8;
+
 impl ChatDecisionReader {
     /// 这份快照是否属于本窗口的会话。
     ///
@@ -1386,7 +1399,63 @@ impl ChatDecisionReader {
         }
         // 键一律用业务容器：屏幕桶只是面板的别名，混用会让同一会话各记一次。
         // `insert` 返回 true 表示「这次才第一次见到」——那正是要跳过的一帧。
-        self.settled_conversations.insert(snapshot.scope.clone())
+        let first_frame = self.settled_conversations.insert(snapshot.scope.clone());
+        if first_frame {
+            // 被跳过的是整屏历史，但**必须登记为已见**（只登记、不派发）。
+            //
+            // 否则第二帧里同一批历史消息会因 `seen` 为空、且快照时间晚于基线，
+            // 被当成新决策再次派发（MUST_READ 第 2 节被绕过）。三条读取路径
+            // 都调用本方法，因此登记放在这里，避免某条路径静默漏掉。
+            for message in &snapshot.messages {
+                self.seen.insert((message.id.clone(), message.text.clone()));
+                // 额外记下首帧 y：第二帧若同一条气泡明显下移，那是用户刚发出的
+                // 新消息（不是重绘历史），需要撤回上面的“已见”登记。
+                self.seen.insert((
+                    message.id.clone(),
+                    format!(
+                        "{SKIPPED_FRAME_MARKER_PREFIX}{}\u{1}{}",
+                        message.block.y, message.text
+                    ),
+                ));
+            }
+            return true;
+        }
+        // 第二帧起：首帧历史里位置稳定或上移的是同一批历史（滚动只会让旧气泡上移），
+        // 保持 seen 抑制；只有明显下移才撤回登记，交给读取循环当作新决策派发。
+        //
+        // 标记**不在这里消费**：同一批历史可能在后续多帧持续出现，标记留到真正撤回
+        // 那一次才移除，避免“第三帧才下移”这种迟到的新消息被永久挡住。
+        for message in &snapshot.messages {
+            let Some((skipped_y, original_text)) = self.skipped_frame_marker(&message.id) else {
+                continue;
+            };
+            if message.block.y > skipped_y + SKIPPED_FRAME_POSITION_TOLERANCE_PX {
+                self.seen.remove(&(message.id.clone(), original_text));
+                self.seen.retain(|(seen_id, text)| {
+                    !(seen_id == &message.id && text.starts_with(SKIPPED_FRAME_MARKER_PREFIX))
+                });
+            }
+        }
+        false
+    }
+
+    /// 读取某条消息在“被跳过的首帧”里留下的位置标记（首帧 y 与原始正文）。
+    ///
+    /// 标记伪装成 `seen` 文本（前缀 + 首帧 y + `\u{1}` + 原正文），因此永远不会
+    /// 与读取循环里的 `(id, 正文)` 查询相撞。用 `seen` 保存是为了不新增结构体字段
+    /// —— `ChatDecisionReader` 的其他构造点在未授权修改的文件里。
+    fn skipped_frame_marker(
+        &self,
+        id: &crate::observation::chat::ObservedChatMessageId,
+    ) -> Option<(i32, String)> {
+        self.seen.iter().find_map(|(seen_id, text)| {
+            if seen_id != id {
+                return None;
+            }
+            let rest = text.strip_prefix(SKIPPED_FRAME_MARKER_PREFIX)?;
+            let (y, original_text) = rest.split_once('\u{1}')?;
+            Some((y.parse::<i32>().ok()?, original_text.to_string()))
+        })
     }
 
     /// 这条消息是否晚于窗口打开时的水位。
@@ -1772,8 +1841,10 @@ impl ApplicationRuntime {
             friend_delivery_config.clone(),
         )
         .with_recovery(recovery.clone());
-        let hall_ui = HallUi::new(ui_handle.clone(), ocr.clone(), hall_config);
-        let moderation_ui = ModerationUi::new(ui_handle.clone(), moderation_config);
+        let hall_ui = HallUi::new(ui_handle.clone(), ocr.clone(), hall_config)
+            .with_recovery(recovery.clone());
+        let moderation_ui =
+            ModerationUi::new(ui_handle.clone(), moderation_config).with_recovery(recovery.clone());
         let startup_ui = StartupUi::new(ui_handle.clone(), ocr.clone(), startup_config)
             .with_recovery(recovery.clone());
         let secondary_unread_ui = SecondaryUnreadUi::new(
@@ -1781,7 +1852,8 @@ impl ApplicationRuntime {
             ocr.clone(),
             secondary_unread_config,
             chat_timeline.clone(),
-        );
+        )
+        .with_recovery(recovery.clone());
         // 好友投递 / 大厅批量发送同样在事务包装器里做会话级恢复（入口 → 二级聊天 →
         // 回到入口），与 `residency_ui` 是同一类触发源，共用同一份协调器。
         let friend_delivery_ui = FriendDeliveryUi::new(
@@ -1796,7 +1868,8 @@ impl ApplicationRuntime {
             friend_delivery_config.clone(),
         )
         .with_recovery(recovery.clone());
-        let invite_ui = InviteUi::new(ui_handle.clone(), ocr.clone(), invite_config);
+        let invite_ui = InviteUi::new(ui_handle.clone(), ocr.clone(), invite_config)
+            .with_recovery(recovery.clone());
         let custom_action_ui = CustomActionUi::new(
             ui_handle.clone(),
             ocr.clone(),
@@ -1804,7 +1877,8 @@ impl ApplicationRuntime {
             config.screen.expected_width,
             config.screen.expected_height,
             friend_delivery_config,
-        );
+        )
+        .with_recovery(recovery.clone());
         let openai_runtime = OpenAiRuntime::start().context("启动 OpenAI runtime")?;
         let openai = openai_runtime.handle();
         // 三个 AI 功能共用同一份连接配置与 HTTP 客户端。
@@ -2107,14 +2181,53 @@ fn is_private_undercover_input(parsed: &RoutedCommand) -> bool {
     )
 }
 
-fn private_safe_command_log(parsed: &RoutedCommand) -> &str {
-    match &parsed.command {
+/// 可进日志/任务标签的命令文本。
+///
+/// 两层脱敏，缺一层都会漏：
+/// - 结构层：私密命令按语义给固定描述。卧底投票/弃权的 `raw` 是「投票」，
+///   谜底查询是「谜底」，但**不能依赖路由层永远这么拼**（旧版本把 `#投A` 原样
+///   放进 `raw`）；好友管理命令的 `raw` 是「拉黑 <昵称> <游戏 UID>」，昵称与
+///   UID 都是红线项，只保留动作名。
+/// - 文本层：`privacy::redacted_chat_text` 兜住未按结构识别的私密文本
+///   （歌单导入链接、卧底私聊原文、汤底等）。
+/// - 身份层：私聊点歌把发送者昵称拼进了 `raw`，这里统一换成 `[玩家]`。
+///
+/// 调用点有两处，口径必须一致：执行命令的 debug/info/error 日志与
+/// `PendingTask::label()`（后者会进「待处理任务已完成/失败」日志）。
+fn private_safe_command_log(parsed: &RoutedCommand) -> String {
+    let safe = match &parsed.command {
         ModuleCommand::Undercover(UndercoverCommand::Vote(_) | UndercoverCommand::Abstain) => {
-            "谁是卧底投票"
+            "谁是卧底投票".to_string()
         }
-        ModuleCommand::Undercover(UndercoverCommand::Reveal) => "谁是卧底谜底查询",
-        _ => &parsed.raw,
+        ModuleCommand::Undercover(UndercoverCommand::Reveal) => "谁是卧底谜底查询".to_string(),
+        // `ModerationCommand::parse_chat` 把「昵称 + 游戏 UID」拼进 raw；动作名足够定位问题。
+        ModuleCommand::Moderation(command) => format!("好友{}命令", command.action.label()),
+        _ => parsed.raw.clone(),
+    };
+    let safe = crate::privacy::redacted_chat_text(&safe);
+    redact_command_sender(safe, &parsed.username)
+}
+
+/// 把命令文本里的发送者昵称替换成占位符。
+///
+/// 私聊点歌的 `raw` 是 `<昵称> <前缀> <关键词>`，昵称属于真实玩家标识。
+/// 只有「出现在开头且后面跟着空白」或「昵称至少 2 个字符」时才替换：
+/// 单字昵称做全文替换会把命令里的同名字（例如「点」）一起吃掉，
+/// 而开头命中已经覆盖了大部分拼装格式。
+fn redact_command_sender(text: &str, sender: &str) -> String {
+    let sender = sender.trim();
+    if sender.is_empty() {
+        return text.to_string();
     }
+    if let Some(rest) = text.strip_prefix(sender)
+        && rest.starts_with(char::is_whitespace)
+    {
+        return format!("[玩家]{rest}");
+    }
+    if sender.chars().count() >= 2 {
+        return text.replace(sender, "[玩家]");
+    }
+    text.to_string()
 }
 
 fn command_location(message_type: &str) -> &str {
@@ -2699,6 +2812,113 @@ mod tests {
         assert!(!task.label().contains("敏感提问"));
     }
 
+    /// 把一行聊天路由成可排队的命令任务；路由失败直接 panic，避免测到假样本。
+    fn routed_command_task(text: &str, message_type: &str) -> PendingTask {
+        routed_command_task_with_active(text, message_type, None)
+    }
+
+    /// 同上，但允许指定「当前进行中的娱乐玩法」：`#` 命令需要会话匹配才被认领。
+    fn routed_command_task_with_active(
+        text: &str,
+        message_type: &str,
+        active: Option<crate::features::entertainment::EntertainmentKind>,
+    ) -> PendingTask {
+        let envelope = crate::interfaces::chat::parse_command_envelope(
+            text,
+            message_type,
+            None,
+            CommandObservation::default(),
+        )
+        .expect("command envelope");
+        let routed = ChatCommandRouter::without_custom_workflow()
+            .route(&envelope, active)
+            .expect("routed command");
+        PendingTask::Command(Box::new(PendingCommand {
+            lock_key: command::lock_key(&routed),
+            routed,
+        }))
+    }
+
+    /// B03-P1-3：`label()` 会进 INFO/ERROR 日志，卧底私聊投票不能带投票字母与昵称。
+    #[test]
+    fn pending_command_label_redacts_undercover_private_vote() {
+        let task = routed_command_task_with_active(
+            "[玩家甲]：#投A",
+            "pink",
+            Some(crate::features::entertainment::EntertainmentKind::Undercover),
+        );
+
+        let label = task.label();
+        assert!(label.contains("投票"), "脱敏后仍要能看出是投票：{label}");
+        assert!(!label.contains('A'), "投票字母不得进日志：{label}");
+        assert!(!label.contains("#投"), "私聊命令原文不得进日志：{label}");
+        assert!(!label.contains("玩家甲"), "发送者昵称不得进日志：{label}");
+    }
+
+    /// 路由层把投票 `raw` 换成「投票」只是第一道防线；`label()` 自己必须也能挡住
+    /// 原文。旧实现直接返回 `routed.raw`，本用例在旧代码上会失败。
+    #[test]
+    fn pending_command_label_redacts_vote_even_when_raw_keeps_the_letter() {
+        let envelope = CommandEnvelope::new(
+            "#投A",
+            "玩家甲",
+            "pink",
+            "#投A",
+            CommandObservation::default(),
+        )
+        .expect("command envelope");
+        let routed = RoutedCommand::from_envelope(
+            &envelope,
+            crate::features::command::FeatureCommandMatch::new(
+                "#",
+                "#投A",
+                ModuleCommand::Undercover(UndercoverCommand::Vote('A')),
+            ),
+        );
+        let task = PendingTask::Command(Box::new(PendingCommand {
+            lock_key: command::lock_key(&routed),
+            routed,
+        }));
+
+        assert_eq!(task.label(), "谁是卧底投票");
+    }
+
+    /// 好友管理命令的 `raw` 是「<动作> <昵称> <游戏 UID>」，两者都是红线项。
+    #[test]
+    fn pending_command_label_redacts_moderation_nickname_and_game_uid() {
+        let task = routed_command_task("[玩家甲]：@拉黑123456789", "pink");
+
+        let label = task.label();
+        assert!(label.contains("拉黑"), "脱敏后仍要能看出是拉黑：{label}");
+        assert!(!label.contains("123456789"), "游戏 UID 不得进日志：{label}");
+        assert!(!label.contains("玩家甲"), "发送者昵称不得进日志：{label}");
+    }
+
+    /// 私聊点歌把发送者昵称拼进了 `raw`；标签里换成占位符，命令内容照旧可诊断。
+    #[test]
+    fn pending_command_label_hides_the_sender_but_keeps_the_request() {
+        let task = routed_command_task("[玩家甲]：@点歌 晴天", "pink");
+
+        let label = task.label();
+        assert!(!label.contains("玩家甲"), "发送者昵称不得进日志：{label}");
+        assert!(label.contains("晴天"), "命令参数仍要保留：{label}");
+    }
+
+    /// 控制台命令不是玩家输入，保持原文与前缀语义（否则面板排障失去依据）。
+    #[test]
+    fn pending_command_label_keeps_console_command_text() {
+        let task = PendingTask::Command(Box::new(PendingCommand {
+            lock_key: ModuleCommand::Playback(PlaybackCommand::Next).lock_key(),
+            routed: RoutedCommand::console(
+                "下一首",
+                "下一首",
+                ModuleCommand::Playback(PlaybackCommand::Next),
+            ),
+        }));
+
+        assert_eq!(task.label(), "控制台命令: 下一首");
+    }
+
     #[test]
     fn idiom_explanation_uses_the_exclusive_command_executor() {
         assert!(
@@ -3025,5 +3245,83 @@ mod tests {
                 .expect("wait")
         );
         handle.join().expect("join notifier");
+    }
+
+    /// 回归 B03-P0-2：多会话窗口跳过新会话首帧时，必须把该帧消息登记为已见。
+    ///
+    /// 旧行为只 `settled_conversations.insert` 后 `continue`，没有写 `seen`；
+    /// 第二帧同一批历史因 `seen` 为空、且快照时间晚于基线，会被当成新决策派发。
+    #[test]
+    fn skipped_first_frame_messages_are_not_dispatched_on_second_frame() {
+        use crate::observation::chat::{ChatIdentity, ChatTimeline, RecognizedChatMessage};
+
+        fn message(text: &str, y: i32) -> RecognizedChatMessage {
+            RecognizedChatMessage {
+                message_type: "blue".to_string(),
+                block: crate::geometry::Rect::new(0, y, 100, 10),
+                text: text.to_string(),
+                sender: None,
+                raw_sender: None,
+            }
+        }
+
+        let shared = ChatTimeline::new();
+        let observations = ChatObservationShared::new();
+        let observation_session = observations.begin_exclusive().unwrap();
+        let subscriber = shared.subscribe().unwrap();
+        let baseline = shared
+            .publish(
+                Instant::now(),
+                ChatIdentity::PrimaryHall,
+                vec![message("基线", 10)],
+            )
+            .unwrap();
+        let mut reader = ChatDecisionReader {
+            listener_mode: ChatListenerMode::Primary,
+            subscriber,
+            scope: baseline.scope.clone(),
+            any_conversation: true,
+            chat: ChatIdentity::PrimaryHall,
+            settled_conversations: std::collections::HashSet::new(),
+            baseline_at: baseline.captured_at,
+            sequence_floor: None,
+            baseline_cursor: None,
+            seen: baseline
+                .messages
+                .into_iter()
+                .map(|message| (message.id, message.text))
+                .collect(),
+            screen_lock: DecisionScreenLock::default(),
+            _observation_session: observation_session,
+        };
+
+        // 首次见到该会话：整屏历史必须跳过。
+        shared
+            .publish(
+                Instant::now(),
+                ChatIdentity::Friend("甲".into()),
+                vec![message("@确认", 20)],
+            )
+            .unwrap();
+        assert!(
+            reader.read_messages().unwrap().is_empty(),
+            "首次见到某会话时，它的整屏历史不得作为决策输入"
+        );
+
+        // 第二帧同一批历史：快照时间已晚于基线，但跳过时已登记 seen，不得重新派发。
+        std::thread::sleep(Duration::from_millis(2));
+        shared
+            .publish(
+                Instant::now(),
+                ChatIdentity::Friend("甲".into()),
+                vec![message("@确认", 20)],
+            )
+            .unwrap();
+        let got = reader.read_messages().unwrap();
+        assert!(
+            got.is_empty(),
+            "被跳过的首帧历史不得在第二帧重新派发，实际收到 {} 条",
+            got.len()
+        );
     }
 }

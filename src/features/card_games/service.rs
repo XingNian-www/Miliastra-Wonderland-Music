@@ -638,9 +638,11 @@ impl CardGameService {
                         )?;
                         (CardGameCommandStart::Suspended(request), false)
                     } else {
-                        self.begin_game_outcome_in_state(
+                        // `player` 是身份键（可能是 UUID），渲染与投递只认展示名。
+                        self.begin_game_outcome_in_state_with_display(
                             entertainment,
                             player,
+                            player_display,
                             command,
                             now,
                             CardGameEffectLane::Formal,
@@ -845,24 +847,6 @@ impl CardGameService {
         .map(CardGameCommandStart::Suspended)
     }
 
-    fn begin_game_outcome_in_state(
-        &mut self,
-        entertainment: &mut EntertainmentState,
-        player: &str,
-        command: &LandlordCommand,
-        now: Instant,
-        lane: CardGameEffectLane,
-    ) -> Result<(CardGameCommandStart, bool)> {
-        self.begin_game_outcome_in_state_with_display(
-            entertainment,
-            player,
-            player,
-            command,
-            now,
-            lane,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn begin_game_outcome_in_state_with_display(
         &mut self,
@@ -924,6 +908,11 @@ impl CardGameService {
         if !pending_state.effect.accepts(&result) {
             bail!("card game effect result does not match the suspended effect");
         }
+        // `PrivateBatch` 与 `PrivateBatchTemplates` 都被 `accepts` 接受，但恢复分支
+        // 只按模板版实现：先统一折算，避免「接受后被 `_ =>` 当作异常」把挂起态吃掉
+        // （旧实现会在移除 pending 后报「恢复分支异常」，既不进 `pending_retry`
+        // 也不释放娱乐锁）。
+        let result = normalize_private_batch_result(result);
         let continues = pending_state.effect.continues_after(&result);
         if continues && let Err(error) = ensure_operation_capacity(&self.state) {
             reset_transient_state(&mut self.state);
@@ -1694,6 +1683,28 @@ fn suspend_effect(
     );
     state.next_operation_id = next_operation_id;
     Ok(CardGameEffectRequest { key, lane, effect })
+}
+
+/// 把旧投递端点可能回传的通用 `PrivateBatch` 结果折算成卡牌模板版。
+///
+/// `CardGameEffectResult::PrivateBatch` 携带的是 `Vec<FriendMessage>` 形态的可重试项，
+/// 与卡牌需要的 `LandlordPrivateDelivery`（带模板与动作）**无法无损互换**：
+/// - `Complete` 语义相同；
+/// - `Failed` 一律按「结果未知」处理，`retryable` 置空 —— 宁可让玩家 `#结束`
+///   收尾，也不拿通用好友消息去重发牌局私聊（会重复发牌/发词）。
+fn normalize_private_batch_result(result: CardGameEffectResult) -> CardGameEffectResult {
+    match result {
+        CardGameEffectResult::PrivateBatch(raw) => {
+            CardGameEffectResult::PrivateBatchTemplates(raw.map(|outcome| match outcome {
+                FriendBatchOutcome::Complete => CardGameFriendBatchOutcome::Complete,
+                FriendBatchOutcome::Failed { failure, .. } => CardGameFriendBatchOutcome::Failed {
+                    retryable: Vec::new(),
+                    failure,
+                },
+            }))
+        }
+        other => other,
+    }
 }
 
 fn abort_state(state: &mut CardGameState) -> Result<bool> {

@@ -13,6 +13,7 @@ use crate::observation::chat::{
     unread_hit_still_visible,
 };
 use crate::runtime::ocr::OcrRuntimeHandle;
+use crate::runtime::recovery::GameRecoveryCoordinator;
 use crate::runtime::ui::{
     InputCertainty, UiOperation, UiRoutine, UiRoutineContext, UiRoutineFailure, UiRuntimeHandle,
     UiSubmitError, sealed,
@@ -65,6 +66,8 @@ pub(crate) struct SecondaryUnreadUi {
     ocr: OcrRuntimeHandle,
     chat_timeline: ChatTimeline,
     config: SecondaryUnreadRoutineConfig,
+    /// 进程级共享的恢复协调器（见 [`SettleEnvironment::with_recovery`]）。
+    recovery: GameRecoveryCoordinator,
 }
 
 impl SecondaryUnreadUi {
@@ -79,7 +82,14 @@ impl SecondaryUnreadUi {
             ocr,
             chat_timeline,
             config,
+            recovery: GameRecoveryCoordinator::default(),
         }
+    }
+
+    /// 用进程级共享的恢复协调器替换默认实例（装配层只 `default()` 一次）。
+    pub(crate) fn with_recovery(mut self, recovery: GameRecoveryCoordinator) -> Self {
+        self.recovery = recovery;
+        self
     }
 
     pub(crate) fn submit(
@@ -91,6 +101,7 @@ impl SecondaryUnreadUi {
             ocr: self.ocr.clone(),
             chat_timeline: self.chat_timeline.clone(),
             config: self.config.clone(),
+            recovery: self.recovery.clone(),
         })
     }
 }
@@ -126,6 +137,15 @@ struct ProcessSecondaryUnreadRoutine {
     ocr: OcrRuntimeHandle,
     chat_timeline: ChatTimeline,
     config: SecondaryUnreadRoutineConfig,
+    recovery: GameRecoveryCoordinator,
+}
+
+impl ProcessSecondaryUnreadRoutine {
+    /// 业务前置恢复同样挂在进程级协调器上：这次基线也属于「恢复采样」。
+    fn environment(&self) -> SettleEnvironment {
+        SettleEnvironment::new(self.ocr.clone(), self.config.residency.clone())
+            .with_recovery(self.recovery.clone())
+    }
 }
 
 impl sealed::UiRoutineSealed for ProcessSecondaryUnreadRoutine {}
@@ -134,26 +154,14 @@ impl UiRoutine for ProcessSecondaryUnreadRoutine {
     type Output = ProcessSecondaryUnreadOutcome;
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
-        // Acquire before any navigation and keep suppression through restoration,
-        // including failure/cancellation paths. No service lock spans UI waits.
-        let _discard_guard = if self.request.discard_only {
-            match self.chat_timeline.suppress_friend_business() {
-                Ok(guard) => Some(guard),
-                Err(error) => {
-                    let failure = before_input_failure("suppress_secondary_unread", error);
-                    return ProcessSecondaryUnreadOutcome {
-                        effect: SecondaryUnreadEffect::Failed(failure.clone()),
-                        residency: UiResidencyOutcome::Failed(failure),
-                    };
-                }
-            }
-        } else {
-            None
-        };
+        // 抑制守卫由外层 `ProcessSecondaryUnreadTask` 持有（见那里的说明）：
+        // 本结构体在 `UiTask` 的内层执行结束时就会被消费掉，若守卫挂在这里，
+        // 它会在包装器的收尾恢复**开始之前**析构（B15-P1-1）。
+        let environment = self.environment();
         let effect = match process_unread(
             context,
             &self.request,
-            &self.ocr,
+            &environment,
             &self.chat_timeline,
             &self.config,
         ) {
@@ -202,6 +210,15 @@ struct ProcessSecondaryUnreadTask {
     ocr: OcrRuntimeHandle,
     chat_timeline: ChatTimeline,
     config: SecondaryUnreadRoutineConfig,
+    recovery: GameRecoveryCoordinator,
+}
+
+impl ProcessSecondaryUnreadTask {
+    /// 收尾环境必须挂着进程级共享的协调器，否则本次恢复记账只活在本任务里。
+    fn environment(&self) -> SettleEnvironment {
+        SettleEnvironment::new(self.ocr.clone(), self.config.residency.clone())
+            .with_recovery(self.recovery.clone())
+    }
 }
 
 impl sealed::UiRoutineSealed for ProcessSecondaryUnreadTask {}
@@ -210,7 +227,25 @@ impl UiRoutine for ProcessSecondaryUnreadTask {
     type Output = ProcessSecondaryUnreadOutcome;
 
     fn execute(self, context: &mut UiRoutineContext<'_>) -> Self::Output {
-        let environment = SettleEnvironment::new(self.ocr.clone(), self.config.residency.clone());
+        // 抑制守卫必须在**任何导航之前**取得，并活到 `UiTask::execute` 返回——
+        // 那次返回已经包含包装器的 `Fixed(Secondary(CurrentHall))` 收尾恢复
+        // （含失败/取消路径）。放在这里而不是内层 `execute`，是因为内层返回时
+        // 收尾还没开始，守卫会被提前析构（B15-P1-1）。
+        let discard_guard = if self.request.discard_only {
+            match self.chat_timeline.suppress_friend_business() {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    let failure = before_input_failure("suppress_secondary_unread", error);
+                    return ProcessSecondaryUnreadOutcome {
+                        effect: SecondaryUnreadEffect::Failed(failure.clone()),
+                        residency: UiResidencyOutcome::Failed(failure),
+                    };
+                }
+            }
+        } else {
+            None
+        };
+        let environment = self.environment();
         let outcome = UiTask::new(
             process_secondary_unread_task_spec(environment),
             ProcessSecondaryUnreadRoutine {
@@ -218,9 +253,12 @@ impl UiRoutine for ProcessSecondaryUnreadTask {
                 ocr: self.ocr,
                 chat_timeline: self.chat_timeline,
                 config: self.config,
+                recovery: self.recovery,
             },
         )
         .execute(context);
+        // 收尾恢复已经随 `UiTask::execute` 结束，这里才允许释放抑制。
+        drop(discard_guard);
         let residency = outcome.residency.clone();
         match outcome.output {
             Some(mut output) => {
@@ -241,7 +279,7 @@ impl UiRoutine for ProcessSecondaryUnreadTask {
 fn process_unread(
     context: &mut UiRoutineContext<'_>,
     request: &ProcessSecondaryUnread,
-    ocr: &OcrRuntimeHandle,
+    environment: &SettleEnvironment,
     chat_timeline: &ChatTimeline,
     config: &SecondaryUnreadRoutineConfig,
 ) -> Result<SecondaryUnreadEffect, UiRoutineFailure> {
@@ -253,7 +291,7 @@ fn process_unread(
     // 不承担任务收尾。收尾由包装器 Fixed(Secondary(CurrentHall)) 唯一执行。
     super::residency::settle_to(
         context,
-        &SettleEnvironment::new(ocr.clone(), config.residency.clone()),
+        environment,
         ResidencyTarget::Secondary(ConversationRef::CurrentHall),
     )?;
 
@@ -661,7 +699,10 @@ mod tests {
     use super::*;
     use crate::config::AppConfig;
     use crate::geometry::Rect;
+    use crate::runtime::ocr::{OcrDevice, OcrLine, OcrRuntime};
+    use crate::runtime::recovery::{GameRecoveryCoordinator, RecoveryTrigger};
     use crate::ui::routines::friend_delivery::FriendDeliveryRoutineConfig;
+    use image::DynamicImage;
 
     #[test]
     fn unread_selection_promotes_latest_incoming_without_replaying_history() {
@@ -888,8 +929,7 @@ mod tests {
     /// 收尾固定在这里且只由包装器 Fixed 的唯一引擎执行一次。
     #[test]
     fn secondary_unread_task_spec_is_fixed_to_current_hall() {
-        let config =
-            AppConfig::load(std::path::Path::new("tests/fixtures/config.full.yaml")).unwrap();
+        let config = crate::config::bundled_config();
         let spec = process_secondary_unread_task_spec(SettleEnvironment::without_ocr(
             FriendDeliveryRoutineConfig::from_app(&config),
         ));
@@ -903,5 +943,97 @@ mod tests {
             spec.target,
             ResidencyTarget::Secondary(ConversationRef::CurrentHall)
         );
+    }
+
+    struct EmptySecondaryUnreadOcr;
+
+    impl OcrDevice for EmptySecondaryUnreadOcr {
+        fn recognize_lines(&mut self, _image: &DynamicImage) -> anyhow::Result<Vec<OcrLine>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn unread_request() -> ProcessSecondaryUnread {
+        ProcessSecondaryUnread::new(
+            UnreadFriendHit {
+                indicator: crate::geometry::Point::new(67, 307),
+                row_click: crate::geometry::Point::new(150, 307),
+            },
+            true,
+        )
+    }
+
+    fn unread_config() -> SecondaryUnreadRoutineConfig {
+        SecondaryUnreadRoutineConfig::resolve(
+            FriendDeliveryRoutineConfig::from_app(&crate::config::bundled_config()),
+            0,
+            Arc::new(RwLock::new(100)),
+        )
+    }
+
+    /// B15-P2-4 回归：未读任务的两个环境构造点都必须共享进程级协调器。
+    ///
+    /// 一处是 `UiTask` 的收尾环境，另一处是例程开头「当前大厅」的业务基线；
+    /// 少接一处，那一次恢复采样就记进私有实例。
+    #[test]
+    fn secondary_unread_paths_share_the_injected_recovery_coordinator() {
+        let ocr_runtime = OcrRuntime::start(EmptySecondaryUnreadOcr, 1).unwrap();
+        let shared = GameRecoveryCoordinator::default();
+        shared.record_restart_completed(
+            std::time::Instant::now(),
+            RecoveryTrigger::ExternalChatDisconnect,
+        );
+        let timeline = ChatTimeline::new();
+
+        let task = ProcessSecondaryUnreadTask {
+            request: unread_request(),
+            ocr: ocr_runtime.handle(),
+            chat_timeline: timeline.clone(),
+            config: unread_config(),
+            recovery: shared.clone(),
+        };
+        assert_eq!(
+            task.environment()
+                .recovery()
+                .health_snapshot_now()
+                .total_restarts,
+            1,
+            "未读任务的收尾环境必须共享注入的协调器"
+        );
+
+        let routine = ProcessSecondaryUnreadRoutine {
+            request: unread_request(),
+            ocr: ocr_runtime.handle(),
+            chat_timeline: timeline,
+            config: unread_config(),
+            recovery: shared.clone(),
+        };
+        assert_eq!(
+            routine
+                .environment()
+                .recovery()
+                .health_snapshot_now()
+                .total_restarts,
+            1,
+            "业务前置基线也必须共享注入的协调器"
+        );
+
+        let unwired = ProcessSecondaryUnreadRoutine {
+            request: unread_request(),
+            ocr: ocr_runtime.handle(),
+            chat_timeline: ChatTimeline::new(),
+            config: unread_config(),
+            recovery: GameRecoveryCoordinator::default(),
+        };
+        assert_eq!(
+            unwired
+                .environment()
+                .recovery()
+                .health_snapshot_now()
+                .total_restarts,
+            0,
+            "默认构造的协调器不得看到共享实例的重启记录"
+        );
+        ocr_runtime.shutdown().unwrap();
     }
 }

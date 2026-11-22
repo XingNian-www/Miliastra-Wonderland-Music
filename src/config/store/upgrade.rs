@@ -73,6 +73,15 @@ impl ConfigStore {
             drop(transaction);
             return Self::ensure_schema(connection, path);
         }
+        // B04-P1-6：取锁后版本必须仍等于决策时读到的版本。若已被别的进程推进到
+        // 另一个旧版本，本次断代会按过期前提丢弃配置——放弃并重走 ensure_schema。
+        if version != stale_version {
+            log::warn!(
+                "配置断代：取写锁后 schema 版本已从 v{stale_version} 变为 v{version}（另一进程刚升级过），放弃本次断代并重新校验"
+            );
+            drop(transaction);
+            return Self::ensure_schema(connection, path);
+        }
         transaction.execute_batch(
             "DROP TABLE config_revisions;
                  DROP TABLE config_sections;
@@ -132,6 +141,11 @@ impl ConfigStore {
         }
         if version != stale_version {
             // 版本在取锁前被别的进程推进到另一个仍需迁移的旧版本：按实际版本重来。
+            // 放弃而不是继续，否则会用 v{stale_version} 的映射表去改 v{version} 的数据
+            // （并发升级可能把新版本数据回退，B04-P1-6）。
+            log::warn!(
+                "配置迁移：取写锁后 schema 版本已从 v{stale_version} 变为 v{version}（另一进程刚升级过），放弃本次迁移并重新校验"
+            );
             drop(transaction);
             return Self::ensure_schema(connection, path);
         }

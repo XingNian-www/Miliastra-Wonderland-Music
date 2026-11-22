@@ -435,7 +435,16 @@ fn required_mnn_path<'a>(path: &'a Option<PathBuf>, field: &str) -> Result<&'a P
 }
 
 pub(crate) fn merge_ocr_lines(mut items: Vec<OcrLine>, same_line_y_tolerance: i32) -> String {
-    items.sort_by(|left, right| compare_rect_top_left(left.bbox, right.bbox));
+    // 行聚类是贪心的：每个文本框只与 `lines.last_mut()` 比较纵向距离，
+    // 因此预排序必须严格按 y 递增。不能用 `compare_rect_top_left` 的 `y / 10` 分桶：
+    // 同一行的两个框若跨过 10*k 边界（y=9 与 y=10），桶内又先比 x，
+    // 下一行左侧的框（x 更小）会插到两者中间，把同一行拆开或把下一行并进来。
+    items.sort_by(|left, right| {
+        left.bbox
+            .y
+            .cmp(&right.bbox.y)
+            .then_with(|| left.bbox.x.cmp(&right.bbox.x))
+    });
     let mut lines: Vec<(i32, Vec<OcrLine>)> = Vec::new();
     for item in items {
         if let Some((line_y, line_items)) = lines.last_mut()
@@ -545,12 +554,9 @@ fn elapsed_ms(started: Instant) -> u128 {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "ocr-mnn")]
-    use std::path::Path;
-
     use super::*;
     #[cfg(feature = "ocr-mnn")]
-    use crate::config::AppConfig;
+    use crate::config::bundled_config;
     #[cfg(feature = "ocr-mnn")]
     use crate::observation::chat::SECONDARY_TITLE_RECT;
 
@@ -588,6 +594,48 @@ mod tests {
         );
     }
 
+    fn ocr_line(text: &str, x: i32, y: i32) -> OcrLine {
+        OcrLine {
+            text: text.to_string(),
+            confidence: 0.9,
+            bbox: Rect::new(x, y, 10, 10),
+        }
+    }
+
+    #[test]
+    fn merge_ocr_lines_orders_rows_by_y_instead_of_by_ten_pixel_buckets() {
+        // 第一行的两个框（y=10/11）与第二行的左框（y=19）落在同一个 `y / 10` 桶里。
+        // 旧实现在桶内先比 x，会把第二行（x=10 更小）排到第一行前面，
+        // 合并结果变成「CC AA BB」——上下两行文本顺序颠倒。
+        assert_eq!(
+            merge_ocr_lines(
+                vec![
+                    ocr_line("AA", 100, 10),
+                    ocr_line("BB", 200, 11),
+                    ocr_line("CC", 10, 19),
+                ],
+                2
+            ),
+            "AA BB CC",
+            "行聚类必须按 y 递增排序，不能按 y/10 分桶后再比 x"
+        );
+
+        // 同一行的两个框跨过 10 的倍数边界（y=9 与 y=10）：预排序不能把下一行插进来，
+        // 也不能让第一行右半部分被拆到第二行后面。
+        assert_eq!(
+            merge_ocr_lines(
+                vec![
+                    ocr_line("AA", 10, 9),
+                    ocr_line("BB", 100, 10),
+                    ocr_line("CC", 10, 19),
+                ],
+                2
+            ),
+            "AA BB CC",
+            "跨 10 像素边界的同行文本框必须仍然相邻"
+        );
+    }
+
     #[test]
     fn resolves_backend_priority_case_insensitively_and_deduplicates() {
         assert_eq!(
@@ -618,8 +666,9 @@ mod tests {
     #[test]
     #[cfg(feature = "ocr-mnn")]
     fn fixed_secondary_chat_fixture_recognizes_title_and_strict_friend_list() {
-        let config = AppConfig::load(Path::new("tests/fixtures/config.full.yaml"))
-            .expect("load default config");
+        // 配置来自编译进二进制的 `src/config/test.full.yaml`；`tests/` 不入库，
+        // 干净检出时不能依赖 `tests/fixtures/config.full.yaml`。
+        let config = bundled_config();
         let args = OcrArgs::default().resolve(&config.ocr);
         let mut engine = make_ocr_engine(&args).expect("initialize OCR engine");
         let image = image::open("tests/fixtures/ui/secondary-chat-scrolled-1920x1080.jpg")

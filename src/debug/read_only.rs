@@ -398,17 +398,20 @@ impl ReadOnlyObserver {
             return;
         }
         let redactions = sensitive_strings(&payload);
-        let mut task = redact_strings(sanitize_payload(payload), &redactions);
+        let sanitized = sanitize_payload(payload);
         // Source policy survives payload-budget truncation; oversized metadata must
         // never turn an explicitly private or nonvisual source into a raw screenshot.
-        let private_source = task.get("sourceFrameOmitted").is_some()
-            || task.pointer("/sourceCommand/sourceFrameOmitted").is_some();
-        let non_visual_source = task.get("sourceKind").and_then(Value::as_str)
-            == Some("nonVisualInput")
-            || task
-                .pointer("/sourceCommand/sourceKind")
-                .and_then(Value::as_str)
-                == Some("nonVisualInput");
+        let private_source = sanitized.get("sourceFrameOmitted").is_some()
+            || sanitized
+                .pointer("/sourceCommand/sourceFrameOmitted")
+                .is_some();
+        // B04-P1-7: decide the source kind on the *unredacted* payload. Short secrets
+        // may legitimately appear as a substring of the marker (a two-character
+        // nickname also occurs inside "nonVisualInput" only in theory, but a token
+        // prefix such as "non" really does), so reading it after replacement would
+        // silently turn a console input into a "missing screenshot" visual flow.
+        let non_visual_source = source_kind(&sanitized) == Some(NON_VISUAL_INPUT_KIND);
+        let mut task = redact_strings(sanitized, &redactions);
         let payload_bytes = serde_json::to_vec(&task)
             .map(|v| v.len())
             .unwrap_or(MAX_PAYLOAD_BYTES + 1);
@@ -1134,6 +1137,22 @@ fn sensitive_key(key: &str) -> bool {
         )
 }
 
+/// 判定 `sourceKind` 用的标记值：控制台/HTTP 输入没有可截图的来源。
+const NON_VISUAL_INPUT_KIND: &str = "nonVisualInput";
+
+/// 子串替换的最小长度（字节）。短于此长度的敏感值（如两位数字令牌、ASCII
+/// 两字缩写）会在无关文本里大量命中，因此只做整词/整段替换（见
+/// [`replace_whole_token`]）。
+const MIN_SUBSTRING_REDACTION_BYTES: usize = 4;
+
+/// 敏感值是否可以安全地做子串替换。
+///
+/// 长度达标还不够：纯空白/纯标点（`" "`、`"..."`、`"***"`）在任何文本里都能
+/// 命中，同样只做整词替换。至少含一个字母或数字才算有区分度。
+fn substring_redaction(secret: &str) -> bool {
+    secret.len() >= MIN_SUBSTRING_REDACTION_BYTES && secret.chars().any(char::is_alphanumeric)
+}
+
 fn sensitive_strings(value: &Value) -> Vec<String> {
     fn collect_sensitive_values(value: &Value, output: &mut Vec<String>) {
         match value {
@@ -1192,11 +1211,54 @@ fn sensitive_strings(value: &Value) -> Vec<String> {
     output
 }
 
+/// 从一份（已 sanitize 的）payload 里读来源类型：先看顶层，再看 `sourceCommand`。
+fn source_kind(payload: &Value) -> Option<&str> {
+    payload
+        .get("sourceKind")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            payload
+                .pointer("/sourceCommand/sourceKind")
+                .and_then(Value::as_str)
+        })
+}
+
+/// 阈值以下的敏感值只做「整词/整段」替换：命中位置前后必须是非字母数字边界
+/// （字符串首尾也算边界）。这样 `"12"` 仍能脱敏独立的 `"12"`（含整段恰好等于
+/// `"12"` 的情形），但不会把 `"123456789"`、`"2012"` 一起改掉。
+fn replace_whole_token(text: &str, secret: &str, replacement: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for (start, _) in text.match_indices(secret) {
+        if start < cursor {
+            continue;
+        }
+        let end = start + secret.len();
+        let before = text[..start].chars().next_back();
+        let after = text[end..].chars().next();
+        let bounded = before.is_none_or(|c| !c.is_alphanumeric())
+            && after.is_none_or(|c| !c.is_alphanumeric());
+        if bounded {
+            output.push_str(&text[cursor..start]);
+            output.push_str(replacement);
+            cursor = end;
+        }
+    }
+    output.push_str(&text[cursor..]);
+    output
+}
+
 fn redact_strings(value: Value, redactions: &[String]) -> Value {
     match value {
         Value::String(mut text) => {
             for secret in redactions {
-                text = text.replace(secret, "[redacted]");
+                // B04-P1-7: 阈值以上的敏感值仍做子串替换，脱敏强度不降；
+                // 阈值以下（短令牌、2 字昵称、纯标点）只替换整词/整段。
+                text = if substring_redaction(secret) {
+                    text.replace(secret.as_str(), "[redacted]")
+                } else {
+                    replace_whole_token(&text, secret, "[redacted]")
+                };
             }
             json!(crate::privacy::redacted_chat_text(&text))
         }
@@ -1509,6 +1571,87 @@ mod tests {
         assert!(!evidence.contains("123456"));
         assert!(!evidence.contains("测试昵称"));
         assert!(!evidence.contains("secret-auth"));
+    }
+
+    /// B04-P1-7 ①：短敏感值（少于 4 字节的令牌/昵称）不得污染无关文本。
+    #[test]
+    fn short_secrets_do_not_redact_unrelated_text() {
+        // "12" 是合法的两字昵称/短令牌前缀；"2012"、"123456789" 与它无关。
+        assert_eq!(
+            redact_strings(json!({"result": "2012年的记录 123456789"}), &["12".into()]),
+            json!({"result": "2012年的记录 123456789"}),
+            "短值的子串不得命中无关文本"
+        );
+        // 整段恰好等于短值时仍要脱敏（不降低既有强度）。
+        assert_eq!(
+            redact_strings(json!({"result": "12"}), &["12".into()]),
+            json!({"result": "[redacted]"})
+        );
+        // 整词出现（前后是非字母数字边界）仍要脱敏。
+        assert_eq!(
+            redact_strings(json!({"result": "id=12; next"}), &["12".into()]),
+            json!({"result": "id=[redacted]; next"})
+        );
+        // 纯标点即使长度达标也不做子串替换（"...." 会命中一切点号序列）。
+        assert!(!substring_redaction("...."));
+        assert_eq!(
+            redact_strings(
+                json!({"result": "v1....2", "only": "...."}),
+                &["....".into()]
+            ),
+            json!({"result": "v1....2", "only": "[redacted]"}),
+            "纯标点敏感值只做整段替换"
+        );
+    }
+
+    /// B04-P1-7 ②：阈值以上的敏感值仍做完整子串替换。
+    #[test]
+    fn long_secrets_are_still_replaced_everywhere() {
+        let redactions = ["secret-token".to_string()];
+        assert_eq!(
+            redact_strings(
+                json!({"a": "prefix-secret-token-suffix", "b": ["secret-token"]}),
+                &redactions
+            ),
+            json!({"a": "prefix-[redacted]-suffix", "b": ["[redacted]"]})
+        );
+        // 观测器层面：状态里的长敏感串也要被替换掉。
+        let observer = ReadOnlyObserver::default();
+        observer.set_enabled_state(true, ReadOnlyState::Push);
+        observer.record_trigger(
+            1,
+            json!({"kind": "command", "parameters": {"token": "secret-token"}}),
+            None,
+        );
+        let evidence = observer.read_entry("readonly-1").unwrap().to_string();
+        assert!(!evidence.contains("secret-token"));
+    }
+
+    /// B04-P1-7 ③：`sourceKind` 的判定必须用替换前的原始 payload。
+    ///
+    /// 敏感值恰好是 `"nonVisualInput"` 的子串（这里是 `"nonV"`，4 字节）时，
+    /// 旧实现先替换再判定，会把 "nonVisualInput" 打成 "[redacted]isualInput"，
+    /// 从而把一个控制台输入误判成「缺失截图的可视流程」。
+    #[test]
+    fn source_kind_is_decided_before_redaction() {
+        let observer = ReadOnlyObserver::default();
+        observer.set_enabled_state(true, ReadOnlyState::Push);
+        observer.record_trigger(
+            7,
+            json!({"kind": "command", "sourceKind": "nonVisualInput",
+                "parameters": {"token": "nonV"}}),
+            Some(Instant::now()),
+        );
+        let evidence = observer.read_entry("readonly-1").unwrap();
+        assert_eq!(
+            evidence["missingReason"], "non_visual_input_has_no_source_frame",
+            "sourceKind 判定不得被脱敏污染"
+        );
+        assert!(evidence["source"].is_null());
+        assert_eq!(
+            evidence["task"]["sourceKind"], "[redacted]isualInput",
+            "任务里的敏感子串仍要被替换（脱敏强度不降）"
+        );
     }
 
     /// This is opt-in because real screenshots are deliberately kept local and ignored by git.

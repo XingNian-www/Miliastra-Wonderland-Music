@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -232,21 +233,6 @@ impl QqMusicAdapter {
             .get("qqmusic")
             .map_err(|error| CatalogError::AuthRequired(error.to_string()))?
             .ok_or_else(|| CatalogError::AuthRequired("QQ Music credential_required".to_owned()))
-    }
-
-    async fn request_json_with_credential(
-        &self,
-        credential: &ProviderCredential,
-        url: &Url,
-        body: Value,
-    ) -> Result<Value, CatalogError> {
-        self.request_json_with_credential_options(
-            credential,
-            url,
-            body,
-            &QqRequestOptions::default(),
-        )
-        .await
     }
 
     async fn request_json_with_credential_options(
@@ -1059,6 +1045,54 @@ impl QqMusicAdapter {
         }
     }
 
+    /// 请求 `VipLogin.VipLoginInter/vip_login_base`：真正的登录态接口。
+    ///
+    /// 搜索端点匿名也可用（对照 `netease.rs` 的同一条规则），不能作为登录成功依据；
+    /// 本接口对匿名/过期会话返回业务错误码或空 `data`，只有有效会话才返回
+    /// `identity`。账号状态查询与登录凭据校验共用同一请求口径，避免两处判定再次分叉。
+    async fn vip_login_base(
+        &self,
+        cookies: &BTreeMap<String, String>,
+    ) -> Result<Value, CatalogError> {
+        let uin = first_cookie(cookies, &["uin", "wxuin"]).unwrap_or("0");
+        let body = serde_json::json!({
+            "comm": {"ct": 24, "cv": 0, "uin": uin},
+            "req_0": {
+                "module": "VipLogin.VipLoginInter",
+                "method": "vip_login_base",
+                "param": {}
+            }
+        });
+        let response = self
+            .client
+            .post(self.search_url.clone())
+            .header("Cookie", cookie_header(cookies))
+            .header("Referer", "https://y.qq.com/")
+            .json(&body)
+            .send()
+            .await
+            .map_err(classify_request_error)?;
+        classify_status(&response)?;
+        let value = response
+            .json::<Value>()
+            .await
+            .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
+        if let Some(error) = qq_response_business_error(&value) {
+            return Err(match error {
+                CatalogError::AuthRequired(_) => CatalogError::CredentialRejected(
+                    "QQ Music vip_login_base rejected credentials".to_owned(),
+                ),
+                other => other,
+            });
+        }
+        if qq_validation_is_rejected(&value) {
+            return Err(CatalogError::InvalidResponse(
+                "QQ Music vip_login_base returned an unrecognized error code".to_owned(),
+            ));
+        }
+        Ok(value)
+    }
+
     async fn query_account_status(&self) -> Result<Option<ProviderAccountStatus>, CatalogError> {
         let checked_at_ms = epoch_ms();
         let Ok(credential) = self.credential() else {
@@ -1101,42 +1135,7 @@ impl QqMusicAdapter {
                 ..ProviderAccountStatus::default()
             }));
         }
-        let uin = first_cookie(cookies, &["uin", "wxuin"]).unwrap_or("0");
-        let body = serde_json::json!({
-            "comm": {"ct": 24, "cv": 0, "uin": uin},
-            "req_0": {
-                "module": "VipLogin.VipLoginInter",
-                "method": "vip_login_base",
-                "param": {}
-            }
-        });
-        let response = self
-            .client
-            .post(self.search_url.clone())
-            .header("Cookie", cookie_header(cookies))
-            .header("Referer", "https://y.qq.com/")
-            .json(&body)
-            .send()
-            .await
-            .map_err(classify_request_error)?;
-        classify_status(&response)?;
-        let value = response
-            .json::<Value>()
-            .await
-            .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
-        if let Some(error) = qq_response_business_error(&value) {
-            return Err(match error {
-                CatalogError::AuthRequired(_) => CatalogError::CredentialRejected(
-                    "QQ Music vip_login_base rejected credentials".to_owned(),
-                ),
-                other => other,
-            });
-        }
-        if qq_validation_is_rejected(&value) {
-            return Err(CatalogError::InvalidResponse(
-                "QQ Music vip_login_base returned an unrecognized error code".to_owned(),
-            ));
-        }
+        let value = self.vip_login_base(cookies).await?;
         let Some(data) = qq_response_data(&value).filter(|value| value.is_object()) else {
             // 登录态失效或接口拒绝：视为查询失败，走失败缓存快速重试。
             return Err(CatalogError::InvalidResponse(
@@ -1191,32 +1190,10 @@ impl SourceAdapter for QqMusicAdapter {
                 "QQ Music candidate provider does not match adapter".to_owned(),
             ));
         }
-        let response = self
-            .request_json_with_credential(
-                candidate,
-                &self.search_url,
-                Self::search_payload("validation", 1),
-            )
-            .await?;
-        if !response.is_object() {
-            return Err(CatalogError::InvalidResponse(
-                "QQ Music credential validation response is not an object".to_owned(),
-            ));
-        }
-        if let Some(error) = qq_response_business_error(&response) {
-            return Err(match error {
-                CatalogError::AuthRequired(_) => CatalogError::CredentialRejected(
-                    "QQ Music credential validation was rejected".to_owned(),
-                ),
-                other => other,
-            });
-        }
-        if qq_validation_is_rejected(&response) {
-            return Err(CatalogError::InvalidResponse(
-                "QQ Music credential validation returned an unrecognized error code".to_owned(),
-            ));
-        }
-        Ok(())
+        // 搜索端点匿名也可用（对照 netease.rs「搜索接口可匿名使用，不能作为登录成功的
+        // 依据」），因此改用只对有效会话返回身份的 vip_login_base。
+        let response = self.vip_login_base(candidate.cookies()).await?;
+        qq_validate_login_response(&response)
     }
 
     async fn search(
@@ -1875,19 +1852,36 @@ struct QqDevice {
 
 impl QqDevice {
     fn load(path: Option<PathBuf>) -> Result<Self, std::io::Error> {
-        if let Some(path) = path {
-            if path.exists() {
-                let mut device: Self = serde_json::from_str(&fs::read_to_string(&path)?)
-                    .map_err(std::io::Error::other)?;
-                device.path = Some(path);
-                return Ok(device);
+        let Some(path) = path else {
+            return Ok(Self::new());
+        };
+        if path.exists() {
+            match Self::read_at(&path) {
+                Ok(mut device) => {
+                    device.path = Some(path);
+                    return Ok(device);
+                }
+                // 设备文件只是辅助状态：损坏不能让整个播放运行时起不来（对照
+                // credentials.rs 的 `.bad` 隔离与酷狗设备文件的 warn+继续）。
+                // 隔离坏文件后重建默认设备继续启动，下一次保存会写回完整 JSON。
+                Err(error) => quarantine_invalid_device(&path, &error),
             }
-            let mut device = Self::new();
-            device.path = Some(path.clone());
-            device.save_at(&path)?;
-            return Ok(device);
         }
-        Ok(Self::new())
+        let mut device = Self::new();
+        device.path = Some(path.clone());
+        if let Err(error) = device.save_at(&path) {
+            // 写不进去同样不能阻断启动：内存中的设备标识本进程仍可用。
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "无法写入 QQ 音乐设备文件，本次运行使用内存设备标识"
+            );
+        }
+        Ok(device)
+    }
+    fn read_at(path: &Path) -> Result<Self, std::io::Error> {
+        let text = fs::read_to_string(path)?;
+        serde_json::from_str(&text).map_err(std::io::Error::other)
     }
     fn new() -> Self {
         let mut rng = rand::thread_rng();
@@ -1937,10 +1931,55 @@ impl QqDevice {
         Ok(())
     }
     fn save_at(&self, path: &Path) -> Result<(), std::io::Error> {
-        fs::write(
-            path,
-            serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?,
-        )
+        let content = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
+        write_device_atomic(path, &content)
+    }
+}
+
+/// 原子写：临时文件 → `sync_all` → rename。
+///
+/// 非原子 `fs::write` 在进程中断/断电时会留下半截 JSON，而设备文件读取失败曾经
+/// 直接让播放运行时以 `PlaybackError::Startup` 起不来。与 credentials.rs 的
+/// `write_atomic` 保持同一口径（临时文件先落盘再改名）。
+fn write_device_atomic(path: &Path, content: &[u8]) -> Result<(), std::io::Error> {
+    let temporary = path.with_extension("tmp");
+    let _ = fs::remove_file(&temporary);
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)?;
+    let written = file.write_all(content).and_then(|_| file.sync_all());
+    drop(file);
+    if let Err(error) = written {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    // std::fs::rename 在 Windows 上走 MoveFileEx(REPLACE_EXISTING)，可覆盖旧文件；
+    // 失败时清掉临时文件，避免残留影响下一次写入。
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// 内容损坏的设备文件改名 `*.bad` 隔离，只记一次 warn；调用方随后重建默认设备。
+fn quarantine_invalid_device(path: &Path, error: &std::io::Error) {
+    let mut quarantine = path.to_path_buf();
+    quarantine.set_extension("bad");
+    match fs::rename(path, &quarantine) {
+        Ok(()) => tracing::warn!(
+            path = %path.display(),
+            quarantined = %quarantine.display(),
+            %error,
+            "QQ 音乐设备文件已损坏，已隔离并重建默认设备"
+        ),
+        Err(rename_error) => tracing::warn!(
+            path = %path.display(),
+            %error,
+            %rename_error,
+            "QQ 音乐设备文件已损坏且无法隔离，将直接重建默认设备"
+        ),
     }
 }
 
@@ -2306,6 +2345,57 @@ fn qq_validation_is_rejected(response: &Value) -> bool {
     qq_response_code(response).is_some_and(|code| code != 0)
 }
 
+/// `vip_login_base` 的身份快照：有效会话在 `data.identity` 里给出账号标识；匿名或
+/// 过期会话只返回空对象/无关字段。
+fn qq_login_identity(response: &Value) -> Option<&Value> {
+    let data = qq_response_data(response).filter(|value| value.is_object())?;
+    let identity = data
+        .get("identity")
+        .filter(|value| value.is_object())
+        .unwrap_or(data);
+    identity
+        .as_object()
+        .is_some_and(|object| !object.is_empty())
+        .then_some(identity)
+}
+
+/// 响应里是否有真实账号标识（`uin`/`musicid`/`openid` 等）。
+///
+/// 仅凭「没有业务错误码」不能判定登录成功：匿名响应对搜索端点同样合法，QQ 适配器
+/// 旧实现正是因此把匿名会话误判为已登录。身份字段缺失即视为凭据无效、需重新登录。
+fn qq_identity_has_account_id(identity: &Value) -> bool {
+    ["uin", "musicid", "str_musicid", "openid", "wxopenid", "qq"]
+        .iter()
+        .any(|field| {
+            identity.get(*field).is_some_and(|value| match value {
+                Value::String(text) => {
+                    let text = text.trim();
+                    !text.is_empty() && text != "0"
+                }
+                Value::Number(number) => {
+                    number.as_i64().is_some_and(|number| number > 0)
+                        || number.as_u64().is_some_and(|number| number > 0)
+                }
+                _ => false,
+            })
+        })
+}
+
+/// 登录凭据校验的纯判定：必须拿到真实账号标识，否则判为凭据无效（需重新登录）。
+fn qq_validate_login_response(response: &Value) -> Result<(), CatalogError> {
+    let Some(identity) = qq_login_identity(response) else {
+        return Err(CatalogError::CredentialRejected(
+            "QQ Music vip_login_base returned no account identity; relogin is required".to_owned(),
+        ));
+    };
+    if !qq_identity_has_account_id(identity) {
+        return Err(CatalogError::CredentialRejected(
+            "QQ Music vip_login_base identity has no user id; relogin is required".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// 生成 QQ 音乐 VIP 类型标签（绿钻/SVIP/豪华绿钻/年费等组合）。
 fn vip_vip_type_label(identity: &Value, data: &Value) -> String {
     let mut labels = Vec::new();
@@ -2589,10 +2679,14 @@ fn classify_status(response: &reqwest::Response) -> Result<(), CatalogError> {
 }
 
 fn classify_request_error(error: reqwest::Error) -> CatalogError {
-    if error.is_timeout() {
-        CatalogError::TimedOut(error.to_string())
+    // 隐私红线：Display 会附上完整请求 URL（查询串含 token / musickey），而 CatalogError
+    // 会经 `#[error(transparent)]` 进日志；取文本前必须剥离 URL。
+    let timed_out = error.is_timeout();
+    let detail = error.without_url().to_string();
+    if timed_out {
+        CatalogError::TimedOut(detail)
     } else {
-        CatalogError::Transient(error.to_string())
+        CatalogError::Transient(detail)
     }
 }
 
@@ -2609,12 +2703,13 @@ mod tests {
         PlaybackEligibility, QQ_QIMEI_FALLBACK, QqDevice, QqMusicAdapter, QqQimei, QqQimeiCache,
         QqRequestOptions, classify_qq_refresh_code, merge_qq_web_cookie_updates,
         parse_qimei_response, parse_qq_date_ms, parse_search_candidates, qimei_is_fresh,
-        qimei_payload, qq_account_is_vip, qq_eligibility, qq_filename, qq_is_auth_response_code,
-        qq_refresh_login_type, qq_resolver_ids, qq_response_business_error, qq_response_code,
-        qq_response_data, qq_response_has_lyrics, qq_response_payload_object,
-        qq_response_requires_auth_refresh, qq_stream_url, qq_validation_is_rejected,
-        qq_vip_expire_at_ms, random_beacon_id, replace_cookie_alias,
-        replace_cookie_alias_from_values, vip_vip_type_label,
+        qimei_payload, qq_account_is_vip, qq_eligibility, qq_filename, qq_identity_has_account_id,
+        qq_is_auth_response_code, qq_login_identity, qq_refresh_login_type, qq_resolver_ids,
+        qq_response_business_error, qq_response_code, qq_response_data, qq_response_has_lyrics,
+        qq_response_payload_object, qq_response_requires_auth_refresh, qq_stream_url,
+        qq_validate_login_response, qq_validation_is_rejected, qq_vip_expire_at_ms,
+        random_beacon_id, replace_cookie_alias, replace_cookie_alias_from_values,
+        vip_vip_type_label,
     };
     use crate::catalog::{CatalogError, ProviderAccountStatus, SourceAdapter};
     use crate::credentials::{CredentialStore, ProviderCredential};
@@ -2829,6 +2924,58 @@ mod tests {
         assert!(!qq_validation_is_rejected(&json!({
             "search": {"code": 0, "data": {}}
         })));
+    }
+
+    #[test]
+    fn qq_login_validation_requires_a_real_account_identity() {
+        // 匿名/过期会话：合法 JSON 但没有账号标识，必须判为「需重新登录」。
+        // 旧实现只用匿名可用的搜索端点 + “没有业务错误码”，会把这类响应当成功。
+        for anonymous in [
+            json!({"req_0": {"code": 0, "data": {}}}),
+            json!({"req_0": {"code": 0}}),
+            json!({"req_0": {"code": 0, "data": {"identity": {"vip": 0, "HugeVip": 0}}}}),
+            json!({"req_0": {"code": 0, "data": {"uin": "0"}}}),
+            json!({"req_0": {"code": 0, "data": {"identity": {"musicid": 0}}}}),
+            json!({"req_0": {"code": 0, "data": {"identity": null}}}),
+        ] {
+            assert!(
+                matches!(
+                    qq_validate_login_response(&anonymous),
+                    Err(CatalogError::CredentialRejected(_))
+                ),
+                "anonymous response must be rejected: {anonymous}"
+            );
+        }
+
+        // 有效会话：`identity`（或 `data` 根）带真实账号标识。
+        for authenticated in [
+            json!({"req_0": {"code": 0, "data": {"identity": {"uin": "12345", "vip": 1}}}}),
+            json!({"req_0": {"code": 0, "data": {"identity": {"musicid": 12345}}}}),
+            json!({"req_0": {"code": 0, "data": {"uin": "12345"}}}),
+            json!({"req_0": {"code": 0, "data": {"identity": {"openid": "openid-value"}}}}),
+        ] {
+            assert!(
+                qq_validate_login_response(&authenticated).is_ok(),
+                "authenticated response must be accepted: {authenticated}"
+            );
+        }
+    }
+
+    #[test]
+    fn qq_login_identity_prefers_the_nested_identity_object() {
+        let response = json!({
+            "req_0": {"code": 0, "data": {"identity": {"uin": 42}, "svip": 1}}
+        });
+        assert_eq!(
+            qq_login_identity(&response).and_then(|identity| identity.get("uin")),
+            Some(&json!(42))
+        );
+        // 只有业务码、没有 data 的信封：响应对齐会回退到信封本身，但校验仍判为无效。
+        assert!(qq_validate_login_response(&json!({"req_0": {"code": 0}})).is_err());
+        assert!(qq_login_identity(&json!({"req_0": {"code": 0, "data": {}}})).is_none());
+        assert!(!qq_identity_has_account_id(&json!({"uin": "0"})));
+        assert!(!qq_identity_has_account_id(&json!({"vip": 1})));
+        assert!(qq_identity_has_account_id(&json!({"uin": "12345"})));
     }
 
     #[test]
@@ -3377,6 +3524,54 @@ mod tests {
         assert!(loaded.qimei.is_none());
         assert!(loaded.qimei_saved_at.is_none());
         assert_eq!(loaded.path, Some(path));
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn qq_device_load_quarantines_a_corrupt_file_and_rebuilds() {
+        let directory =
+            std::env::temp_dir().join(format!("miliastra-qq-device-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("device.json");
+        let corrupt = "{\"display\": \"half";
+        fs::write(&path, corrupt).unwrap();
+
+        // B18-P1-3：损坏的设备文件不能再经 build_catalog 让播放运行时 Startup 失败。
+        let loaded = QqDevice::load(Some(path.clone()))
+            .expect("a corrupt device file must not fail the playback runtime");
+        assert_eq!(loaded.path, Some(path.clone()));
+        assert!(!loaded.boot_id.is_empty());
+
+        // 坏文件被隔离为 *.bad，原内容原样保留供排查。
+        assert_eq!(
+            fs::read_to_string(directory.join("device.bad")).unwrap(),
+            corrupt
+        );
+        // 重建的设备文件是完整可解析 JSON（原子写，无临时文件残留）。
+        assert!(!directory.join("device.tmp").exists());
+        let reloaded = QqDevice::load(Some(path)).expect("rebuilt device file must be readable");
+        assert_eq!(reloaded.boot_id, loaded.boot_id);
+
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn qq_device_saves_atomically_and_round_trips() {
+        let directory =
+            std::env::temp_dir().join(format!("miliastra-qq-device-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("device.json");
+        let device = QqDevice::new();
+
+        device.save_at(&path).unwrap();
+        assert!(!directory.join("device.tmp").exists());
+        let loaded = QqDevice::load(Some(path.clone())).unwrap();
+        assert_eq!(loaded.boot_id, device.boot_id);
+
+        // 覆盖已存在文件同样成功（rename 替换语义），且不留下临时文件。
+        device.save_at(&path).unwrap();
+        assert!(!directory.join("device.tmp").exists());
+
         let _ = fs::remove_dir_all(directory);
     }
 
@@ -3984,5 +4179,17 @@ mod tests {
             super::strip_untranslated_placeholder_lines("[00:02.00]//"),
             None
         );
+    }
+}
+
+/// B18-P1-1 回归：请求失败文本不得携带 URL / 查询参数（token、musickey 等）。
+#[cfg(test)]
+mod request_error_redaction_tests {
+    use super::classify_request_error;
+    use crate::catalog::request_error_probe::assert_classified_error_is_redacted;
+
+    #[test]
+    fn classified_request_errors_never_carry_the_request_url() {
+        assert_classified_error_is_redacted(classify_request_error);
     }
 }

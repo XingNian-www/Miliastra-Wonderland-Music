@@ -205,6 +205,12 @@ pub(crate) fn execute_hall_batch(
         }
     }
 
+    if request.ready.is_some() && matches!(&status, HallBatchStatus::Failed(_)) {
+        // 邀请就绪（ready 闸门）取消/失败：发送阶段已经证明“不能再动界面”，
+        // 收尾阶段也必须零输入——否则外层 `UiTask` 会按 `RestoreEntry`
+        // 发 Esc/Return/点击会话行，违背“取消时零输入”（B15-P1-5）。
+        context.force_finish();
+    }
     HallBatchInner {
         sent,
         status,
@@ -619,9 +625,32 @@ pub(crate) fn send_parsed_segments(
         }
         return Ok(());
     }
+    dispatch_emoji_tags(&tags, ready, !text.trim().is_empty(), |tag| {
+        send_emoji_segment(context, ocr, config, tag, "send_emoji")
+    })
+}
+
+/// 依次发送表情标签；每一步之前都重新确认邀请就绪闸门仍开启。
+///
+/// 表情点击即发送、无法撤回：文本段发完到表情段之间可能已经过去几十毫秒，
+/// 这期间邀请任务被取消是真实可达的；不复查闸门就会继续打开表情面板并点击
+/// （B15-P1-5）。闸门关闭时**立即**返回失败（不再尝试剩余标签），
+/// 保持“取消时零输入”的硬约束。
+///
+/// 部分标签发送失败沿用原语义：只要文字段已经发出（`text_present`），
+/// 就不再把这个局部失败升级成整条消息失败。
+pub(super) fn dispatch_emoji_tags(
+    tags: &[&EmojiTag],
+    ready: Option<&InviteReadyGate>,
+    text_present: bool,
+    mut send: impl FnMut(&EmojiTag) -> Result<(), UiRoutineFailure>,
+) -> Result<(), UiRoutineFailure> {
     let mut first_emoji_failure: Option<UiRoutineFailure> = None;
     for tag in tags {
-        if let Err(failure) = send_emoji_segment(context, ocr, config, tag, "send_emoji") {
+        if let Some(gate) = ready {
+            check_invite_ready_running(gate)?;
+        }
+        if let Err(failure) = send(tag) {
             log::warn!(
                 "表情发送失败（页签 {}，候选 {} 个，原因：{}）",
                 tag.pack,
@@ -633,10 +662,8 @@ pub(crate) fn send_parsed_segments(
             }
         }
     }
-    if let Some(failure) = first_emoji_failure
-        && text.trim().is_empty()
-    {
-        return Err(failure);
+    match first_emoji_failure {
+        Some(failure) if !text_present => Err(failure),
+        _ => Ok(()),
     }
-    Ok(())
 }

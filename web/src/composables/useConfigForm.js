@@ -2,25 +2,50 @@
 //
 // 把「段导航 / 草稿 / 保存 / 历史版本」四个 composable 串起来，页面只保留模板。
 // 页面与子组件之间只传值 + 事件，不共享内部实现。
+//
+// 脏标记与草稿按页面（scope）分区：
+//   - 全局 state.dirty 是共享的，AI 配置页保存后会调 clearDirty()（清空整个对象）。
+//     所以配置中心只在**挂载期间**把本页脏段放进 state.dirty：进来时先把别的页面留下的
+//     脏标记收进 foreignDirty、换成本页的 configDirty 快照；离开时把本页脏段收回
+//     configDirty、再把 foreignDirty 原样放回。这样别的页面清脏标记时不会抹掉本页修改，
+//     回来时本页的未保存状态也还在。
+//   - 草稿缓存在 draftCache 里按 scope 分开存（Map），不同页面各存各的。
 
 import { computed, ref, onBeforeUnmount, onMounted } from 'vue'
 import { handleAuth, isDirty, loadConfig, state, toast } from '../store.js'
 import { friendlyError } from '../util/format.js'
-import { navigateTo } from '../router.js'
+import { isSecretField } from '../util/configSchema.js'
+import { navigateTo, registerDirtySource } from '../router.js'
 import { useConfigSections } from './useConfigSections.js'
 import { useConfigDraft } from './useConfigDraft.js'
 import { useConfigSave } from './useConfigSave.js'
 import { useConfigHistory } from './useConfigHistory.js'
 
-// 切到别的页面时缓存草稿：只有版本号一致、且确实有脏标记时才复用。
-// 模块级变量即可——同一时刻只有一个配置中心实例。
-let draftCache = { revision: null, draft: null }
+/** 切到别的页面时缓存草稿：key 是页面 scope，同一 scope 只保留最后一份。 */
+const draftCache = new Map()
+/** 配置中心自己的脏段；离开期间从全局 state.dirty 摘出来暂存。 */
+const configDirty = new Set()
+/** 配置中心挂载前，state.dirty 里属于别的页面的脏标记；离开时原样放回。 */
+let foreignDirty = null
+/** 默认 scope：现有调用方 `useConfigForm()` 不传参，等价于旧行为。 */
+const DEFAULT_SCOPE = 'config'
 
-export function useConfigForm() {
+export function useConfigForm(scope = DEFAULT_SCOPE) {
+  const pageScope = String(scope || DEFAULT_SCOPE)
   const loading = ref(!state.config)
   const loadError = ref('')
 
   const historyPanelRef = ref(null)
+
+  // 站内切页守卫 / 全局 beforeunload 通过它判断「配置中心有未保存修改」。
+  // blocksNavigation=false：本页草稿在切页时会被 draftCache 原样恢复，用户不会真的丢改动，
+  // 再弹一次「离开后可能丢失」就是假警告；刷新/关标签仍会被全局 beforeunload 拦下。
+  // 卸载时注销：离开的那次确认发生在卸载之前，能看到本页。
+  const unregisterDirty = registerDirtySource(`config:${pageScope}`, {
+    label: '配置中心',
+    blocksNavigation: false,
+    dirty: () => Object.keys(state.dirty).length,
+  })
 
   const nav = useConfigSections()
   const form = useConfigDraft(nav.sections, nav.activeSection)
@@ -82,6 +107,13 @@ export function useConfigForm() {
 
   /* ---------- 事件包装：确认框与 toast 留在这一层，子组件保持纯展示 ---------- */
   function resetField(field) {
+    // secret 没有可下发的默认值，「恢复默认」的真实语义是清除已保存的密钥
+    // （草稿层写的是 {"__clear__": true}）。文案与 AI 页统一，见审计 O1。
+    if (isSecretField(field)) {
+      if (!window.confirm(`清除「${field.label}」已保存的密钥（尚未保存）？`)) return
+      if (form.resetField(field)) toast(`已标记清除「${field.label}」，保存后生效`, 'ok')
+      return
+    }
     if (!window.confirm(`将「${field.label}」恢复为默认值（尚未保存）？`)) return
     if (form.resetField(field)) toast(`已将「${field.label}」恢复为默认值，记得保存`, 'ok')
   }
@@ -105,6 +137,43 @@ export function useConfigForm() {
   }
 
   /* ---------- 生命周期 ---------- */
+  /** 本页 schema 里的段名：用来把「自己的脏段」和「别的页面的脏标记」分开。 */
+  function ownSectionNames() {
+    return new Set((nav.sections.value || []).map((section) => section.name))
+  }
+
+  /**
+   * 接管全局脏标记：把别的页面留下的脏标记先收起来，换成本页离开前存的快照。
+   * 必须在任何 isDirty() / markDirty() 之前执行（即 loadConfig 之前）。
+   */
+  function adoptDirtyScope() {
+    const ownNames = ownSectionNames()
+    const own = {}
+    const foreign = {}
+    for (const [name, flag] of Object.entries(state.dirty)) {
+      if (ownNames.size && !ownNames.has(name)) foreign[name] = flag
+      else own[name] = flag
+    }
+    foreignDirty = foreign
+    for (const name of configDirty) own[name] = true
+    state.dirty = own
+  }
+
+  /** 交还全局脏标记：本页脏段收回 configDirty，别的页面原样放回。 */
+  function releaseDirtyScope() {
+    const ownNames = ownSectionNames()
+    const current = { ...state.dirty }
+    configDirty.clear()
+    const next = { ...(foreignDirty || {}) }
+    for (const [name, flag] of Object.entries(current)) {
+      // 挂载期间写入的脏标记：属于自己的段收进快照，不属于的（别的页面先挂载时写的）保留。
+      if (!ownNames.size || ownNames.has(name)) configDirty.add(name)
+      else next[name] = flag
+    }
+    state.dirty = next
+    foreignDirty = null
+  }
+
   function onKeydown(event) {
     if ((event.ctrlKey || event.metaKey) && String(event.key).toLowerCase() === 's') {
       event.preventDefault()
@@ -119,18 +188,29 @@ export function useConfigForm() {
   }
 
   onMounted(async () => {
+    adoptDirtyScope()
     window.addEventListener('keydown', onKeydown)
     window.addEventListener('beforeunload', onBeforeUnload)
     try {
       await loadConfig()
-      const cached = draftCache
-      const canReuse = !!(cached && cached.draft && isDirty() && cached.revision === state.revision)
+      const cached = draftCache.get(pageScope)
+      // 版本号不再是「丢弃草稿」的条件：别的页面保存只说明基线变了，
+      // 用户在本页没保存的修改仍然优先（回来时提示一次，让他自己决定保存还是放弃）。
+      const canReuse = !!(cached && cached.draft && isDirty())
       if (canReuse) {
         form.applyDraft(cached.draft)
+        if (cached.revision != null && cached.revision !== state.revision) {
+          toast('其他页面已保存新的配置版本；你未保存的修改已保留，请检查后保存', '')
+        }
       } else {
-        // 其他页面已保存过新版本：旧草稿失效，同步清掉脏标记避免误报「未保存」。
-        if (cached && cached.revision != null && cached.revision !== state.revision) form.discardToConfig(state.config)
-        form.applyDraft(state.config ? state.config.sections : {})
+        // 没有对应脏段的旧草稿已被保存/放弃，丢掉避免下次误复用。
+        draftCache.delete(pageScope)
+        if (isDirty()) {
+          // 有脏标记却没有草稿（例如热更新后模块状态丢失）：按服务端值重建，避免保存空改动。
+          form.discardToConfig(state.config)
+        } else {
+          form.applyDraft(state.config ? state.config.sections : {})
+        }
       }
       if (
         !nav.activeSectionName.value ||
@@ -146,7 +226,9 @@ export function useConfigForm() {
   })
 
   onBeforeUnmount(() => {
-    draftCache = { revision: state.revision, draft: form.snapshotDraft() }
+    unregisterDirty()
+    draftCache.set(pageScope, { revision: state.revision, draft: form.snapshotDraft() })
+    releaseDirtyScope()
     window.removeEventListener('keydown', onKeydown)
     window.removeEventListener('beforeunload', onBeforeUnload)
   })

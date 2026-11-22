@@ -123,17 +123,51 @@ jobs:
           fi
           echo "technical-docs/ 未纳入索引，符合预期"
 
+      # ---- 前端单元测试（node:test，零依赖）-----------------------------------
+      # 放在 repo-scripts 而不是 web-build：这里不装依赖、不构建，`node --test` 只用
+      # Node 内置模块，几秒钟就能给出结果，失败原因也比「构建失败」精确得多。
+      # 用例全部在 web/src/**（web/ 是入库目录；tests/ 在本仓库是符号链接且被 gitignore 挡住，
+      # 往那里写测试既不入库、还会写到主检出目录去）。
+      - name: 安装 Node（单元测试用）
+        uses: actions/setup-node@v4
+        with:
+          # 与 web-build 保持一致：测试跑在与构建相同的运行时上才有意义。
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 前端单元测试（node --test）
+        working-directory: web
+        run: |
+          set -euo pipefail
+          # 先确认测试文件真的存在。`node --test` 在「一个测试文件都没找到」时是
+          # 静默通过（退出码 0）——不挡住这一条，这个门禁就会退化成永远绿灯的摆设。
+          mapfile -t test_files < <(find src -type f -name '*.test.mjs' | sort)
+          [ "${#test_files[@]}" -gt 0 ] || {
+            echo "::error::web/src 下没有找到任何 *.test.mjs，前端单元测试实际上没有执行"
+            exit 1
+          }
+          printf '发现 %d 个前端测试文件：\n' "${#test_files[@]}"
+          printf '  %s\n' "${test_files[@]}"
+          # 用 runner 自身的递归发现（Node 20 起支持），不要依赖 shell glob：
+          # CI 的 bash 默认没有 globstar，`src/**/*.test.mjs` 在子目录上匹配不到。
+          node --test
+
   # ===========================================================================
-  # 门禁三：Rust（格式 / 检查 / 单测）+ 隐私扫描
+  # 门禁三：Rust（格式 / 检查 / 单元测试 + clippy 报告）+ 隐私扫描
   #
   # 两处“全局唯一”的配置集中在这里：
   #
-  # 1) CARGO_HOME 沙箱。仓库内的 .cargo/config.toml 用 [env] 把 FFMPEG_DIR / MNN_*
-  #    钉到 vendor/ffmpeg/8.1/windows-x64（Windows 预编译库）。cargo 会忽略
-  #    $CARGO_HOME/config.toml，所以让缓存目录充当 CARGO_HOME：路径固定可缓存，
-  #    同时干净地屏蔽仓库内的 Windows 专用 [env]，让 ffmpeg-sys-next 走 pkg-config
-  #    找系统 libav*。任何 `--config` 参数都做不到这一点（cargo 的优先级是
-  #    环境变量 > 仓库内配置 > --config）。
+  # 1) CARGO_HOME 指到 runner 的临时目录（`$RUNNER_TEMP/cargo-home`）。
+  #    过去它指向 `/opt/quality-gate/cargo-home`，有两个问题：
+  #      - `ubuntu-latest` 上 /opt 属于 root，runner 用户不可写，第一次写
+  #        registry 就 Permission denied；
+  #      - 注释当时声称这样能“屏蔽仓库内的 Windows 专用 [env]”，**这是错的**。
+  #        CARGO_HOME 只改变 `$CARGO_HOME/config.toml` 的位置，cargo 仍会从工作区
+  #        向上读 `.cargo/config.toml`，[env] 照样生效。
+  #    真正的修法是把 Windows 专用变量从 `.cargo/config.toml` 挪走（已做：
+  #    那个文件现在是空的，FFMPEG_DIR / MNN_* 由 build-windows-exe.yml 的 step env 提供）。
+  #    这里保留一个临时 CARGO_HOME 只是为了缓存目录固定可复用，不再承担“隔离”职责。
   #    `--no-default-features` 关掉两个 OCR 后端，Linux 因此完全不需要 MNN / OpenVINO / nasm。
   #
   # 2) lld 链接。链接阶段是 Rust 门禁最慢的一环，统一换成 lld。RUSTFLAGS 只在 job 级设置，
@@ -141,7 +175,7 @@ jobs:
   #    镜像也有 ld.lld；`校验系统依赖` 一步会显式确认它的存在。
   # ===========================================================================
   rust-gate:
-    name: Rust 门禁（fmt / check / test）
+    name: Rust 门禁（fmt / check / test / clippy）
     runs-on: ubuntu-latest
     # 本地实测（Linux、--lib、--test-threads=1）：冷编译约 2.5 分钟，2332 个用例一轮 417 秒，
     # 整个 job 冷启动约 12 分钟；rust-cache 命中后编译阶段基本消失。45 分钟的余量足够覆盖
@@ -150,8 +184,6 @@ jobs:
     needs: web-build
     env:
       RUSTFLAGS: -C link-arg=-fuse-ld=lld
-      # 临时 CARGO_HOME（见上方第 1 点）。固定路径保证缓存键与目录稳定。
-      CARGO_HOME: /opt/quality-gate/cargo-home
     steps:
       - name: 检出代码
         uses: actions/checkout@v5
@@ -160,6 +192,19 @@ jobs:
           fetch-depth: 1
 
       # ---- 工具链 ----------------------------------------------------------
+      # 注意 CARGO_HOME 不能写在 job 级 `env:`：`jobs.<job_id>.env` 的可用上下文里
+      # **没有** `runner`（只有 github/needs/strategy/matrix/vars/secrets/inputs），
+      # 写了 `${{ runner.temp }}` 会直接报表达式错误。改为在这里写进 $GITHUB_ENV，
+      # 后续所有步骤（含 uses: 步骤）都能读到。
+      - name: 初始化临时 CARGO_HOME
+        run: |
+          set -euo pipefail
+          cargo_home="$RUNNER_TEMP/cargo-home"
+          mkdir -p "$cargo_home"
+          test -w "$cargo_home" || { echo "::error::$cargo_home 不可写"; exit 1; }
+          echo "CARGO_HOME=$cargo_home" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=$cargo_home"
+
       # 不给 toolchain 输入：仓库里有 rust-toolchain.toml（channel = 1.96.0，
       # components = rustfmt, clippy）。rustup 会按它自动安装并锁定版本，
       # CI 里不必重复写一遍版本号（写死反而会在改钉版本时悄悄失配）。
@@ -178,8 +223,13 @@ jobs:
           rustc --version | grep -q "^rustc $pinned " \
             || { echo "::error::rust-toolchain.toml 钉定的版本没有生效"; exit 1; }
           for component in rustfmt clippy; do
-            rustup component list --installed | grep -qx "$component" \
-              || { echo "::error::缺少 $component 组件"; exit 1; }
+            # `rustup component list --installed` 的输出带目标三元组，
+            # 形如 `rustfmt-x86_64-unknown-linux-gnu`。
+            # 旧写法 `grep -qx "$component"` 是整行精确匹配，永远不命中 —— 这一步
+            # 只要跑到就必红。这里按「组件名 + 连字符或行尾」匹配，版本后缀
+            # （如 `-x86_64-unknown-linux-gnu`）一并吃掉。
+            rustup component list --installed | grep -Eq "^${component}(-|$)" \
+              || { echo "::error::缺少 $component 组件（rustup component list --installed 里找不到 ${component}-*）"; exit 1; }
           done
 
       # ---- Linux 系统依赖 ---------------------------------------------------
@@ -225,10 +275,13 @@ jobs:
       - name: 缓存 Cargo 构建
         uses: Swatinem/rust-cache@v2
         with:
-          # 显式列出两个目录，不依赖 action 对 CARGO_HOME 的隐式推导。
+          # 每行语义是 `<工作区目录> [-> <target 目录>]`。这里只需要一个工作区。
+          # 旧写法还填了 `/opt/quality-gate/cargo-home` 一行 —— 那是 CARGO_HOME 的
+          # 绝对路径，既不是工作区、也没有 `-> target`，action 解析不出任何东西，
+          # 那条缓存项等于落空。CARGO_HOME 的缓存由 action 自己按 registry/git
+          # 目录处理，不需要（也不能）在这里声明。
           workspaces: |
             . -> target
-            /opt/quality-gate/cargo-home
           key: linux-quality-gate
 
       # ---- 前端产物 ---------------------------------------------------------
@@ -289,10 +342,55 @@ jobs:
           print("workspace --lib 编译检查通过：0 警告")
           '
 
-      - name: 单测（cargo test --lib --no-default-features）
-        # `-- --test-threads=1` 是仓库既定用法（存在进程级 static），必须保留；
-        # 它只让单测之间串行，不影响本步骤之前的前端构建与工具链准备。
-        run: cargo test --locked --lib --no-default-features -- --test-threads=1
+      - name: 单测（cargo test --workspace --lib --no-default-features）
+        # 覆盖面的三处补充（B00-P1-6）：
+        #   1) `--workspace`：workspace 有 5 个 member，旧命令只测根 crate，
+        #      miliastra-kernel / miliastra-login-protocol / miliastra-playback 的
+        #      `#[cfg(test)]` 一律不跑（对照上面的 check 本来就是 `--workspace`）。
+        #   2) `--lib` 之外补 `-p miliastra-login-helper --bins`：这个 crate 只有
+        #      `src/main.rs`（没有 lib 目标），`--lib` 永远碰不到它；它的单测挂在
+        #      bin target 上，用 `--bins` 收。其余 crate 的 bin target 在 Linux 上
+        #      有 `compile_error!`（产品只支持 Windows），所以**不能**全局加 `--bins`。
+        #   3) `-- --test-threads=1` 是仓库既定用法（存在进程级 static），必须保留。
+        run: |
+          set -euo pipefail
+          cargo test --locked --workspace --lib --no-default-features -- --test-threads=1
+          cargo test --locked -p miliastra-login-helper --bins --no-default-features -- --test-threads=1
+
+      - name: clippy（报告模式，不阻断）
+        # 为什么是 report-only 而不是硬闸门：
+        #   `cargo clippy --workspace --lib --no-default-features` 在 1.96.0 上
+        #   实测有 100+ 条告警（collapsible_if / map-over-inspect / needless_borrow…），
+        #   全在 `src/**` 与 `crates/**` —— 清零属于独立批量任务，本批次只做 CI 侧接线，
+        #   不能顺手改业务代码（也避免把 clippy 变成长期红着的摆设）。
+        #   真正的硬门禁是上一步的「零 warning `cargo check`」。
+        # 这里仍然**执行**它，原因是：安装了 clippy 却从不运行（旧状态）时，
+        #   - 新告警没有任何可见度；
+        #   - `-D warnings` 级别的回归要等到有人手工跑才会发现。
+        #   PR 上把结果落成 `::warning` 注释 + Job Summary，master/push 只留日志。
+        #   告警数写进摘要，便于清零进度可量化（目标：把 count 降到 0 后改成 `-- -D warnings`）。
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          # continue-on-error 下不要 set -e：要让后面的统计照常跑完。
+          log="${RUNNER_TEMP}/clippy-workspace-lib.log"
+          cargo clippy --locked --workspace --lib --no-default-features --message-format=short \
+            2>&1 | tee "$log"
+          status=${PIPESTATUS[0]}
+          warnings=$(grep -cE '^[^ ].*warning: ' "$log" || true)
+          errors=$(grep -cE '^[^ ].*error(\[|:)' "$log" || true)
+          echo "clippy 告警 $warnings 条、错误 $errors 条（lib target，--no-default-features）"
+          {
+            echo "### clippy（--workspace --lib）"
+            echo ""
+            echo "- 告警：**$warnings** 条"
+            echo "- 错误：**$errors** 条"
+            echo ""
+            echo "报告模式：清零后应改成 \`cargo clippy ... -- -D warnings\` 并去掉 \`continue-on-error\`。"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$status" -ne 0 ]; then
+            echo "::warning title=clippy 报告::clippy 退出码 $status（告警 $warnings 条）——本步骤不阻断，详细输出见日志 ${log}"
+          fi
 
       # ---- 隐私扫描（需要远端身份映射，单独守卫）-----------------------------
       - name: 隐私扫描（scripts/privacy-filter.py --repo --check）

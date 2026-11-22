@@ -1,4 +1,32 @@
-[env]
-MNN_INCLUDE_DIR = { value = "vendor/mnn/3.6.0/windows-x64/include", relative = true }
-MNN_LIB_DIR = { value = "vendor/mnn/3.6.0/windows-x64/lib", relative = true }
-FFMPEG_DIR = { value = "vendor/ffmpeg/8.1/windows-x64", relative = true }
+# 这个文件**故意是空的**：Windows 预编译依赖的路径变量不能再放在这里。
+#
+# 原来这里有 [env] MNN_INCLUDE_DIR / MNN_LIB_DIR / FFMPEG_DIR 三项，指向
+# vendor/mnn/3.6.0/windows-x64 与 vendor/ffmpeg/8.1/windows-x64。问题有两层
+# （2026-11-22 在 cargo 1.96.0 上实测确认）：
+#
+# 1) 跨平台的 .cargo/config.toml 里的 [env] 对**所有 target** 生效。Linux 构建也会读到
+#    FFMPEG_DIR=vendor/ffmpeg/8.1/windows-x64；ffmpeg-sys-next 见到 FFMPEG_DIR 就不再走
+#    pkg-config，转而把 vendor 目录当 FFmpeg 前缀去 -lavcodec 链接。结果是
+#    `cargo check --lib` 能过（不链接）、`cargo test` 链接失败，Linux 门禁红。
+# 2) cargo **不支持**按 target 限定 [env]，所以无法写成“只给 Windows 生效”：
+#    - [target.x86_64-pc-windows-msvc.env]  —— 静默忽略，变量根本不存在；
+#    - [target.'cfg(windows)'.env]           —— 打印 "unused key `env` in [target] config table"。
+#    也就是说这条路没有配置层的解法，只能由“设置环境变量的一侧”决定生效范围。
+#
+# 因此这三个变量改由 Windows 侧显式提供：
+#   - CI：.github/workflows/build-windows-exe.yml 的顶层 env:（用 ${{ github.workspace }} 展开成绝对路径）
+#   - 本地打包：scripts/package-release.ps1 在 cargo build 前把同样的值导出到进程环境
+#   - 本地手工 cargo build：自己 set FFMPEG_DIR / MNN_INCLUDE_DIR / MNN_LIB_DIR，
+#     取值见上面两个文件；不设时 ffmpeg-sys-next 会退回 pkg-config / vcpkg。
+#
+# 不要把 [env] 加回来：加回来就等于让 Linux 门禁重新被 Windows 路径污染。
+#
+# ⚠ 本文件只清空了**这一份**。cargo 从当前工作目录**逐级向上**读 .cargo/config.toml，
+#   所以本 worktree 仍可能被父级检出（如 /root/DSH/Miliastra-Wonderland-Music/.cargo/config.toml）
+#   的同名 [env] 命中 —— 实测：清空本文件后跑
+#   `cargo test -p miliastra-playback --lib --no-default-features` 仍然 SIGSEGV，
+#   因为父级那份 FFMPEG_DIR 还指向 Windows 8.1 的头文件（libavcodec 62 / avutil 60），
+#   而系统 .so 是 libavcodec 59 / avutil 57 → ABI 不匹配、段错误（不是链接错误）。
+#   验证/复现时请显式覆盖，例如：
+#     FFMPEG_DIR=/tmp/nonexistent cargo test ...   # 父级 [env] 被环境变量压过
+#   或者把父级那份也清掉。CI 上只有一份检出，不存在这个问题。

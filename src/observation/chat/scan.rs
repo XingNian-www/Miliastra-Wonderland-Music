@@ -16,17 +16,12 @@ use crate::ui::template::{TemplateHit, dedupe_hits, find_color_template_hit_grou
 
 const CHAT_SCAN_RESULT_LOG_TARGET: &str = "chat_scan_result";
 
-/// 进程级去重器与它当前的「窗口」编号。
-///
-/// 测试每取一次新的窗口就推进会窗口编号：去重器随即丢弃旧内容、从空窗口重新开始，
-/// 用例之间因此互不串味；生产路径的窗口编号永远是 0。
-static SCAN_LOG_DEDUP: OnceLock<(ScanLogDedup, std::sync::atomic::AtomicU64)> = OnceLock::new();
+/// 生产路径固定使用的去重窗口（命名空间编号）。
+/// 测试窗口从 1 起单调递增，永不与生产窗口重叠：并行用例既不会读到生产路径的上一帧，也不会互相覆盖对方。
+const PRODUCTION_SCAN_LOG_WINDOW: u64 = 0;
 
-fn scan_log_dedup() -> (&'static ScanLogDedup, u64) {
-    let (dedup, window) =
-        SCAN_LOG_DEDUP.get_or_init(|| (ScanLogDedup::new(), std::sync::atomic::AtomicU64::new(0)));
-    (dedup, window.load(std::sync::atomic::Ordering::Acquire))
-}
+/// 扫描结果日志的进程级去重器（状态见 [`ScanLogDedup`]）。
+static SCAN_LOG_DEDUP: OnceLock<ScanLogDedup> = OnceLock::new();
 
 /// 扫描结果日志的进程级去重器。
 ///
@@ -38,38 +33,41 @@ fn scan_log_dedup() -> (&'static ScanLogDedup, u64) {
 /// 诊断服务）也不该为了日志去持有可变状态；把抑制器做成入参又等于让每个调用点
 /// 自己定义日志语义。去重只需要「上次记过什么」这一份事实，进程内共享才是它的
 /// 真实语义。
+/// 去重状态按**窗口**分槽：每个窗口只与自己的上一帧比较。生产路径恒用窗口 0，
+/// 测试每次取一个从 1 起递增的新窗口，因此用例之间（以及用例与生产路径之间）
+/// 看不到、也清不掉对方的上一帧。
+/// 为什么不是「窗口一变就清空唯一的上一帧」：窗口编号是进程级的，若只有一个槽，
+/// 并行用例会互相把对方刚写下的上一帧清掉，让「同一内容第二次必须被抑制」的
+/// 断言偶发失败。分槽后跨窗口零干扰，同一窗口内仍然严格去重。
 struct ScanLogDedup {
-    /// 比较与落账在同一个临界区里完成：两帧同时到达时，恰好一帧判定为「有变化」。
-    last: std::sync::Mutex<Option<String>>,
-    /// 上一次落账时的窗口编号（生产恒为 0）。
-    window: std::sync::atomic::AtomicU64,
+    /// 窗口 -> 该窗口上一次落账的内容；比较与落账在同一个临界区里完成：
+    /// 两帧同时到达时，恰好一帧判定为「有变化」。
+    ///
+    /// 生产进程只会出现窗口 0 这一条；非 0 窗口只由测试创建，条数由用例数
+    /// 决定，不会在长跑中增长。
+    last: std::sync::Mutex<std::collections::BTreeMap<u64, String>>,
 }
 
 impl ScanLogDedup {
     const fn new() -> Self {
         Self {
-            last: std::sync::Mutex::new(None),
-            window: std::sync::atomic::AtomicU64::new(0),
+            last: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
-    /// 记录一次扫描结果，返回它是不是「自上次记录以来第一次出现」。
+    /// 记录一次扫描结果，返回它是不是「该窗口内自上次记录以来第一次出现」。
     fn record(&self, scan_result: &str, window: u64) -> bool {
         let mut last = self
             .last
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // 窗口号变化表示「换了一份新的去重窗口」：旧内容必须丢弃，不能让它把
-        // 新窗口里的第一帧误判成「与上次相同」。
-        if self.window.load(std::sync::atomic::Ordering::Acquire) != window {
-            self.window
-                .store(window, std::sync::atomic::Ordering::Release);
-            *last = None;
-        }
-        if last.as_deref() == Some(scan_result) {
+        let unchanged = last
+            .get(&window)
+            .is_some_and(|previous| previous.as_str() == scan_result);
+        if unchanged {
             return false;
         }
-        *last = Some(scan_result.to_owned());
+        last.insert(window, scan_result.to_owned());
         true
     }
 }
@@ -83,23 +81,21 @@ impl ScanLogDedup {
 // 无法参与构建时这里看起来“没人用”，但删掉会让真正的接线断开，因此显式标注意图。
 #[cfg_attr(not(test), allow(dead_code))]
 fn remember_scan_result_for_log(scan_result: &str) -> bool {
-    let (dedup, window) = scan_log_dedup();
-    dedup.record(scan_result, window)
+    let dedup = SCAN_LOG_DEDUP.get_or_init(ScanLogDedup::new);
+    dedup.record(scan_result, PRODUCTION_SCAN_LOG_WINDOW)
 }
 
-/// 开一份全新的去重窗口，返回去重器与窗口编号（测试用）。
+/// 测试专用：分配一份全新的去重窗口，返回去重器与窗口编号。
 ///
-/// 用例因此从「进程刚启动、还没记录过任何扫描」的状态开始，不会读到别的用例
-/// 留下的内容；它仍然覆盖真实的全局路径——并发用例在同一把锁上竞争。
+/// 窗口编号从 1 起单调递增，因此并行用例各拿一个互不相交的命名空间：既从
+/// 「该窗口还没记录过任何扫描」开始，也不会读到或覆盖别的用例的上一帧。
+/// 它仍然覆盖真实的全局路径——所有窗口共享同一把锁、同一个去重器。
 #[cfg(test)]
 fn fresh_scan_log_dedup() -> (&'static ScanLogDedup, u64) {
-    let (dedup, _) =
-        SCAN_LOG_DEDUP.get_or_init(|| (ScanLogDedup::new(), std::sync::atomic::AtomicU64::new(0)));
-    let next = dedup
-        .window
-        .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-        + 1;
-    (dedup, next)
+    static NEXT_TEST_WINDOW: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(PRODUCTION_SCAN_LOG_WINDOW + 1);
+    let window = NEXT_TEST_WINDOW.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    (SCAN_LOG_DEDUP.get_or_init(ScanLogDedup::new), window)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -568,8 +564,8 @@ mod tests {
 
     #[test]
     fn scan_result_log_recorded_only_when_content_changes() {
-        // 生产入口固定落在进程级去重器上。这里开一份全新窗口，从「进程刚启动、
-        // 还没记录过任何扫描」开始断言，不会读到别的用例留下的内容。
+        // 生产入口固定落在进程级去重器上。这里取一份全新窗口（与生产窗口 0 及
+        // 其它用例的窗口互不相交），从「该窗口还没记录过任何扫描」开始断言。
         let (dedup, window) = fresh_scan_log_dedup();
         // 内容未变时不重复写，变化后重新记录一次。
         assert!(dedup.record("scan-dedup-a", window));
@@ -584,15 +580,16 @@ mod tests {
         assert!(dedup.record("", window));
         assert!(!dedup.record("", window));
 
-        // 换一份新窗口等价于「进程重开」：同样的内容重新算作第一次。
-        // 这正是用例之间互不串味的来源。
+        // 换一份新窗口等价于「换了一份干净的去重命名空间」：新窗口没有历史，
+        // 同样的内容重新算作第一次。这正是用例之间互不串味的来源。
         let (fresh, next_window) = fresh_scan_log_dedup();
         assert!(next_window > window, "开新窗口必须推进窗口编号");
         assert!(fresh.record("scan-dedup-a", next_window));
         assert!(!fresh.record("scan-dedup-a", next_window));
 
-        // 生产入口与去重器是同一份状态：连续两次上报同一内容，第一次算变化、
-        // 第二次必须被抑制——否则观察线程与诊断服务会各自记一份相同的文本。
+        // 生产入口与去重器是同一份状态（窗口恒为 0，上面测试窗口不会碰到它）：
+        // 连续两次上报同一内容，第一次算变化、第二次必须被抑制——否则观察线程
+        // 与诊断服务会各自记一份相同的文本。
         let first = remember_scan_result_for_log("scan-prod-entry");
         assert!(first, "生产入口第一次上报新内容必须记录");
         assert!(
@@ -606,6 +603,9 @@ mod tests {
     /// 生产里大厅观察线程与 `/tools/scan-chat` 诊断会同时扫描；若比较与落账
     /// 不在同一个临界区，同一段文本会被两条日志各记一次。这里让 8 个线程同时
     /// 报同一个全新内容，恰好一个线程拿到 true。
+    ///
+    /// 用例使用自己的窗口：即使与本模块其它用例并行执行，也不会有谁清掉这个
+    /// 窗口的上一帧，因此结果与调度顺序无关。
     #[test]
     fn concurrent_scan_results_record_a_shared_payload_exactly_once() {
         let (dedup, window) = fresh_scan_log_dedup();

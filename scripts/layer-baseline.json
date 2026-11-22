@@ -1,0 +1,3008 @@
+{
+  "version": 1,
+  "comment": "由 `python3 scripts/check-layers.py --freeze` 生成：当前层间边的 allowlist 与文件预算棘轮。不要手改；新增/消失的边会被 `--check` 判失败，确认无误后重新 freeze。",
+  "fake_targets": [
+    "RunOutcome",
+    "CONFIG_RELOAD_CHILD_ENV",
+    "CONFIG_RELOAD_RUN_STARTUP_ENV",
+    "config_reload_child_ready",
+    "mark_config_reload_child_ready"
+  ],
+  "edges": [
+    {
+      "source": "adapters",
+      "target": "config",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/adapters/logging.rs",
+          "count": 1
+        },
+        {
+          "path": "src/adapters/login_helper.rs",
+          "count": 7
+        },
+        {
+          "path": "src/adapters/windows/device.rs",
+          "count": 1
+        },
+        {
+          "path": "src/adapters/windows/input.rs",
+          "count": 2
+        },
+        {
+          "path": "src/adapters/windows/window.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "adapters",
+      "target": "debug",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/adapters/windows/device.rs",
+          "count": 17
+        }
+      ]
+    },
+    {
+      "source": "adapters",
+      "target": "features",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/adapters/native_playback.rs",
+          "count": 1
+        },
+        {
+          "path": "src/adapters/player.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "adapters",
+      "target": "runtime",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/adapters/logging.rs",
+          "count": 1
+        },
+        {
+          "path": "src/adapters/native_playback.rs",
+          "count": 2
+        },
+        {
+          "path": "src/adapters/player.rs",
+          "count": 2
+        },
+        {
+          "path": "src/adapters/windows/device.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "ai_trace",
+      "target": "text",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/ai_trace.rs",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "source": "change_detection",
+      "target": "geometry",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/change_detection.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "composition",
+      "target": "adapters",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/composition.rs",
+          "count": 1
+        },
+        {
+          "path": "src/composition/application.rs",
+          "count": 7
+        },
+        {
+          "path": "src/composition/application/listener/loop_driver.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "composition",
+      "target": "ai_trace",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/composition.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "composition",
+      "target": "change_detection",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/composition/application.rs",
+          "count": 1
+        },
+        {
+          "path": "src/composition/application/shared_observer.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "composition",
+      "target": "config",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/composition.rs",
+          "count": 1
+        },
+        {
+          "path": "src/composition/application.rs",
+          "count": 6
+        },
+        {
+          "path": "src/composition/application/ai_chat_commands.rs",
+          "count": 18
+        },
+        {
+          "path": "src/composition/application/commands.rs",
+          "count": 1
+        },
+        {
+          "path": "src/composition/application/delivery.rs",
+          "count": 2
+        },
+        {
+          "path": "src/composition/application/external_chat.rs",
+          "count": 16
+        },
+        {
+          "path": "src/composition/application/formal_task.rs",
+          "count": 1
+        },
+        {
+          "path": "src/composition/application/listener/recovery_guard.rs",
+          "count": 2
+        },
+        {
+          "path": "src/composition/application/playback.rs",
+          "count": 1
+        },
+        {
+          "path": "src/composition/application/shared_observer.rs",
+          "count": 1
+        },
+        {
+          "path": "src/composition/application/tasks.rs",
+          "count": 2
+        },
+        {
+          "path": "src/composition/application/workers.rs",
+          "count": 4
+        }
+      ]
+    },
+    {
+      "source": "composition",
+      "target": "debug",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/composition/application/formal_task.rs",
+          "count": 6
+        },
+        {
+          "path": "src/composition/application/listener/chat_routing.rs",
+          "count": 3
+        },
+        {
+          "path": "src/composition/application/listener/display.rs",
+          "count": 1
+        },
+        {
+          "path": "src/composition/application/listener/loop_driver.rs",
+          "count": 1
+        },
+        {
+          "path": "src/composition/application/playback.rs",
+          "count": 1
+        },
+        {
+          "path": "src/composition/application/playlist_window.rs",
+          "count": 1
+        },
+        {
+          "path": "src/composition/application/shared_observer.rs",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "source": "composition",
+      "target": "features",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/composition/application.rs",
+          "count": 36
+        },
+        {
+          "path": "src/composition/application/ai_chat_commands.rs",
+          "count": 71
+        },
+        {
+          "path": "src/composition/application/commands.rs",
+          "count": 48
+        },
+        {
+          "path": "src/composition/application/custom_workflow.rs",
+          "count": 4
+        },
+        {
+          "path": "src/composition/application/delivery.rs",
+          "count": 45
+        },
+        {
+          "path": "src/composition/application/external_chat.rs",
+          "count": 11
+        },
+        {
+          "path": "src/composition/application/formal_task.rs",
+          "count": 6
+        },
+        {
+          "path": "src/composition/application/listener/chat_routing.rs",
+          "count": 20
+        },
+        {
+          "path": "src/composition/application/listener/display.rs",
+          "count": 2
+        },
+        {
+          "path": "src/composition/application/listener/loop_driver.rs",
+          "count": 1
+        },
+        {
+          "path": "src/composition/application/moderation.rs",
+          "count": 8
+        },
+        {
+          "path": "src/composition/application/playback.rs",
+          "count": 8
+        },
+        {
+          "path": "src/composition/application/playlist_window.rs",
+          "count": 5
+        },
+        {
+          "path": "src/composition/application/secondary_chat.rs",
+          "count": 3
+        },
+        {
+          "path": "src/composition/application/song_request_port.rs",
+          "count": 14
+        },
+        {
+          "path": "src/composition/application/startup.rs",
+          "count": 1
+        },
+        {
+          "path": "src/composition/application/workers.rs",
+          "count": 22
+        }
+      ]
+    },
+    {
+      "source": "composition",
+      "target": "geometry",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/composition/application.rs",
+          "count": 3
+        }
+      ]
+    },
+    {
+      "source": "composition",
+      "target": "interfaces",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/composition.rs",
+          "count": 1
+        },
+        {
+          "path": "src/composition/application.rs",
+          "count": 4
+        },
+        {
+          "path": "src/composition/application/ai_chat_commands.rs",
+          "count": 1
+        },
+        {
+          "path": "src/composition/application/formal_task.rs",
+          "count": 2
+        },
+        {
+          "path": "src/composition/application/listener/chat_routing.rs",
+          "count": 3
+        },
+        {
+          "path": "src/composition/application/moderation.rs",
+          "count": 1
+        },
+        {
+          "path": "src/composition/application/playlist_window.rs",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "source": "composition",
+      "target": "observation",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/composition/application.rs",
+          "count": 17
+        },
+        {
+          "path": "src/composition/application/external_chat.rs",
+          "count": 2
+        },
+        {
+          "path": "src/composition/application/listener/chat_routing.rs",
+          "count": 16
+        },
+        {
+          "path": "src/composition/application/listener/display.rs",
+          "count": 7
+        },
+        {
+          "path": "src/composition/application/listener/loop_driver.rs",
+          "count": 4
+        },
+        {
+          "path": "src/composition/application/moderation.rs",
+          "count": 1
+        },
+        {
+          "path": "src/composition/application/playlist_window.rs",
+          "count": 3
+        },
+        {
+          "path": "src/composition/application/secondary_chat.rs",
+          "count": 8
+        },
+        {
+          "path": "src/composition/application/shared_observer.rs",
+          "count": 3
+        }
+      ]
+    },
+    {
+      "source": "composition",
+      "target": "privacy",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/composition/application.rs",
+          "count": 2
+        },
+        {
+          "path": "src/composition/application/commands.rs",
+          "count": 1
+        },
+        {
+          "path": "src/composition/application/custom_workflow.rs",
+          "count": 1
+        },
+        {
+          "path": "src/composition/application/formal_task.rs",
+          "count": 2
+        },
+        {
+          "path": "src/composition/application/listener/display.rs",
+          "count": 1
+        },
+        {
+          "path": "src/composition/application/playlist_window.rs",
+          "count": 7
+        }
+      ]
+    },
+    {
+      "source": "composition",
+      "target": "runtime",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/composition.rs",
+          "count": 1
+        },
+        {
+          "path": "src/composition/application.rs",
+          "count": 16
+        },
+        {
+          "path": "src/composition/application/ai_chat_commands.rs",
+          "count": 1
+        },
+        {
+          "path": "src/composition/application/custom_workflow.rs",
+          "count": 1
+        },
+        {
+          "path": "src/composition/application/external_chat.rs",
+          "count": 10
+        },
+        {
+          "path": "src/composition/application/formal_task.rs",
+          "count": 8
+        },
+        {
+          "path": "src/composition/application/lifecycle.rs",
+          "count": 1
+        },
+        {
+          "path": "src/composition/application/listener/loop_driver.rs",
+          "count": 1
+        },
+        {
+          "path": "src/composition/application/listener/recovery_guard.rs",
+          "count": 3
+        },
+        {
+          "path": "src/composition/application/moderation.rs",
+          "count": 3
+        },
+        {
+          "path": "src/composition/application/shared_observer.rs",
+          "count": 1
+        },
+        {
+          "path": "src/composition/application/tasks.rs",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "source": "composition",
+      "target": "text",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/composition/application/ai_chat_commands.rs",
+          "count": 1
+        },
+        {
+          "path": "src/composition/application/commands.rs",
+          "count": 2
+        },
+        {
+          "path": "src/composition/application/delivery.rs",
+          "count": 11
+        },
+        {
+          "path": "src/composition/application/listener/display.rs",
+          "count": 1
+        },
+        {
+          "path": "src/composition/application/playlist_window.rs",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "source": "composition",
+      "target": "ui",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/composition/application.rs",
+          "count": 8
+        },
+        {
+          "path": "src/composition/application/ai_chat_commands.rs",
+          "count": 3
+        },
+        {
+          "path": "src/composition/application/custom_workflow.rs",
+          "count": 5
+        },
+        {
+          "path": "src/composition/application/delivery.rs",
+          "count": 2
+        },
+        {
+          "path": "src/composition/application/listener/loop_driver.rs",
+          "count": 1
+        },
+        {
+          "path": "src/composition/application/moderation.rs",
+          "count": 1
+        },
+        {
+          "path": "src/composition/application/startup.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "config",
+      "target": "adapters",
+      "kind": "debt",
+      "issue": "ARCH-DEBT-03 config 直接依赖 adapters",
+      "expires": "2027-03-31",
+      "files": [
+        {
+          "path": "src/config/store/upgrade.rs",
+          "count": 1
+        },
+        {
+          "path": "src/config/types/aggregate.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "config",
+      "target": "debug",
+      "kind": "debt",
+      "issue": "ARCH-DEBT-04 config/ai.rs 依赖 debug 沙盒",
+      "expires": "2027-03-31",
+      "files": [
+        {
+          "path": "src/config/ai.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "config",
+      "target": "features",
+      "kind": "debt",
+      "issue": "ARCH-DEBT-01 config 聚合 feature 定义的 *Config 结构体",
+      "expires": "2027-03-31",
+      "files": [
+        {
+          "path": "src/config/live.rs",
+          "count": 4
+        },
+        {
+          "path": "src/config/live/tests_effect.rs",
+          "count": 14
+        },
+        {
+          "path": "src/config/store/mod.rs",
+          "count": 1
+        },
+        {
+          "path": "src/config/types/aggregate.rs",
+          "count": 18
+        },
+        {
+          "path": "src/config/types/ui.rs",
+          "count": 4
+        }
+      ]
+    },
+    {
+      "source": "config",
+      "target": "geometry",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/config/types/general.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "config",
+      "target": "runtime",
+      "kind": "debt",
+      "issue": "ARCH-DEBT-02 config 依赖 runtime 类型",
+      "expires": "2027-03-31",
+      "files": [
+        {
+          "path": "src/config/types/aggregate.rs",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "source": "config",
+      "target": "ui_diagnostics",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/config/live.rs",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "source": "debug",
+      "target": "adapters",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/debug/sandbox_runner.rs",
+          "count": 3
+        }
+      ]
+    },
+    {
+      "source": "debug",
+      "target": "features",
+      "kind": "debt",
+      "issue": "ARCH-DEBT-06 debug 沙盒复用 features 解析器",
+      "expires": "2027-03-31",
+      "files": [
+        {
+          "path": "src/debug/read_only.rs",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "source": "debug",
+      "target": "observation",
+      "kind": "debt",
+      "issue": "ARCH-DEBT-07 debug 沙盒复用 observation 快照类型",
+      "expires": "2027-03-31",
+      "files": [
+        {
+          "path": "src/debug/read_only.rs",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "source": "debug",
+      "target": "privacy",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/debug/read_only.rs",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "source": "debug",
+      "target": "runtime",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/debug/http_service.rs",
+          "count": 10
+        },
+        {
+          "path": "src/debug/read_only.rs",
+          "count": 3
+        },
+        {
+          "path": "src/debug/sandbox_runner.rs",
+          "count": 9
+        }
+      ]
+    },
+    {
+      "source": "debug",
+      "target": "ui",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/debug/sandbox_runner.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "features",
+      "target": "ai_trace",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/features/ai_chat/memory.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "features",
+      "target": "config",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/features/ai_chat/config.rs",
+          "count": 1
+        },
+        {
+          "path": "src/features/ai_chat/vision.rs",
+          "count": 1
+        },
+        {
+          "path": "src/features/ai_chat_preview.rs",
+          "count": 1
+        },
+        {
+          "path": "src/features/custom_workflow.rs",
+          "count": 1
+        },
+        {
+          "path": "src/features/invite.rs",
+          "count": 2
+        },
+        {
+          "path": "src/features/moderation.rs",
+          "count": 1
+        },
+        {
+          "path": "src/features/playback/controller.rs",
+          "count": 1
+        },
+        {
+          "path": "src/features/reply_template/mod.rs",
+          "count": 3
+        },
+        {
+          "path": "src/features/song_request/ai.rs",
+          "count": 14
+        },
+        {
+          "path": "src/features/song_request/review.rs",
+          "count": 5
+        },
+        {
+          "path": "src/features/startup.rs",
+          "count": 1
+        },
+        {
+          "path": "src/features/turtle_soup/service.rs",
+          "count": 4
+        }
+      ]
+    },
+    {
+      "source": "features",
+      "target": "observation",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/features/command.rs",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "source": "features",
+      "target": "retry",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/features/song_request/review.rs",
+          "count": 3
+        },
+        {
+          "path": "src/features/turtle_soup/service.rs",
+          "count": 3
+        }
+      ]
+    },
+    {
+      "source": "features",
+      "target": "runtime",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/features/administration.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "features",
+      "target": "text",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/features/administration.rs",
+          "count": 1
+        },
+        {
+          "path": "src/features/ai_chat/prompt.rs",
+          "count": 1
+        },
+        {
+          "path": "src/features/card_games/cards.rs",
+          "count": 1
+        },
+        {
+          "path": "src/features/chat_text.rs",
+          "count": 2
+        },
+        {
+          "path": "src/features/command_access.rs",
+          "count": 2
+        },
+        {
+          "path": "src/features/emoji.rs",
+          "count": 1
+        },
+        {
+          "path": "src/features/hall.rs",
+          "count": 1
+        },
+        {
+          "path": "src/features/number_bomb.rs",
+          "count": 1
+        },
+        {
+          "path": "src/features/playback/application.rs",
+          "count": 1
+        },
+        {
+          "path": "src/features/playback/format.rs",
+          "count": 6
+        },
+        {
+          "path": "src/features/playback/matcher.rs",
+          "count": 1
+        },
+        {
+          "path": "src/features/playlist.rs",
+          "count": 4
+        },
+        {
+          "path": "src/features/song_request/ai.rs",
+          "count": 1
+        },
+        {
+          "path": "src/features/song_request/application.rs",
+          "count": 11
+        },
+        {
+          "path": "src/features/song_request/review.rs",
+          "count": 1
+        },
+        {
+          "path": "src/features/tarot.rs",
+          "count": 2
+        },
+        {
+          "path": "src/features/turtle_soup/service.rs",
+          "count": 4
+        },
+        {
+          "path": "src/features/undercover/mod.rs",
+          "count": 4
+        }
+      ]
+    },
+    {
+      "source": "features",
+      "target": "ui",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/features/custom_workflow.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "interfaces",
+      "target": "adapters",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/interfaces/http/facade.rs",
+          "count": 5
+        },
+        {
+          "path": "src/interfaces/http/protocol.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "interfaces",
+      "target": "ai_trace",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/interfaces/http/routes/ai.rs",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "source": "interfaces",
+      "target": "config",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/interfaces/hotkeys.rs",
+          "count": 2
+        },
+        {
+          "path": "src/interfaces/http/facade.rs",
+          "count": 1
+        },
+        {
+          "path": "src/interfaces/http/ports.rs",
+          "count": 1
+        },
+        {
+          "path": "src/interfaces/http/protocol.rs",
+          "count": 9
+        },
+        {
+          "path": "src/interfaces/http/routes/ai.rs",
+          "count": 15
+        },
+        {
+          "path": "src/interfaces/http/routes/commands.rs",
+          "count": 3
+        },
+        {
+          "path": "src/interfaces/http/routes/config.rs",
+          "count": 11
+        },
+        {
+          "path": "src/interfaces/tui.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "interfaces",
+      "target": "debug",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/interfaces/hotkeys.rs",
+          "count": 1
+        },
+        {
+          "path": "src/interfaces/http/facade.rs",
+          "count": 28
+        },
+        {
+          "path": "src/interfaces/http/ports.rs",
+          "count": 23
+        },
+        {
+          "path": "src/interfaces/http/protocol.rs",
+          "count": 1
+        },
+        {
+          "path": "src/interfaces/http/routes/debug.rs",
+          "count": 15
+        },
+        {
+          "path": "src/interfaces/http/routes/tasks_chat.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "interfaces",
+      "target": "features",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/interfaces/chat.rs",
+          "count": 15
+        },
+        {
+          "path": "src/interfaces/chat/router.rs",
+          "count": 36
+        },
+        {
+          "path": "src/interfaces/http/facade.rs",
+          "count": 23
+        },
+        {
+          "path": "src/interfaces/http/ports.rs",
+          "count": 5
+        },
+        {
+          "path": "src/interfaces/http/protocol.rs",
+          "count": 14
+        },
+        {
+          "path": "src/interfaces/http/routes/ai.rs",
+          "count": 17
+        },
+        {
+          "path": "src/interfaces/http/routes/commands.rs",
+          "count": 21
+        },
+        {
+          "path": "src/interfaces/http/routes/config.rs",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "source": "interfaces",
+      "target": "geometry",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/interfaces/http/protocol.rs",
+          "count": 1
+        },
+        {
+          "path": "src/interfaces/http/routes/debug.rs",
+          "count": 6
+        },
+        {
+          "path": "src/interfaces/http/routes/system.rs",
+          "count": 2
+        },
+        {
+          "path": "src/interfaces/http/tools.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "interfaces",
+      "target": "observation",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/interfaces/http/facade.rs",
+          "count": 2
+        },
+        {
+          "path": "src/interfaces/http/routes/debug.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "interfaces",
+      "target": "runtime",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/interfaces/http/facade.rs",
+          "count": 19
+        },
+        {
+          "path": "src/interfaces/http/ports.rs",
+          "count": 5
+        },
+        {
+          "path": "src/interfaces/http/protocol.rs",
+          "count": 5
+        },
+        {
+          "path": "src/interfaces/http/routes/debug.rs",
+          "count": 2
+        },
+        {
+          "path": "src/interfaces/http/routes/health.rs",
+          "count": 2
+        },
+        {
+          "path": "src/interfaces/tui.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "interfaces",
+      "target": "text",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/interfaces/chat.rs",
+          "count": 1
+        },
+        {
+          "path": "src/interfaces/chat/router.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "interfaces",
+      "target": "ui",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/interfaces/http/protocol.rs",
+          "count": 1
+        },
+        {
+          "path": "src/interfaces/http/routes/debug.rs",
+          "count": 6
+        }
+      ]
+    },
+    {
+      "source": "observation",
+      "target": "change_detection",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/observation/chat/scan_gate.rs",
+          "count": 1
+        },
+        {
+          "path": "src/observation/chat/visual.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "observation",
+      "target": "config",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/observation/chat/passive.rs",
+          "count": 1
+        },
+        {
+          "path": "src/observation/chat/scan.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "observation",
+      "target": "geometry",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/observation/chat/passive.rs",
+          "count": 1
+        },
+        {
+          "path": "src/observation/chat/scan.rs",
+          "count": 1
+        },
+        {
+          "path": "src/observation/chat/secondary_hall_vision/mod.rs",
+          "count": 1
+        },
+        {
+          "path": "src/observation/chat/secondary_unread_vision.rs",
+          "count": 1
+        },
+        {
+          "path": "src/observation/chat/timeline.rs",
+          "count": 2
+        },
+        {
+          "path": "src/observation/chat/visual.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "observation",
+      "target": "privacy",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/observation/chat/scan.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "observation",
+      "target": "runtime",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/observation/chat/passive.rs",
+          "count": 5
+        },
+        {
+          "path": "src/observation/chat/scan.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "observation",
+      "target": "text",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/observation/chat/freshness.rs",
+          "count": 1
+        },
+        {
+          "path": "src/observation/chat/scan.rs",
+          "count": 1
+        },
+        {
+          "path": "src/observation/chat/timeline.rs",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "source": "observation",
+      "target": "ui",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/observation/chat/passive.rs",
+          "count": 5
+        },
+        {
+          "path": "src/observation/chat/scan.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "privacy",
+      "target": "text",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/privacy.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "runtime",
+      "target": "config",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/runtime/chat_source/launcher.rs",
+          "count": 1
+        },
+        {
+          "path": "src/runtime/ocr/engine.rs",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "source": "runtime",
+      "target": "debug",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/runtime/monitor.rs",
+          "count": 6
+        },
+        {
+          "path": "src/runtime/ui.rs",
+          "count": 19
+        }
+      ]
+    },
+    {
+      "source": "runtime",
+      "target": "features",
+      "kind": "debt",
+      "issue": "ARCH-DEBT-05 runtime 反向依赖 features 业务规则",
+      "expires": "2027-03-31",
+      "files": [
+        {
+          "path": "src/runtime/business.rs",
+          "count": 14
+        },
+        {
+          "path": "src/runtime/business/entertainment.rs",
+          "count": 7
+        },
+        {
+          "path": "src/runtime/business/hall.rs",
+          "count": 1
+        },
+        {
+          "path": "src/runtime/business/playback.rs",
+          "count": 1
+        },
+        {
+          "path": "src/runtime/deadline.rs",
+          "count": 4
+        },
+        {
+          "path": "src/runtime/deferred_chat.rs",
+          "count": 1
+        },
+        {
+          "path": "src/runtime/monitor.rs",
+          "count": 4
+        },
+        {
+          "path": "src/runtime/player_io.rs",
+          "count": 1
+        },
+        {
+          "path": "src/runtime/task_engine.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "runtime",
+      "target": "geometry",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/runtime/ocr/batch.rs",
+          "count": 1
+        },
+        {
+          "path": "src/runtime/ocr/engine.rs",
+          "count": 1
+        },
+        {
+          "path": "src/runtime/ocr/openvino.rs",
+          "count": 1
+        },
+        {
+          "path": "src/runtime/ui.rs",
+          "count": 3
+        }
+      ]
+    },
+    {
+      "source": "runtime",
+      "target": "observation",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/runtime/business.rs",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "source": "runtime",
+      "target": "test_support",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/runtime/business.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "ui",
+      "target": "adapters",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/ui/routines/custom_action.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/routines/startup.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "ui",
+      "target": "change_detection",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/ui/routines/custom_action.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/routines/friend_delivery/navigation.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/routines/secondary_unread.rs",
+          "count": 5
+        },
+        {
+          "path": "src/ui/routines/startup.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "ui",
+      "target": "config",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/ui/atoms.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/routines/friend_delivery.rs",
+          "count": 3
+        },
+        {
+          "path": "src/ui/routines/hall.rs",
+          "count": 2
+        },
+        {
+          "path": "src/ui/routines/invite.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/routines/startup.rs",
+          "count": 2
+        },
+        {
+          "path": "src/ui/state/args.rs",
+          "count": 2
+        },
+        {
+          "path": "src/ui/state/classifier.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/state/classify.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/state/fallback.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/state/world.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "ui",
+      "target": "debug",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/ui/atoms.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "ui",
+      "target": "geometry",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/ui/locator.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/routines/custom_action.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/routines/friend_delivery.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/routines/friend_delivery/emoji_panel.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/routines/friend_delivery/navigation.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/routines/hall.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/routines/invite.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/routines/moderation.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/routines/residency.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/routines/startup.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/state/anchors.rs",
+          "count": 2
+        },
+        {
+          "path": "src/ui/state/classifier.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/state/classify.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/state/diagnostic.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/state/fallback.rs",
+          "count": 3
+        },
+        {
+          "path": "src/ui/state/hall.rs",
+          "count": 2
+        },
+        {
+          "path": "src/ui/state/panels.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/state/profiles.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/state/regions.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/state/world.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/template/api.rs",
+          "count": 3
+        },
+        {
+          "path": "src/ui/template/cpu.rs",
+          "count": 3
+        },
+        {
+          "path": "src/ui/template/mod.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "ui",
+      "target": "observation",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/ui/routines/invite.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/routines/secondary_unread.rs",
+          "count": 2
+        },
+        {
+          "path": "src/ui/state/args.rs",
+          "count": 2
+        },
+        {
+          "path": "src/ui/state/classify.rs",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "source": "ui",
+      "target": "privacy",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/ui/chat_output.rs",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "source": "ui",
+      "target": "runtime",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/ui/atoms.rs",
+          "count": 2
+        },
+        {
+          "path": "src/ui/frame.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/routines/custom_action.rs",
+          "count": 3
+        },
+        {
+          "path": "src/ui/routines/friend_delivery.rs",
+          "count": 3
+        },
+        {
+          "path": "src/ui/routines/friend_delivery/delivery.rs",
+          "count": 3
+        },
+        {
+          "path": "src/ui/routines/friend_delivery/emoji_panel.rs",
+          "count": 7
+        },
+        {
+          "path": "src/ui/routines/friend_delivery/navigation.rs",
+          "count": 3
+        },
+        {
+          "path": "src/ui/routines/hall.rs",
+          "count": 3
+        },
+        {
+          "path": "src/ui/routines/invite.rs",
+          "count": 3
+        },
+        {
+          "path": "src/ui/routines/moderation.rs",
+          "count": 2
+        },
+        {
+          "path": "src/ui/routines/residency.rs",
+          "count": 3
+        },
+        {
+          "path": "src/ui/routines/secondary_unread.rs",
+          "count": 3
+        },
+        {
+          "path": "src/ui/routines/startup.rs",
+          "count": 6
+        },
+        {
+          "path": "src/ui/routines/state_observation.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/routines/transaction.rs",
+          "count": 3
+        },
+        {
+          "path": "src/ui/state/anchors.rs",
+          "count": 2
+        },
+        {
+          "path": "src/ui/state/classifier.rs",
+          "count": 5
+        },
+        {
+          "path": "src/ui/state/classify.rs",
+          "count": 2
+        },
+        {
+          "path": "src/ui/state/diagnostic.rs",
+          "count": 2
+        },
+        {
+          "path": "src/ui/state/fallback.rs",
+          "count": 5
+        },
+        {
+          "path": "src/ui/state/panels.rs",
+          "count": 3
+        },
+        {
+          "path": "src/ui/state/profiles.rs",
+          "count": 3
+        },
+        {
+          "path": "src/ui/state/result.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/state/world.rs",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "source": "ui",
+      "target": "text",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/ui/chat_output.rs",
+          "count": 2
+        },
+        {
+          "path": "src/ui/locator.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/routines/custom_action.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/routines/friend_delivery.rs",
+          "count": 2
+        },
+        {
+          "path": "src/ui/routines/friend_delivery/delivery.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/routines/friend_delivery/emoji_panel.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/routines/friend_delivery/navigation.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/routines/hall.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/routines/residency.rs",
+          "count": 1
+        },
+        {
+          "path": "src/ui/routines/startup.rs",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "source": "ui",
+      "target": "ui_diagnostics",
+      "kind": "design",
+      "issue": null,
+      "expires": null,
+      "files": [
+        {
+          "path": "src/ui/routines/transaction.rs",
+          "count": 2
+        }
+      ]
+    }
+  ],
+  "budgets": {
+    "src/ai_trace.rs": {
+      "lines": 1203,
+      "pub_items": 11
+    },
+    "src/change_detection.rs": {
+      "lines": 70,
+      "pub_items": 4
+    },
+    "src/composition.rs": {
+      "lines": 117,
+      "pub_items": 2
+    },
+    "src/geometry.rs": {
+      "lines": 255,
+      "pub_items": 16
+    },
+    "src/input_gate.rs": {
+      "lines": 196,
+      "pub_items": 13
+    },
+    "src/lib.rs": {
+      "lines": 243,
+      "pub_items": 26
+    },
+    "src/main.rs": {
+      "lines": 471,
+      "pub_items": 0
+    },
+    "src/privacy.rs": {
+      "lines": 238,
+      "pub_items": 5
+    },
+    "src/retry.rs": {
+      "lines": 52,
+      "pub_items": 2
+    },
+    "src/ui_diagnostics.rs": {
+      "lines": 84,
+      "pub_items": 3
+    },
+    "src/adapters/file_store.rs": {
+      "lines": 110,
+      "pub_items": 2
+    },
+    "src/adapters/game_path.rs": {
+      "lines": 117,
+      "pub_items": 2
+    },
+    "src/adapters/input.rs": {
+      "lines": 40,
+      "pub_items": 1
+    },
+    "src/adapters/logging.rs": {
+      "lines": 1009,
+      "pub_items": 6
+    },
+    "src/adapters/login_helper.rs": {
+      "lines": 3110,
+      "pub_items": 22
+    },
+    "src/adapters/mod.rs": {
+      "lines": 9,
+      "pub_items": 8
+    },
+    "src/adapters/native_playback.rs": {
+      "lines": 508,
+      "pub_items": 2
+    },
+    "src/adapters/player.rs": {
+      "lines": 425,
+      "pub_items": 2
+    },
+    "src/adapters/windows/clipboard.rs": {
+      "lines": 225,
+      "pub_items": 8
+    },
+    "src/adapters/windows/device.rs": {
+      "lines": 308,
+      "pub_items": 2
+    },
+    "src/adapters/windows/dpi.rs": {
+      "lines": 13,
+      "pub_items": 1
+    },
+    "src/adapters/windows/game.rs": {
+      "lines": 71,
+      "pub_items": 2
+    },
+    "src/adapters/windows/input.rs": {
+      "lines": 229,
+      "pub_items": 10
+    },
+    "src/adapters/windows/mod.rs": {
+      "lines": 18,
+      "pub_items": 5
+    },
+    "src/adapters/windows/window.rs": {
+      "lines": 1516,
+      "pub_items": 21
+    },
+    "src/composition/application.rs": {
+      "lines": 3327,
+      "pub_items": 33
+    },
+    "src/composition/application/ai_chat_commands.rs": {
+      "lines": 2331,
+      "pub_items": 2
+    },
+    "src/composition/application/commands.rs": {
+      "lines": 1592,
+      "pub_items": 11
+    },
+    "src/composition/application/custom_workflow.rs": {
+      "lines": 769,
+      "pub_items": 6
+    },
+    "src/composition/application/delivery.rs": {
+      "lines": 849,
+      "pub_items": 14
+    },
+    "src/composition/application/diagnostics.rs": {
+      "lines": 648,
+      "pub_items": 1
+    },
+    "src/composition/application/external_chat.rs": {
+      "lines": 3661,
+      "pub_items": 52
+    },
+    "src/composition/application/formal_task.rs": {
+      "lines": 1524,
+      "pub_items": 22
+    },
+    "src/composition/application/lifecycle.rs": {
+      "lines": 384,
+      "pub_items": 1
+    },
+    "src/composition/application/moderation.rs": {
+      "lines": 2391,
+      "pub_items": 5
+    },
+    "src/composition/application/playback.rs": {
+      "lines": 663,
+      "pub_items": 5
+    },
+    "src/composition/application/playlist_window.rs": {
+      "lines": 896,
+      "pub_items": 1
+    },
+    "src/composition/application/secondary_chat.rs": {
+      "lines": 1609,
+      "pub_items": 16
+    },
+    "src/composition/application/shared_observer.rs": {
+      "lines": 699,
+      "pub_items": 2
+    },
+    "src/composition/application/song_request_port.rs": {
+      "lines": 251,
+      "pub_items": 0
+    },
+    "src/composition/application/startup.rs": {
+      "lines": 67,
+      "pub_items": 0
+    },
+    "src/composition/application/tasks.rs": {
+      "lines": 1342,
+      "pub_items": 24
+    },
+    "src/composition/application/workers.rs": {
+      "lines": 1648,
+      "pub_items": 13
+    },
+    "src/composition/application/listener/chat_routing.rs": {
+      "lines": 1749,
+      "pub_items": 36
+    },
+    "src/composition/application/listener/display.rs": {
+      "lines": 346,
+      "pub_items": 22
+    },
+    "src/composition/application/listener/loop_driver.rs": {
+      "lines": 1740,
+      "pub_items": 27
+    },
+    "src/composition/application/listener/mod.rs": {
+      "lines": 39,
+      "pub_items": 2
+    },
+    "src/composition/application/listener/recovery_guard.rs": {
+      "lines": 519,
+      "pub_items": 27
+    },
+    "src/config/ai.rs": {
+      "lines": 3285,
+      "pub_items": 54
+    },
+    "src/config/live.rs": {
+      "lines": 1277,
+      "pub_items": 11
+    },
+    "src/config/migrations.rs": {
+      "lines": 1204,
+      "pub_items": 6
+    },
+    "src/config/mod.rs": {
+      "lines": 55,
+      "pub_items": 8
+    },
+    "src/config/visual.rs": {
+      "lines": 659,
+      "pub_items": 9
+    },
+    "src/config/live/tests_effect.rs": {
+      "lines": 3449,
+      "pub_items": 0
+    },
+    "src/config/schema/ai.rs": {
+      "lines": 664,
+      "pub_items": 5
+    },
+    "src/config/schema/games.rs": {
+      "lines": 330,
+      "pub_items": 5
+    },
+    "src/config/schema/general.rs": {
+      "lines": 243,
+      "pub_items": 6
+    },
+    "src/config/schema/mod.rs": {
+      "lines": 1470,
+      "pub_items": 15
+    },
+    "src/config/schema/playback.rs": {
+      "lines": 206,
+      "pub_items": 4
+    },
+    "src/config/schema/system.rs": {
+      "lines": 194,
+      "pub_items": 8
+    },
+    "src/config/schema/ui.rs": {
+      "lines": 1111,
+      "pub_items": 8
+    },
+    "src/config/store/codec.rs": {
+      "lines": 362,
+      "pub_items": 16
+    },
+    "src/config/store/mod.rs": {
+      "lines": 576,
+      "pub_items": 16
+    },
+    "src/config/store/replies.rs": {
+      "lines": 155,
+      "pub_items": 4
+    },
+    "src/config/store/sqlite.rs": {
+      "lines": 334,
+      "pub_items": 11
+    },
+    "src/config/store/tables.rs": {
+      "lines": 425,
+      "pub_items": 12
+    },
+    "src/config/store/types.rs": {
+      "lines": 198,
+      "pub_items": 11
+    },
+    "src/config/store/upgrade.rs": {
+      "lines": 444,
+      "pub_items": 3
+    },
+    "src/config/types/aggregate.rs": {
+      "lines": 1143,
+      "pub_items": 12
+    },
+    "src/config/types/general.rs": {
+      "lines": 410,
+      "pub_items": 14
+    },
+    "src/config/types/mod.rs": {
+      "lines": 38,
+      "pub_items": 8
+    },
+    "src/config/types/paths.rs": {
+      "lines": 183,
+      "pub_items": 11
+    },
+    "src/config/types/playback.rs": {
+      "lines": 115,
+      "pub_items": 5
+    },
+    "src/config/types/system.rs": {
+      "lines": 182,
+      "pub_items": 13
+    },
+    "src/config/types/ui.rs": {
+      "lines": 1139,
+      "pub_items": 17
+    },
+    "src/debug/events.rs": {
+      "lines": 242,
+      "pub_items": 10
+    },
+    "src/debug/http_service.rs": {
+      "lines": 2056,
+      "pub_items": 41
+    },
+    "src/debug/mod.rs": {
+      "lines": 31,
+      "pub_items": 14
+    },
+    "src/debug/read_only.rs": {
+      "lines": 1910,
+      "pub_items": 30
+    },
+    "src/debug/sandbox.rs": {
+      "lines": 483,
+      "pub_items": 9
+    },
+    "src/debug/sandbox_journal.rs": {
+      "lines": 165,
+      "pub_items": 8
+    },
+    "src/debug/sandbox_runner.rs": {
+      "lines": 4492,
+      "pub_items": 51
+    },
+    "src/debug/sandbox_store.rs": {
+      "lines": 570,
+      "pub_items": 19
+    },
+    "src/debug/read_only/paging.rs": {
+      "lines": 226,
+      "pub_items": 3
+    },
+    "src/features/administration.rs": {
+      "lines": 680,
+      "pub_items": 22
+    },
+    "src/features/ai_chat_preview.rs": {
+      "lines": 300,
+      "pub_items": 1
+    },
+    "src/features/ai_tag.rs": {
+      "lines": 27,
+      "pub_items": 3
+    },
+    "src/features/chat_text.rs": {
+      "lines": 80,
+      "pub_items": 8
+    },
+    "src/features/clock_text.rs": {
+      "lines": 114,
+      "pub_items": 2
+    },
+    "src/features/command.rs": {
+      "lines": 558,
+      "pub_items": 34
+    },
+    "src/features/command_access.rs": {
+      "lines": 1084,
+      "pub_items": 17
+    },
+    "src/features/command_catalog.rs": {
+      "lines": 1550,
+      "pub_items": 23
+    },
+    "src/features/custom_workflow.rs": {
+      "lines": 2479,
+      "pub_items": 30
+    },
+    "src/features/emoji.rs": {
+      "lines": 13,
+      "pub_items": 1
+    },
+    "src/features/entertainment.rs": {
+      "lines": 89,
+      "pub_items": 8
+    },
+    "src/features/friend_delivery.rs": {
+      "lines": 75,
+      "pub_items": 11
+    },
+    "src/features/hall.rs": {
+      "lines": 1150,
+      "pub_items": 28
+    },
+    "src/features/identity.rs": {
+      "lines": 2384,
+      "pub_items": 47
+    },
+    "src/features/idiom_chain.rs": {
+      "lines": 1721,
+      "pub_items": 43
+    },
+    "src/features/invite.rs": {
+      "lines": 575,
+      "pub_items": 26
+    },
+    "src/features/mod.rs": {
+      "lines": 29,
+      "pub_items": 29
+    },
+    "src/features/moderation.rs": {
+      "lines": 1990,
+      "pub_items": 51
+    },
+    "src/features/number_bomb.rs": {
+      "lines": 1973,
+      "pub_items": 22
+    },
+    "src/features/playlist.rs": {
+      "lines": 2570,
+      "pub_items": 34
+    },
+    "src/features/startup.rs": {
+      "lines": 585,
+      "pub_items": 21
+    },
+    "src/features/tarot.rs": {
+      "lines": 1148,
+      "pub_items": 12
+    },
+    "src/features/tts.rs": {
+      "lines": 2041,
+      "pub_items": 40
+    },
+    "src/features/ai_chat/budget.rs": {
+      "lines": 142,
+      "pub_items": 23
+    },
+    "src/features/ai_chat/config.rs": {
+      "lines": 880,
+      "pub_items": 43
+    },
+    "src/features/ai_chat/memory.rs": {
+      "lines": 1374,
+      "pub_items": 36
+    },
+    "src/features/ai_chat/mod.rs": {
+      "lines": 100,
+      "pub_items": 9
+    },
+    "src/features/ai_chat/prompt.rs": {
+      "lines": 746,
+      "pub_items": 19
+    },
+    "src/features/ai_chat/service.rs": {
+      "lines": 49,
+      "pub_items": 3
+    },
+    "src/features/ai_chat/tools.rs": {
+      "lines": 360,
+      "pub_items": 14
+    },
+    "src/features/ai_chat/vision.rs": {
+      "lines": 200,
+      "pub_items": 13
+    },
+    "src/features/card_games/cards.rs": {
+      "lines": 101,
+      "pub_items": 10
+    },
+    "src/features/card_games/commands.rs": {
+      "lines": 146,
+      "pub_items": 11
+    },
+    "src/features/card_games/config.rs": {
+      "lines": 39,
+      "pub_items": 2
+    },
+    "src/features/card_games/deadline.rs": {
+      "lines": 26,
+      "pub_items": 3
+    },
+    "src/features/card_games/dealing.rs": {
+      "lines": 138,
+      "pub_items": 7
+    },
+    "src/features/card_games/landlord.rs": {
+      "lines": 1784,
+      "pub_items": 51
+    },
+    "src/features/card_games/mod.rs": {
+      "lines": 58,
+      "pub_items": 9
+    },
+    "src/features/card_games/outcome.rs": {
+      "lines": 143,
+      "pub_items": 10
+    },
+    "src/features/card_games/reply_helpers.rs": {
+      "lines": 23,
+      "pub_items": 2
+    },
+    "src/features/card_games/rng.rs": {
+      "lines": 38,
+      "pub_items": 6
+    },
+    "src/features/card_games/rules.rs": {
+      "lines": 511,
+      "pub_items": 21
+    },
+    "src/features/card_games/service.rs": {
+      "lines": 1755,
+      "pub_items": 55
+    },
+    "src/features/hall/state.rs": {
+      "lines": 192,
+      "pub_items": 11
+    },
+    "src/features/playback/application.rs": {
+      "lines": 5033,
+      "pub_items": 39
+    },
+    "src/features/playback/controller.rs": {
+      "lines": 5762,
+      "pub_items": 42
+    },
+    "src/features/playback/dedup.rs": {
+      "lines": 317,
+      "pub_items": 6
+    },
+    "src/features/playback/format.rs": {
+      "lines": 412,
+      "pub_items": 11
+    },
+    "src/features/playback/matcher.rs": {
+      "lines": 84,
+      "pub_items": 1
+    },
+    "src/features/playback/mod.rs": {
+      "lines": 1847,
+      "pub_items": 65
+    },
+    "src/features/playback/queue.rs": {
+      "lines": 601,
+      "pub_items": 16
+    },
+    "src/features/playback/state.rs": {
+      "lines": 2442,
+      "pub_items": 51
+    },
+    "src/features/reply_template/card_games.rs": {
+      "lines": 1033,
+      "pub_items": 74
+    },
+    "src/features/reply_template/hall.rs": {
+      "lines": 175,
+      "pub_items": 10
+    },
+    "src/features/reply_template/idiom_chain.rs": {
+      "lines": 401,
+      "pub_items": 27
+    },
+    "src/features/reply_template/mod.rs": {
+      "lines": 1683,
+      "pub_items": 45
+    },
+    "src/features/reply_template/moderation.rs": {
+      "lines": 37,
+      "pub_items": 1
+    },
+    "src/features/reply_template/number_bomb.rs": {
+      "lines": 213,
+      "pub_items": 30
+    },
+    "src/features/reply_template/ownership.rs": {
+      "lines": 657,
+      "pub_items": 6
+    },
+    "src/features/reply_template/playback.rs": {
+      "lines": 622,
+      "pub_items": 41
+    },
+    "src/features/reply_template/playlist.rs": {
+      "lines": 306,
+      "pub_items": 38
+    },
+    "src/features/reply_template/song.rs": {
+      "lines": 111,
+      "pub_items": 2
+    },
+    "src/features/reply_template/tarot.rs": {
+      "lines": 152,
+      "pub_items": 9
+    },
+    "src/features/reply_template/turtle_soup.rs": {
+      "lines": 516,
+      "pub_items": 44
+    },
+    "src/features/reply_template/undercover.rs": {
+      "lines": 668,
+      "pub_items": 58
+    },
+    "src/features/song_request/ai.rs": {
+      "lines": 1037,
+      "pub_items": 13
+    },
+    "src/features/song_request/application.rs": {
+      "lines": 5366,
+      "pub_items": 17
+    },
+    "src/features/song_request/commands.rs": {
+      "lines": 178,
+      "pub_items": 7
+    },
+    "src/features/song_request/mod.rs": {
+      "lines": 460,
+      "pub_items": 19
+    },
+    "src/features/song_request/review.rs": {
+      "lines": 739,
+      "pub_items": 10
+    },
+    "src/features/song_request/search.rs": {
+      "lines": 58,
+      "pub_items": 7
+    },
+    "src/features/turtle_soup/mod.rs": {
+      "lines": 564,
+      "pub_items": 37
+    },
+    "src/features/turtle_soup/repository.rs": {
+      "lines": 188,
+      "pub_items": 5
+    },
+    "src/features/turtle_soup/service.rs": {
+      "lines": 4045,
+      "pub_items": 42
+    },
+    "src/features/undercover/mod.rs": {
+      "lines": 2534,
+      "pub_items": 59
+    },
+    "src/features/undercover/repository.rs": {
+      "lines": 233,
+      "pub_items": 3
+    },
+    "src/features/undercover/service.rs": {
+      "lines": 2221,
+      "pub_items": 43
+    },
+    "src/interfaces/chat.rs": {
+      "lines": 1227,
+      "pub_items": 11
+    },
+    "src/interfaces/hotkeys.rs": {
+      "lines": 216,
+      "pub_items": 7
+    },
+    "src/interfaces/mod.rs": {
+      "lines": 4,
+      "pub_items": 4
+    },
+    "src/interfaces/tui.rs": {
+      "lines": 495,
+      "pub_items": 6
+    },
+    "src/interfaces/chat/router.rs": {
+      "lines": 1880,
+      "pub_items": 11
+    },
+    "src/interfaces/http/facade.rs": {
+      "lines": 1697,
+      "pub_items": 16
+    },
+    "src/interfaces/http/mod.rs": {
+      "lines": 15,
+      "pub_items": 4
+    },
+    "src/interfaces/http/panel.rs": {
+      "lines": 91,
+      "pub_items": 3
+    },
+    "src/interfaces/http/ports.rs": {
+      "lines": 638,
+      "pub_items": 25
+    },
+    "src/interfaces/http/protocol.rs": {
+      "lines": 2159,
+      "pub_items": 12
+    },
+    "src/interfaces/http/tools.rs": {
+      "lines": 151,
+      "pub_items": 5
+    },
+    "src/interfaces/http/routes/ai.rs": {
+      "lines": 865,
+      "pub_items": 30
+    },
+    "src/interfaces/http/routes/commands.rs": {
+      "lines": 778,
+      "pub_items": 4
+    },
+    "src/interfaces/http/routes/config.rs": {
+      "lines": 592,
+      "pub_items": 14
+    },
+    "src/interfaces/http/routes/debug.rs": {
+      "lines": 1517,
+      "pub_items": 26
+    },
+    "src/interfaces/http/routes/entertainment.rs": {
+      "lines": 156,
+      "pub_items": 7
+    },
+    "src/interfaces/http/routes/health.rs": {
+      "lines": 129,
+      "pub_items": 2
+    },
+    "src/interfaces/http/routes/operator.rs": {
+      "lines": 119,
+      "pub_items": 8
+    },
+    "src/interfaces/http/routes/playback.rs": {
+      "lines": 904,
+      "pub_items": 40
+    },
+    "src/interfaces/http/routes/system.rs": {
+      "lines": 682,
+      "pub_items": 42
+    },
+    "src/interfaces/http/routes/tasks_chat.rs": {
+      "lines": 145,
+      "pub_items": 6
+    },
+    "src/observation/chat.rs": {
+      "lines": 631,
+      "pub_items": 58
+    },
+    "src/observation/decision.rs": {
+      "lines": 154,
+      "pub_items": 5
+    },
+    "src/observation/exclusive.rs": {
+      "lines": 133,
+      "pub_items": 10
+    },
+    "src/observation/mod.rs": {
+      "lines": 4,
+      "pub_items": 4
+    },
+    "src/observation/shared.rs": {
+      "lines": 222,
+      "pub_items": 13
+    },
+    "src/observation/chat/freshness.rs": {
+      "lines": 588,
+      "pub_items": 11
+    },
+    "src/observation/chat/passive.rs": {
+      "lines": 384,
+      "pub_items": 15
+    },
+    "src/observation/chat/scan.rs": {
+      "lines": 825,
+      "pub_items": 15
+    },
+    "src/observation/chat/scan_gate.rs": {
+      "lines": 211,
+      "pub_items": 4
+    },
+    "src/observation/chat/secondary_unread_vision.rs": {
+      "lines": 544,
+      "pub_items": 5
+    },
+    "src/observation/chat/stream.rs": {
+      "lines": 607,
+      "pub_items": 20
+    },
+    "src/observation/chat/timeline.rs": {
+      "lines": 4462,
+      "pub_items": 49
+    },
+    "src/observation/chat/visual.rs": {
+      "lines": 578,
+      "pub_items": 12
+    },
+    "src/observation/chat/secondary_hall_vision/detection.rs": {
+      "lines": 269,
+      "pub_items": 8
+    },
+    "src/observation/chat/secondary_hall_vision/mod.rs": {
+      "lines": 47,
+      "pub_items": 2
+    },
+    "src/observation/chat/secondary_hall_vision/sender_label.rs": {
+      "lines": 673,
+      "pub_items": 3
+    },
+    "src/runtime/business.rs": {
+      "lines": 6317,
+      "pub_items": 145
+    },
+    "src/runtime/chat_listener.rs": {
+      "lines": 179,
+      "pub_items": 18
+    },
+    "src/runtime/deadline.rs": {
+      "lines": 181,
+      "pub_items": 2
+    },
+    "src/runtime/deadline_bridge.rs": {
+      "lines": 1102,
+      "pub_items": 18
+    },
+    "src/runtime/decision.rs": {
+      "lines": 156,
+      "pub_items": 9
+    },
+    "src/runtime/deferred_chat.rs": {
+      "lines": 703,
+      "pub_items": 25
+    },
+    "src/runtime/health.rs": {
+      "lines": 382,
+      "pub_items": 20
+    },
+    "src/runtime/mod.rs": {
+      "lines": 19,
+      "pub_items": 19
+    },
+    "src/runtime/monitor.rs": {
+      "lines": 926,
+      "pub_items": 17
+    },
+    "src/runtime/ocr.rs": {
+      "lines": 902,
+      "pub_items": 18
+    },
+    "src/runtime/player.rs": {
+      "lines": 2123,
+      "pub_items": 30
+    },
+    "src/runtime/player_io.rs": {
+      "lines": 3424,
+      "pub_items": 84
+    },
+    "src/runtime/recovery.rs": {
+      "lines": 1198,
+      "pub_items": 25
+    },
+    "src/runtime/scheduler.rs": {
+      "lines": 1114,
+      "pub_items": 63
+    },
+    "src/runtime/task_engine.rs": {
+      "lines": 1115,
+      "pub_items": 33
+    },
+    "src/runtime/ui.rs": {
+      "lines": 4474,
+      "pub_items": 166
+    },
+    "src/runtime/business/entertainment.rs": {
+      "lines": 400,
+      "pub_items": 20
+    },
+    "src/runtime/business/hall.rs": {
+      "lines": 97,
+      "pub_items": 3
+    },
+    "src/runtime/business/playback.rs": {
+      "lines": 330,
+      "pub_items": 3
+    },
+    "src/runtime/chat_source/launcher.rs": {
+      "lines": 990,
+      "pub_items": 2
+    },
+    "src/runtime/chat_source/mod.rs": {
+      "lines": 660,
+      "pub_items": 14
+    },
+    "src/runtime/chat_source/ws.rs": {
+      "lines": 183,
+      "pub_items": 3
+    },
+    "src/runtime/ocr/batch.rs": {
+      "lines": 327,
+      "pub_items": 3
+    },
+    "src/runtime/ocr/engine.rs": {
+      "lines": 719,
+      "pub_items": 11
+    },
+    "src/runtime/ocr/openvino.rs": {
+      "lines": 1512,
+      "pub_items": 5
+    },
+    "src/test_support/corpus.rs": {
+      "lines": 138,
+      "pub_items": 4
+    },
+    "src/text/chat_layout.rs": {
+      "lines": 386,
+      "pub_items": 10
+    },
+    "src/text/emoji.rs": {
+      "lines": 835,
+      "pub_items": 24
+    },
+    "src/text/mod.rs": {
+      "lines": 667,
+      "pub_items": 17
+    },
+    "src/ui/atoms.rs": {
+      "lines": 301,
+      "pub_items": 11
+    },
+    "src/ui/chat_output.rs": {
+      "lines": 1072,
+      "pub_items": 24
+    },
+    "src/ui/frame.rs": {
+      "lines": 302,
+      "pub_items": 9
+    },
+    "src/ui/locator.rs": {
+      "lines": 152,
+      "pub_items": 8
+    },
+    "src/ui/mod.rs": {
+      "lines": 8,
+      "pub_items": 8
+    },
+    "src/ui/plan.rs": {
+      "lines": 113,
+      "pub_items": 6
+    },
+    "src/ui/routines/custom_action.rs": {
+      "lines": 1293,
+      "pub_items": 10
+    },
+    "src/ui/routines/friend_delivery.rs": {
+      "lines": 1288,
+      "pub_items": 75
+    },
+    "src/ui/routines/hall.rs": {
+      "lines": 1257,
+      "pub_items": 25
+    },
+    "src/ui/routines/invite.rs": {
+      "lines": 1296,
+      "pub_items": 18
+    },
+    "src/ui/routines/mod.rs": {
+      "lines": 56,
+      "pub_items": 10
+    },
+    "src/ui/routines/moderation.rs": {
+      "lines": 853,
+      "pub_items": 14
+    },
+    "src/ui/routines/residency.rs": {
+      "lines": 2255,
+      "pub_items": 30
+    },
+    "src/ui/routines/secondary_unread.rs": {
+      "lines": 1039,
+      "pub_items": 12
+    },
+    "src/ui/routines/startup.rs": {
+      "lines": 2226,
+      "pub_items": 18
+    },
+    "src/ui/routines/state_observation.rs": {
+      "lines": 549,
+      "pub_items": 21
+    },
+    "src/ui/routines/transaction.rs": {
+      "lines": 2134,
+      "pub_items": 19
+    },
+    "src/ui/routines/friend_delivery/delivery.rs": {
+      "lines": 669,
+      "pub_items": 17
+    },
+    "src/ui/routines/friend_delivery/emoji_panel.rs": {
+      "lines": 660,
+      "pub_items": 39
+    },
+    "src/ui/routines/friend_delivery/navigation.rs": {
+      "lines": 578,
+      "pub_items": 29
+    },
+    "src/ui/state/anchors.rs": {
+      "lines": 310,
+      "pub_items": 28
+    },
+    "src/ui/state/args.rs": {
+      "lines": 112,
+      "pub_items": 3
+    },
+    "src/ui/state/classifier.rs": {
+      "lines": 361,
+      "pub_items": 5
+    },
+    "src/ui/state/classify.rs": {
+      "lines": 280,
+      "pub_items": 2
+    },
+    "src/ui/state/diagnostic.rs": {
+      "lines": 117,
+      "pub_items": 13
+    },
+    "src/ui/state/fallback.rs": {
+      "lines": 213,
+      "pub_items": 9
+    },
+    "src/ui/state/hall.rs": {
+      "lines": 198,
+      "pub_items": 14
+    },
+    "src/ui/state/mod.rs": {
+      "lines": 44,
+      "pub_items": 7
+    },
+    "src/ui/state/paimon.rs": {
+      "lines": 168,
+      "pub_items": 14
+    },
+    "src/ui/state/panels.rs": {
+      "lines": 435,
+      "pub_items": 3
+    },
+    "src/ui/state/profiles.rs": {
+      "lines": 430,
+      "pub_items": 16
+    },
+    "src/ui/state/qianxing.rs": {
+      "lines": 291,
+      "pub_items": 26
+    },
+    "src/ui/state/regions.rs": {
+      "lines": 20,
+      "pub_items": 1
+    },
+    "src/ui/state/result.rs": {
+      "lines": 167,
+      "pub_items": 9
+    },
+    "src/ui/state/sampling.rs": {
+      "lines": 326,
+      "pub_items": 18
+    },
+    "src/ui/state/world.rs": {
+      "lines": 425,
+      "pub_items": 23
+    },
+    "src/ui/template/api.rs": {
+      "lines": 386,
+      "pub_items": 9
+    },
+    "src/ui/template/cache.rs": {
+      "lines": 326,
+      "pub_items": 21
+    },
+    "src/ui/template/cpu.rs": {
+      "lines": 957,
+      "pub_items": 33
+    },
+    "src/ui/template/gpu.rs": {
+      "lines": 580,
+      "pub_items": 21
+    },
+    "src/ui/template/mod.rs": {
+      "lines": 28,
+      "pub_items": 4
+    }
+  },
+  "intra_layer_scc": {
+    "adapters": 2,
+    "config": 2,
+    "features": 18
+  }
+}

@@ -2920,6 +2920,7 @@ fn run_ui_runtime(
         if stop_requested.load(Ordering::Acquire) {
             break;
         }
+        crate::runtime::health::ui().touch();
         let message = match next_frame_timeout(&demands) {
             Some(timeout) => match receiver.recv_timeout(timeout) {
                 Ok(message) => Some(message),

@@ -828,6 +828,9 @@ pub fn default_config_json_with_audio_cache() -> Value {
 }
 
 #[cfg(test)]
+mod tests_snapshot;
+
+#[cfg(test)]
 mod tests {
     use std::collections::{BTreeSet, HashMap};
 

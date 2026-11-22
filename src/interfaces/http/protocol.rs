@@ -38,6 +38,8 @@ mod config_routes;
 mod debug_routes;
 #[path = "routes/entertainment.rs"]
 mod entertainment_routes;
+#[path = "routes/health.rs"]
+mod health_routes;
 #[path = "routes/operator.rs"]
 mod operator_routes;
 #[path = "routes/playback.rs"]
@@ -911,6 +913,14 @@ const ROUTES: &[RouteSpec] = &[
         json: false,
         mutating: false,
         handler: health_route,
+    },
+    // W0-C：拉取式只读服务快照。与上面的 `/health` 探活分开——`/health` 是
+    // 免令牌的纯文本约定，不能改；本端点走既有令牌校验并返回 JSON。
+    RouteSpec {
+        path: "/health/services",
+        json: true,
+        mutating: false,
+        handler: health_routes::health_services_route,
     },
 ];
 

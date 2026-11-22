@@ -604,6 +604,7 @@ impl AppServices {
     /// 播放器、配置快照）上，执行方不需要拥有任何运行时，
     /// 也不需要一份「重建出来的应用壳」。
     pub(super) fn execute_pending_task(&self, task: PendingTask) -> Result<PendingTaskExecution> {
+        let probe = crate::runtime::health::formal_task().enter();
         let label = task.label();
         let result = match task {
             PendingTask::Command(pending) => self
@@ -658,10 +659,12 @@ impl AppServices {
         };
         match result {
             Ok(PendingTaskExecution::Completed) => {
+                probe.completed();
                 log::info!("待处理任务已完成：{label}");
                 Ok(PendingTaskExecution::Completed)
             }
             Err(error) => {
+                probe.rejected();
                 log::error!(
                     "待处理任务失败（步骤：执行待处理任务「{label}」），该任务已放弃，不会自动重试：{error:#}"
                 );

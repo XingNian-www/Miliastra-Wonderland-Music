@@ -6,6 +6,7 @@ pub(crate) mod deadline;
 pub(crate) mod deadline_bridge;
 pub(crate) mod decision;
 pub(crate) mod deferred_chat;
+pub(crate) mod health;
 pub use miliastra_kernel::identity;
 pub(crate) mod monitor;
 pub(crate) mod ocr;

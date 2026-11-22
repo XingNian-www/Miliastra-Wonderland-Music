@@ -1550,7 +1550,7 @@ mod tests {
             accepted, 1,
             "并发触发只应成功启动一条后台歌词线程，实际 {accepted} 条"
         );
-        assert_eq!(started.load(AtomicOrdering::SeqCst), 1);
+        wait_until(|| started.load(AtomicOrdering::SeqCst) == 1, "线程已启动");
         assert!(worker.stop().expect("stop the single worker"));
         assert!(!worker.stop().expect("second stop is a no-op"));
     }

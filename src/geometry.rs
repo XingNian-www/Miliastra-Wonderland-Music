@@ -1,8 +1,37 @@
 use anyhow::{Result, bail};
 use image::DynamicImage;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use crate::config::RectConfig;
+/// 屏幕区域配置值：`x`/`y` 起点与宽高。
+///
+/// 定义住在根级几何叶子，而不是 `config/types/general.rs`：`geometry` 只被各层
+/// 引用、不引用任何业务层，而 `config` 需要它来拼 `ScreenConfig` 等段
+/// （`config → geometry` 是向下的合法边）。原先 `geometry` 反过来
+/// `use crate::config::RectConfig`，是一条已存在却因"根级叶子不作为源扫描"
+/// 而看不见的向上边（W0 修）。`crate::config::RectConfig` 路径由
+/// `config/types/general.rs` 的 `pub use` 保持零变更。
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RectConfig {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// 屏幕/窗口内的一个点击坐标。
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PointConfig {
+    pub x: i32,
+    pub y: i32,
+}
+
+impl PointConfig {
+    pub const fn new(x: i32, y: i32) -> Self {
+        Self { x, y }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct Point {
@@ -197,6 +226,22 @@ mod tests {
             clamp_rect(Rect::new(390, 87, 790, 870), 1_280, 720),
             Rect::new(390, 87, 790, 633)
         );
+    }
+
+    /// W0 搬迁的契约：`RectConfig` / `PointConfig` 的值类型住在 `geometry`，
+    /// 但 `crate::config::{RectConfig, PointConfig}` 这条既有路径必须继续可用
+    /// （`config/types/general.rs` 的 `pub use` 重导出）。
+    #[test]
+    fn geometry_value_types_are_reexported_through_config() {
+        let rect: crate::config::RectConfig = RectConfig {
+            x: 1,
+            y: 2,
+            width: 3,
+            height: 4,
+        };
+        assert_eq!(Rect::from(rect), Rect::new(1, 2, 3, 4));
+        let point: crate::config::PointConfig = PointConfig::new(5, 6);
+        assert_eq!((point.x, point.y), (5, 6));
     }
 
     #[test]

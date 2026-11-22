@@ -179,7 +179,10 @@ pub(crate) fn recognize_lines(
     engine: &mut OcrEngineBackend,
     image: &DynamicImage,
 ) -> Result<Vec<OcrLine>> {
-    engine.recognize_lines(image)
+    let probe = crate::runtime::health::ocr().enter();
+    let result = engine.recognize_lines(image);
+    probe.finish(result.is_ok());
+    result
 }
 
 #[cfg(feature = "ocr-mnn")]

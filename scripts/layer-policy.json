@@ -1,5 +1,6 @@
 {
-  "comment": "分层方向策略：forbid 是当前应为 0 的反向边；allow_files 是既有设计边的文件白名单（新增文件不自动豁免）。",
+  "version": 2,
+  "comment": "分层方向策略（W0 allowlist 制）。forbid 是禁区（当前应为 0 且不豁免）；其余层间边全部登记在 scripts/layer-baseline.json（--freeze 产物）。规则说明见 scripts/check-layers.py 顶部。",
   "forbid": [
     [
       "features",
@@ -42,5 +43,90 @@
       "interfaces"
     ]
   ],
-  "allow_files": []
+  "fake_targets": [
+    "RunOutcome",
+    "CONFIG_RELOAD_CHILD_ENV",
+    "CONFIG_RELOAD_RUN_STARTUP_ENV",
+    "config_reload_child_ready",
+    "mark_config_reload_child_ready"
+  ],
+  "strip_comment_edges": true,
+  "new_files": "report",
+  "intra_layer_scc": {
+    "features": {
+      "max_nodes": 18,
+      "exempt": true,
+      "reason": "features 内 18 个玩法子模块互相复用命令/会话模型（实测 Tarjan 口径：layer/子模块；方案写的 14 是旧口径，已漂移）。显式豁免，拆环排在 W5 之后"
+    },
+    "config": {
+      "max_nodes": 2,
+      "report_only_until": "W5",
+      "reason": "config/store 与 config/migrations 互引（CONFIG_SCHEMA_VERSION / has_migration_path）；审查 §4.2-W0 修正 1 允许先 report-only"
+    },
+    "adapters": {
+      "max_nodes": 2,
+      "reason": "cfg(windows) 平台分派：adapters/game_path 只在 Windows 分支调 windows::registry_game_path，windows/game 又重导出 game_path；已声明上界 2，涨到 3 即红"
+    }
+  },
+  "budgets": {
+    "ratchet": "lines+pub_items，只降不升；--freeze 默认不上调，--freeze --update 才显式上调"
+  },
+  "debt": [
+    {
+      "source": "config",
+      "target": "features",
+      "kind": "debt",
+      "issue": "ARCH-DEBT-01 config 聚合 feature 定义的 *Config 结构体",
+      "expires": "2027-03-31",
+      "reason": "各业务模块自己定义 *Config，AppConfig 只是聚合；W5 评估是否把纯配置结构下沉"
+    },
+    {
+      "source": "config",
+      "target": "runtime",
+      "kind": "debt",
+      "issue": "ARCH-DEBT-02 config 依赖 runtime 类型",
+      "expires": "2027-03-31",
+      "reason": "config/types/aggregate.rs 引用 runtime 的运行时类型；配置层不应知道运行时"
+    },
+    {
+      "source": "config",
+      "target": "adapters",
+      "kind": "debt",
+      "issue": "ARCH-DEBT-03 config 直接依赖 adapters",
+      "expires": "2027-03-31",
+      "reason": "config/store/upgrade.rs 与 config/types/aggregate.rs 越过端口直连适配器"
+    },
+    {
+      "source": "config",
+      "target": "debug",
+      "kind": "debt",
+      "issue": "ARCH-DEBT-04 config/ai.rs 依赖 debug 沙盒",
+      "expires": "2027-03-31",
+      "reason": "配置层出现调试沙盒类型；应改为纯数据或端口"
+    },
+    {
+      "source": "runtime",
+      "target": "features",
+      "kind": "debt",
+      "issue": "ARCH-DEBT-05 runtime 反向依赖 features 业务规则",
+      "expires": "2027-03-31",
+      "reason": "runtime 是线程/调度层，引用 features 业务类型会让下层知道上层语义"
+    },
+    {
+      "source": "debug",
+      "target": "features",
+      "kind": "debt",
+      "issue": "ARCH-DEBT-06 debug 沙盒复用 features 解析器",
+      "expires": "2027-03-31",
+      "reason": "沙盒命令认领复用业务解析器；应经端口或只读快照"
+    },
+    {
+      "source": "debug",
+      "target": "observation",
+      "kind": "debt",
+      "issue": "ARCH-DEBT-07 debug 沙盒复用 observation 快照类型",
+      "expires": "2027-03-31",
+      "reason": "调试层直接序列化观察层内部类型；应定义自己的 DTO"
+    }
+  ]
 }

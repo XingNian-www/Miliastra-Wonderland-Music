@@ -10,6 +10,11 @@ use serde::{Deserialize, Serialize};
 
 use super::paths::{validate_nonempty_path, validate_rect_in_canvas};
 
+/// 几何值类型住在根级叶子 `geometry`（W0 搬迁）：`geometry` 被各层引用却不引用
+/// 业务层，`config → geometry` 是向下的合法边。这里保留重导出，使
+/// `crate::config::{RectConfig, PointConfig}` 的既有路径零变更。
+pub(crate) use crate::geometry::{PointConfig, RectConfig};
+
 const BUILTIN_STABILITY_COUNT: u32 = 2;
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -88,28 +93,6 @@ impl Default for WindowConfig {
             focus_point: PointConfig::new(1919, 1000),
             capture_method: WindowCaptureMethod::default(),
         }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RectConfig {
-    pub x: i32,
-    pub y: i32,
-    pub width: u32,
-    pub height: u32,
-}
-
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PointConfig {
-    pub x: i32,
-    pub y: i32,
-}
-
-impl PointConfig {
-    pub const fn new(x: i32, y: i32) -> Self {
-        Self { x, y }
     }
 }
 

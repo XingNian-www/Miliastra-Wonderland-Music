@@ -3487,6 +3487,7 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
         let Ok(message) = receiver.recv() else {
             break;
         };
+        crate::runtime::health::business().touch();
         // 单条消息的 panic 不能让整个业务运行时永久停摆（点歌/决策/队列/值守都依赖它）。
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match message {
             RuntimeMessage::OperationalSnapshot { now, response } => {

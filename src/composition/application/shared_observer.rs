@@ -66,6 +66,7 @@ impl ApplicationRuntime {
                 while running.load(AtomicOrdering::Acquire)
                     && !worker_stop.load(AtomicOrdering::Acquire)
                 {
+                    crate::runtime::health::shared_observer().touch();
                     let live = live_configs.snapshot();
                     let next_interval = live.timing.loop_idle_ms.max(1);
                     if next_interval != interval {

@@ -393,6 +393,18 @@ jobs:
           print("workspace --lib 编译检查通过：0 警告")
           '
 
+      - name: Windows 目标编译检查（mingw 交叉，补 Linux 门禁盲区）
+        # 产品只支持 Windows，而上面那条 check 跑的是 Linux 目标：`#[cfg(windows)]`
+        # 的代码在这里完全不可见。2026-11-23 就把一个 `error[E0432]`（config 漏导出）
+        # 一路推到 Windows Release 构建才炸。这一步用 mingw 交叉到
+        # `x86_64-pc-windows-gnu` 做 `cargo check`（不链接，不需要 MSVC/SDK）。
+        # 能力边界（不覆盖 OCR 后端的编译错误）写在 `scripts/check-windows.sh` 头部。
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64
+          rustup target add x86_64-pc-windows-gnu
+          bash scripts/check-windows.sh
+
       - name: 单测（cargo test --workspace --lib --no-default-features）
         # 覆盖面的三处补充（B00-P1-6）：
         #   1) `--workspace`：workspace 有 5 个 member，旧命令只测根 crate，

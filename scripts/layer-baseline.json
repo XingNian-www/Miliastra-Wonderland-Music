@@ -2020,16 +2020,16 @@
       "pub_items": 1
     },
     "src/adapters/windows/game.rs": {
-      "lines": 71,
-      "pub_items": 2
+      "lines": 69,
+      "pub_items": 1
     },
     "src/adapters/windows/input.rs": {
       "lines": 229,
       "pub_items": 10
     },
     "src/adapters/windows/mod.rs": {
-      "lines": 18,
-      "pub_items": 5
+      "lines": 17,
+      "pub_items": 4
     },
     "src/adapters/windows/window.rs": {
       "lines": 1516,
@@ -2892,7 +2892,7 @@
       "pub_items": 6
     },
     "src/ui/routines/custom_action.rs": {
-      "lines": 1293,
+      "lines": 1291,
       "pub_items": 10
     },
     "src/ui/routines/friend_delivery.rs": {
@@ -2900,7 +2900,7 @@
       "pub_items": 75
     },
     "src/ui/routines/hall.rs": {
-      "lines": 1257,
+      "lines": 1256,
       "pub_items": 25
     },
     "src/ui/routines/invite.rs": {
@@ -2912,19 +2912,19 @@
       "pub_items": 10
     },
     "src/ui/routines/moderation.rs": {
-      "lines": 853,
+      "lines": 852,
       "pub_items": 14
     },
     "src/ui/routines/residency.rs": {
-      "lines": 2255,
+      "lines": 2251,
       "pub_items": 30
     },
     "src/ui/routines/secondary_unread.rs": {
-      "lines": 1039,
+      "lines": 1038,
       "pub_items": 12
     },
     "src/ui/routines/startup.rs": {
-      "lines": 2226,
+      "lines": 2225,
       "pub_items": 18
     },
     "src/ui/routines/state_observation.rs": {
@@ -2952,7 +2952,7 @@
       "pub_items": 28
     },
     "src/ui/state/args.rs": {
-      "lines": 112,
+      "lines": 116,
       "pub_items": 3
     },
     "src/ui/state/classifier.rs": {
@@ -2960,7 +2960,7 @@
       "pub_items": 5
     },
     "src/ui/state/classify.rs": {
-      "lines": 280,
+      "lines": 303,
       "pub_items": 2
     },
     "src/ui/state/diagnostic.rs": {
@@ -3033,7 +3033,6 @@
     }
   },
   "intra_layer_scc": {
-    "adapters": 2,
     "config": 2,
     "features": 19
   }

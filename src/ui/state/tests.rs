@@ -4831,3 +4831,97 @@ fn qianxing_profile_friend_uses_view_profile_without_add_friend() {
         assert!(domain_matched, "{path} 千星资料卡必须由「奇域等级」命中");
     }
 }
+
+/// 二级聊天停在**不可发言页签**（如「已屏蔽公开频道」）时的判据：
+/// 底部没有发送圆钮，靠左上返回按钮 + 左侧「当前大厅」入口按钮确认为二级聊天。
+///
+/// 理由是否定式的：没有它时，这类帧会一路落到千星地图判据，在千星大厅里被
+/// 「整屏偏暗青」抢成 `secondary:qianxing_map`；驻留引擎据此以为自己在千星地图页，
+/// 反复按 Esc 却退不出去（实测死循环）。
+///
+/// 用合成画布而不是真实截图：判据只取决于两个模板是否出现在各自搜索区里，
+/// 与语料无关，因此干净检出也能跑（不 `skip_without_corpus`）。
+#[test]
+fn secondary_chat_without_submit_button_matches_via_hall_anchor() {
+    let config = crate::config::bundled_config();
+    let back = image::open(&config.templates.secondary_back).expect("load secondary_back");
+    let hall = image::open(&config.templates.secondary_hall).expect("load secondary_hall");
+
+    let width = config.screen.expected_width;
+    let height = config.screen.expected_height;
+    let back_rect: Rect = config.screen.secondary_back_rect.into();
+    let hall_rect: Rect = config.screen.secondary_hall_rect.into();
+
+    let paint = |with_hall: bool| {
+        // 底色必须**按大块**变化：`screen_tone` 在 120x68 粗网格上取块均值，
+        // 逐像素噪声会被平均回同一颜色，反而更像「整屏一色」的加载界面；
+        // 而纯色/平滑渐变也都会被 `loading_rule` 抢先判成 loading。
+        let mut canvas = image::RgbaImage::new(width, height);
+        let mut seed: u32 = 0x9E37_79B9;
+        for block_y in (0..height).step_by(24) {
+            for block_x in (0..width).step_by(24) {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let color = image::Rgba([
+                    ((seed >> 8) & 0xFF) as u8,
+                    ((seed >> 16) & 0xFF) as u8,
+                    ((seed >> 24) & 0xFF) as u8,
+                    255,
+                ]);
+                for y in block_y..(block_y + 24).min(height) {
+                    for x in block_x..(block_x + 24).min(width) {
+                        canvas.put_pixel(x, y, color);
+                    }
+                }
+            }
+        }
+        image::imageops::overlay(
+            &mut canvas,
+            &back.to_rgba8(),
+            i64::from(back_rect.x),
+            i64::from(back_rect.y),
+        );
+        if with_hall {
+            image::imageops::overlay(
+                &mut canvas,
+                &hall.to_rgba8(),
+                i64::from(hall_rect.x),
+                i64::from(hall_rect.y),
+            );
+        }
+        image::DynamicImage::ImageRgba8(canvas)
+    };
+
+    let classify = |image: &image::DynamicImage| {
+        let mut classifier = TemplateUiStateClassifier::new(
+            UiTemplateArgs::default().resolve(&config.templates, &config.ocr),
+            config.screen.clone(),
+        );
+        classifier
+            .classify_at(image, Instant::now())
+            .expect("classify")
+    };
+
+    // 正样本：返回按钮 +「当前大厅」入口，没有发送圆钮 —— 必须判二级聊天。
+    let matched = classify(&paint(true));
+    assert_eq!(
+        matched.kind(),
+        UiStateKind::Secondary,
+        "返回按钮 +「当前大厅」入口必须判二级聊天，实际 {}",
+        matched.kind().name()
+    );
+    assert_eq!(
+        matched.evidence().final_rule(),
+        "secondary_hall_anchor",
+        "判据名必须是 secondary_hall_anchor，实际 {}",
+        matched.evidence().final_rule()
+    );
+
+    // 负样本：抹掉「当前大厅」入口后，不得再靠这条判据成立。
+    // 否则说明判据退化成「只要有返回按钮就算二级聊天」，会把奇域主菜单吞进来。
+    let unmatched = classify(&paint(false));
+    assert_ne!(
+        unmatched.evidence().final_rule(),
+        "secondary_hall_anchor",
+        "没有「当前大厅」入口时不得判成 secondary_hall_anchor"
+    );
+}

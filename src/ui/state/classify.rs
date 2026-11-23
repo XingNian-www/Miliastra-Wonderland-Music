@@ -223,6 +223,29 @@ pub(super) fn detect_ui_state_with_evidence(
                 UiStateEvidence::new(template_probes, None, "secondary_chat_anchor"),
             ));
         }
+        // 不可发言页签（如「已屏蔽公开频道」）底部没有发送圆钮，上面的 submit 锚点
+        // 必然落空；但左侧仍有「当前大厅」入口。返回按钮已命中、奇域主菜单已否决，
+        // 再命中这个入口即可确认二级聊天。缺了它整帧会落到千星地图判据，被「整屏偏
+        // 暗青」抢成 `secondary:qianxing_map`，驻留引擎以为在地图页、按 Esc 退不出去。
+        let hall_region: Rect = screen.secondary_hall_rect.into();
+        let hall_candidate =
+            best_template_candidate(image, Some(hall_region), &templates.secondary_hall_template)?;
+        let hall_visible = candidate_matches(&hall_candidate, threshold);
+        template_probes.push(template_probe(
+            &templates.secondary_hall_template,
+            hall_region,
+            threshold,
+            hall_candidate.as_ref(),
+        ));
+        if hall_visible {
+            log::debug!(target: "timing",
+                "UI 状态检测耗时: total={}ms back={}ms state=secondary_chat rule=secondary_hall_anchor",
+                elapsed_ms(started), elapsed_ms(back_started));
+            return Ok((
+                UiState::secondary_chat(),
+                UiStateEvidence::new(template_probes, None, "secondary_hall_anchor"),
+            ));
+        }
         let back_ms = elapsed_ms(back_started);
 
         // 主菜单大世界（ESC 系统菜单）**布局无关**判定（用户要求极快、不用商城、

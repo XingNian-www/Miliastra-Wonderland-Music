@@ -22,6 +22,9 @@ pub(crate) struct ResolvedUiTemplateArgs {
     pub(crate) main_menu_template: PathBuf,
     /// 二级聊天输入行「发送」圆钮模板；与圆形返回按钮一起判二级。
     pub(crate) secondary_chat_submit_template: PathBuf,
+    /// 二级聊天左侧「当前大厅」入口按钮模板；只在**不可发言页签**（如「已屏蔽公开
+    /// 频道」）上需要——那种页签没有发送圆钮，光靠 submit 模板认不出二级聊天。
+    pub(crate) secondary_hall_template: PathBuf,
     /// F2 千星大厅页（多人面板）两个底部按钮锚点：左下「大厅列表」、右下「邀请玩家」。
     pub(crate) qianxing_f2_hall_list_template: PathBuf,
     pub(crate) qianxing_f2_invite_player_template: PathBuf,
@@ -79,6 +82,7 @@ impl UiTemplateArgs {
                 .clone()
                 .unwrap_or_else(|| templates.main_menu.clone()),
             secondary_chat_submit_template: templates.secondary_chat_submit.clone(),
+            secondary_hall_template: templates.secondary_hall.clone(),
             qianxing_f2_hall_list_template: templates.qianxing_f2_hall_list.clone(),
             qianxing_f2_invite_player_template: templates.qianxing_f2_invite_player.clone(),
             qianxing_exit_menu_template: templates.qianxing_exit_menu.clone(),

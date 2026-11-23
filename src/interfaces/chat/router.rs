@@ -453,6 +453,9 @@ impl<'a> ChatCommandRouter<'a> {
 mod alias_oracle_tests;
 
 #[cfg(test)]
+#[path = "router_registry_coverage_tests.rs"]
+mod registry_coverage_tests;
+#[cfg(test)]
 mod tarot_routing_tests {
     use super::*;
     use crate::features::command::CommandObservation;

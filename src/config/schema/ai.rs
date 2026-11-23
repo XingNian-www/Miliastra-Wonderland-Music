@@ -12,12 +12,14 @@ pub(super) fn ai_section() -> Vec<ConfigFieldSchema> {
         ConfigFieldSchema::db_idle_reload(
             "provider",
             "服务商",
-            FieldKind::Enum(vec![
-                ("mimo".to_string(), "小米 MiMo".to_string()),
-                ("openai".to_string(), "OpenAI".to_string()),
-                ("deepseek".to_string(), "DeepSeek".to_string()),
-                ("custom".to_string(), "自定义网关".to_string()),
-            ]),
+            // 下拉选项由 [`crate::config::ai::AI_PROVIDERS`] 派生：值 = `ai.provider`，
+            // 标签 = 面板显示名。新增服务商只登记那张表，这里不再手抄第二份。
+            FieldKind::Enum(
+                crate::config::ai::AI_PROVIDERS
+                    .iter()
+                    .map(|spec| (spec.id.to_string(), spec.label.to_string()))
+                    .collect(),
+            ),
             "所有 AI 功能共用的服务商。二段式配置：先选服务商，再按服务商填写参数；custom 必须填写 endpoint 与 model",
         ),
         ConfigFieldSchema::db_idle_reload(
@@ -89,13 +91,8 @@ pub(super) fn song_ai_section() -> Vec<ConfigFieldSchema> {
         ConfigFieldSchema::db_idle_reload(
             "reasoning",
             "思考强度",
-            FieldKind::Enum(vec![
-                ("unset".to_string(), "不指定（服务端默认）".to_string()),
-                ("minimal".to_string(), "最低".to_string()),
-                ("low".to_string(), "低".to_string()),
-                ("medium".to_string(), "中".to_string()),
-                ("high".to_string(), "高".to_string()),
-            ]),
+            // 选项由 [`crate::config::ai::REASONING_EFFORTS`] 派生。
+            FieldKind::Enum(crate::config::ai::ReasoningEffort::panel_options()),
             "点歌匹配的思考强度；留空跟随服务端默认。点歌偏重低延迟，通常用最低",
         ),
         ConfigFieldSchema::db_live(
@@ -209,13 +206,8 @@ pub(super) fn song_review_section() -> Vec<ConfigFieldSchema> {
         ConfigFieldSchema::db_idle_reload(
             "reasoning",
             "思考强度",
-            FieldKind::Enum(vec![
-                ("unset".to_string(), "不指定（服务端默认）".to_string()),
-                ("minimal".to_string(), "最低".to_string()),
-                ("low".to_string(), "低".to_string()),
-                ("medium".to_string(), "中".to_string()),
-                ("high".to_string(), "高".to_string()),
-            ]),
+            // 选项由 [`crate::config::ai::REASONING_EFFORTS`] 派生。
+            FieldKind::Enum(crate::config::ai::ReasoningEffort::panel_options()),
             "歌曲审核的思考强度；审核偏重判断质量，通常用中或高",
         ),
         ConfigFieldSchema::db_idle_reload(
@@ -331,13 +323,8 @@ pub(super) fn ai_chat_section() -> Vec<ConfigFieldSchema> {
         ConfigFieldSchema::db_live(
             "reasoning",
             "思考强度",
-            FieldKind::Enum(vec![
-                ("unset".to_string(), "不指定（服务端默认）".to_string()),
-                ("minimal".to_string(), "最低".to_string()),
-                ("low".to_string(), "低".to_string()),
-                ("medium".to_string(), "中".to_string()),
-                ("high".to_string(), "高".to_string()),
-            ]),
+            // 选项由 [`crate::config::ai::REASONING_EFFORTS`] 派生。
+            FieldKind::Enum(crate::config::ai::ReasoningEffort::panel_options()),
             "AI 聊天的思考强度；留空跟随服务端默认",
         ),
         ConfigFieldSchema::db_live(

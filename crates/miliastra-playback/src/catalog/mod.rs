@@ -49,8 +49,8 @@ pub use kugou::{
 pub use netease::NeteaseAdapter;
 pub use playlist_import::ImportedPlaylist;
 pub use provider::{
-    PlaybackEligibility, ProviderId, ProviderRegistry, ProviderSearchCandidate,
-    ProviderSearchOutcome,
+    PROVIDERS, PlaybackEligibility, ProviderId, ProviderRegistry, ProviderSearchCandidate,
+    ProviderSearchOutcome, ProviderSpec,
 };
 pub use qqmusic::QqMusicAdapter;
 

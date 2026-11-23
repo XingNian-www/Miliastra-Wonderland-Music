@@ -914,14 +914,18 @@ pub(crate) const FRIEND_MISC: &[CommandSpec] = &[
 
 /// 全部静态命令（不含会话态命令）。
 pub(crate) fn static_commands() -> impl Iterator<Item = &'static CommandSpec> {
-    crate::features::song_request::command_specs()
-        .iter()
-        .chain(PLAYBACK.iter())
-        .chain(HALL.iter())
-        .chain(ADMINISTRATION.iter())
-        .chain(ENTERTAINMENT_START.iter())
-        .chain(PLAYLIST.iter())
-        .chain(FRIEND_MISC.iter())
+    use crate::features::command::CommandTable as T;
+    // 拼接顺序由登记表的 `CommandTable::ALL` 决定，不再手抄 `.chain(...)`。
+    let specs = |table| match table {
+        T::Song => crate::features::song_request::command_specs(),
+        T::Playback => PLAYBACK,
+        T::Hall => HALL,
+        T::Administration => ADMINISTRATION,
+        T::EntertainmentStart => ENTERTAINMENT_START,
+        T::Playlist => PLAYLIST,
+        T::FriendMisc => FRIEND_MISC,
+    };
+    T::ALL.iter().flat_map(move |table| specs(*table).iter())
 }
 
 /// 会话态派发规则：玩法进行中才生效的命令。
@@ -1312,14 +1316,15 @@ mod tests {
     fn session_rules_are_looked_up_by_the_active_entertainment() {
         use crate::features::entertainment::EntertainmentKind;
         assert!(session_rules(None).is_empty(), "无玩法时不应有会话态规则");
-        for kind in [
-            EntertainmentKind::IdiomChain,
-            EntertainmentKind::Landlord,
-            EntertainmentKind::RunFast,
-            EntertainmentKind::TurtleSoup,
-            EntertainmentKind::Undercover,
-            EntertainmentKind::NumberBomb,
-        ] {
+        // 玩法清单由 `SESSION_DISPATCH` 自己给出，不再手抄一份（漏抄即漏测）。
+        let mut kinds: Vec<EntertainmentKind> = Vec::new();
+        for rule in SESSION_DISPATCH {
+            if !kinds.contains(&rule.kind) {
+                kinds.push(rule.kind);
+            }
+        }
+        assert!(!kinds.is_empty(), "会话态规则表不应为空");
+        for kind in kinds {
             let rules = session_rules(Some(kind));
             assert!(!rules.is_empty(), "{kind:?} 没有会话态规则");
             assert!(

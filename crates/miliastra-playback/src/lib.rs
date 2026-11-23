@@ -18,8 +18,9 @@ pub use cache::{
 };
 pub use catalog::{
     BilibiliAdapter, ImportedPlaylist, KugouAccountStatus, KugouAdapter, KugouListenReport,
-    PlaybackEligibility, ProviderAccountStatus, ProviderId, SourceAdapter, bilibili_is_bvid,
-    bilibili_normalize_bvid, kugou_calculate_mid, kugou_normalize_guid, kugou_register_device,
+    PROVIDERS, PlaybackEligibility, ProviderAccountStatus, ProviderId, ProviderSpec, SourceAdapter,
+    bilibili_is_bvid, bilibili_normalize_bvid, kugou_calculate_mid, kugou_normalize_guid,
+    kugou_register_device,
 };
 pub use credentials::{CredentialError, CredentialStatus, CredentialStore, ProviderCredential};
 pub use domain::{

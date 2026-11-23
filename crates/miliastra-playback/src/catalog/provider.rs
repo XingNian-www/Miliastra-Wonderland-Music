@@ -208,6 +208,60 @@ impl ProviderSearchOutcome {
 mod tests {
     use super::*;
 
+    /// 表的唯一性：`as_str` → `FromStr` 必须逐项往返，且 `ALL` 与 enum 变体
+    /// 数量一致。
+    ///
+    /// 变异靶子：把 `provider_registry!` 里某一行的 `id` 改掉（但 `PROVIDERS`
+    /// 的 `display_name` 等其它列不动），往返立刻红；把该行整条删掉，
+    /// `PROVIDERS.len() == ALL.len()` 与 `entries_cover_every_variant` 同时红。
+    #[test]
+    fn provider_ids_round_trip() {
+        assert_eq!(
+            PROVIDERS.len(),
+            ProviderId::ALL.len(),
+            "PROVIDERS 与 ALL 必须同长"
+        );
+        for (index, spec) in PROVIDERS.iter().enumerate() {
+            assert_eq!(
+                spec.variant,
+                ProviderId::ALL[index],
+                "PROVIDERS[{}] 的顺序必须与 ALL 一致",
+                index
+            );
+            assert_eq!(
+                spec.id,
+                spec.variant.as_str(),
+                "PROVIDERS[{}] 的 id 必须等于 as_str()",
+                index
+            );
+            let parsed: ProviderId = spec.id.parse().expect("登记过的 id 必须能解析");
+            assert_eq!(parsed, spec.variant, "{} 往返不一致", spec.id);
+            assert_eq!(parsed.to_string(), spec.id, "{} Display 不一致", spec.id);
+            assert_eq!(
+                serde_json::to_string(&spec.variant).unwrap(),
+                format!("\"{}\"", spec.id),
+                "{} serde 线上值不一致",
+                spec.id
+            );
+        }
+        // `ALL` 恰好覆盖每个变体一次：任何变体漏登记都会让这里少一项。
+        let mut ids: Vec<&str> = ProviderId::ALL.iter().map(|id| id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), PROVIDERS.len(), "ALL 里有重复变体");
+    }
+
+    /// 显示名的登记权在 `PROVIDERS`：面板（`LoginPage.vue` / `PlaybackPage.vue`
+    /// 的 `sourceNames`）与 `adapters/login_helper.rs` 的 `provider_display_name`
+    /// 是尚未迁走的第二份/第三份，本测试逐字对拍，改动任何一处都会红。
+    #[test]
+    fn provider_display_names_are_stable() {
+        assert_eq!(
+            ProviderId::ALL.map(ProviderId::display_name),
+            ["QQ音乐", "网易云音乐", "哔哩哔哩", "酷狗音乐"]
+        );
+    }
+
     #[test]
     fn canonical_ids_are_strict_and_registry_lists_all_known_providers() {
         assert_eq!(

@@ -1,18 +1,15 @@
+/// 登记表：`MODULE_SPECS` / `REPLY_GROUPS` / `CommandTable`（新增玩法的唯一登记点）。
+#[path = "command/registry.rs"]
+mod registry;
+#[cfg(test)]
+pub(crate) use registry::MODULE_SPECS;
+pub(crate) use registry::{CommandReplyGroup, CommandTable, REPLY_GROUPS};
+
 use std::time::Instant;
 
-use serde::{Deserialize, Serialize};
-
-use super::administration::AdministrationCommand;
 use super::card_games::LandlordCommand;
-use super::custom_workflow::CustomWorkflowCommand;
-use super::hall::HallCommand;
 use super::identity::IdentityRole;
 use super::idiom_chain::IdiomChainCommand;
-use super::invite::InviteCommand;
-use super::moderation::ModerationCommand;
-use super::number_bomb::NumberBombCommand;
-use super::playback::PlaybackCommand;
-use super::song_request::SongCommand;
 use super::turtle_soup::TurtleSoupCommand;
 use super::undercover::UndercoverCommand;
 use crate::observation::chat::{ObservationFrameId, ObservedChatMessageId};
@@ -259,47 +256,16 @@ impl<T> FeatureCommandMatch<T> {
 /// 住在命令模型里（而不是路由层），是因为它描述的是"这条命令属于谁"这一领域事实；
 /// 面板也要用它做分组，而 features 层不该反向依赖 interfaces。
 ///
-/// `Ord` 供路由表的一致性测试去重/判可达（`BTreeSet<ChatCommandModule>`）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum ChatCommandModule {
-    SongRequest,
-    Playback,
-    Hall,
-    Administration,
-    IdiomChain,
-    CardGame,
-    TurtleSoup,
-    Tarot,
-    Playlist,
-    Undercover,
-    NumberBomb,
-    Invite,
-    Moderation,
-    CustomWorkflow,
-    AiChat,
-}
+/// **变体由 `registry::define_module_registry!` 生成**（W4b）：与 `ModuleCommand`
+/// 同一次宏调用展开，因此两枚举**必然**同名、同序、同长。新增玩法只改登记表。
+pub(crate) use super::command::registry::{ChatCommandModule, ModuleCommand};
 
 /// ADR 0059 定义的顶层小型路由枚举。
 ///
-/// 每种载荷类型由对应业务模块拥有。聊天路由完成后，此枚举标识选中的模块，也允许非聊天适配器直接提交类型化模块命令。
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum ModuleCommand {
-    SongRequest(SongCommand),
-    Playback(PlaybackCommand),
-    Hall(HallCommand),
-    Administration(AdministrationCommand),
-    IdiomChain(IdiomChainCommand),
-    CardGame(LandlordCommand),
-    TurtleSoup(TurtleSoupCommand),
-    Tarot(super::tarot::TarotCommand),
-    Playlist(super::playlist::PlaylistCommand),
-    Undercover(UndercoverCommand),
-    NumberBomb(NumberBombCommand),
-    Invite(InviteCommand),
-    Moderation(ModerationCommand),
-    CustomWorkflow(CustomWorkflowCommand),
-    AiChat(super::ai_chat::AiChatCommand),
-}
+/// 每种载荷类型由对应业务模块拥有。聊天路由完成后，此枚举标识选中的模块，
+/// 也允许非聊天适配器直接提交类型化模块命令。
+///
+/// 同上，变体与载荷类型由登记表生成（`payload:` 列），写错类型是编译错误。
 
 /// 命令是否携带不能进证据流的私密内容。
 ///
@@ -377,6 +343,11 @@ impl ModuleCommand {
             // 公屏里的审核触发不含私密内容；只有私聊输入才需要脱敏（上面已匹配）。
             Self::Moderation(_) => None,
             // 以下玩法不含需要脱敏的用户输入。
+            //
+            // 这一组**可以表驱动**（登记表把它们标成 `PrivatePayloadClass::Never`），
+            // 但刻意仍写成显式穷尽分支：`|` 模式里少写一个变体会让该变体落到
+            // 编译器的 unreachable/未覆盖检查上，而不是静默变成 `None`。
+            // 与登记表的分类是否一致由 `private_payload_class_matches_the_registry` 对拍。
             Self::SongRequest(_)
             | Self::Playback(_)
             | Self::Hall(_)

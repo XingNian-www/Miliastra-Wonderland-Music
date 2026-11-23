@@ -2132,8 +2132,8 @@
       "pub_items": 27
     },
     "src/config/ai.rs": {
-      "lines": 3285,
-      "pub_items": 54
+      "lines": 3613,
+      "pub_items": 65
     },
     "src/config/live.rs": {
       "lines": 1277,
@@ -2156,7 +2156,7 @@
       "pub_items": 0
     },
     "src/config/schema/ai.rs": {
-      "lines": 664,
+      "lines": 651,
       "pub_items": 5
     },
     "src/config/schema/games.rs": {
@@ -2300,15 +2300,15 @@
       "pub_items": 2
     },
     "src/features/command.rs": {
-      "lines": 585,
-      "pub_items": 35
+      "lines": 557,
+      "pub_items": 36
     },
     "src/features/command_access.rs": {
       "lines": 1084,
       "pub_items": 17
     },
     "src/features/command_catalog.rs": {
-      "lines": 1486,
+      "lines": 1491,
       "pub_items": 23
     },
     "src/features/custom_workflow.rs": {
@@ -2451,6 +2451,14 @@
       "lines": 1755,
       "pub_items": 55
     },
+    "src/features/command/registry.rs": {
+      "lines": 1080,
+      "pub_items": 15
+    },
+    "src/features/command/registry_fixtures.rs": {
+      "lines": 623,
+      "pub_items": 9
+    },
     "src/features/hall/state.rs": {
       "lines": 192,
       "pub_items": 11
@@ -2516,7 +2524,7 @@
       "pub_items": 30
     },
     "src/features/reply_template/ownership.rs": {
-      "lines": 657,
+      "lines": 92,
       "pub_items": 6
     },
     "src/features/reply_template/playback.rs": {
@@ -2608,7 +2616,7 @@
       "pub_items": 6
     },
     "src/interfaces/chat/router.rs": {
-      "lines": 1884,
+      "lines": 1887,
       "pub_items": 11
     },
     "src/interfaces/http/facade.rs": {
@@ -3027,6 +3035,6 @@
   "intra_layer_scc": {
     "adapters": 2,
     "config": 2,
-    "features": 18
+    "features": 19
   }
 }

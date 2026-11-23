@@ -26,12 +26,6 @@ use async_openai::types::responses::{
 };
 use miliastra_kernel::ai::{Authentication, Target, validate_http_proxy};
 
-const MIMO_ENDPOINT: &str = "https://api.xiaomimimo.com/v1/chat/completions";
-const MIMO_MODEL: &str = "mimo-v2.5";
-const OPENAI_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
-const OPENAI_MODEL: &str = "gpt-5.6-mini";
-pub(crate) const DEEPSEEK_ENDPOINT: &str = "https://api.deepseek.com/chat/completions";
-pub(crate) const DEEPSEEK_MODEL: &str = "deepseek-v4-flash";
 const CHAT_COMPLETIONS_SUFFIX: &str = "/chat/completions";
 const RESPONSES_SUFFIX: &str = "/responses";
 
@@ -44,13 +38,156 @@ pub enum WireApi {
     ChatCompletions,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AiProvider {
-    Mimo,
-    OpenAi,
-    DeepSeek,
-    Custom,
+/// 一条 AI 服务商登记。`AI_PROVIDERS` 是**唯一**登记点：
+/// `AiProvider` 的变体、`ALL`、`as_str`、默认 endpoint/model、鉴权方式、
+/// `extra_body` 校验策略、错误白名单里的 id 清单，以及面板「服务商」下拉的
+/// 值/标签全部由它派生。
+///
+/// 字段为什么是这几个：
+/// - `id` / `label`：配置值（`ai.provider`）与面板显示名。面板下拉此前在
+///   `schema/ai.rs` 里手抄同一份，现改为遍历本表；
+/// - `default_endpoint` / `default_model`：留空时沿用的默认值。`None` 表示
+///   「必须由用户填写」——这正是 `custom` 与官方网关唯一的形状差异，
+///   所以用 `Option` 表达而不额外加 bool 标志；
+/// - `authentication`：MiMo 走 `api-key` 头，其余走 `Authorization: Bearer`；
+/// - `extra_body_policy`：`extra_body` 里哪些键要校验、校验多严。这里只放
+///   **策略标签**，具体校验函数仍在 [`validate_extra_body`] 手写——把每个
+///   provider 的字段长度/字符集规则塞进表会让表变成第二份 `fn`。
+pub(crate) struct AiProviderSpec {
+    pub variant: AiProvider,
+    /// `ai.provider` 的合法值。
+    pub id: &'static str,
+    /// 面板「服务商」下拉的显示名。
+    pub label: &'static str,
+    /// 留空时沿用的 Chat Completions 地址；`None` = 必填。
+    pub default_endpoint: Option<&'static str>,
+    /// 留空时沿用的模型名；`None` = 必填。
+    pub default_model: Option<&'static str>,
+    pub authentication: Authentication,
+    pub extra_body_policy: ExtraBodyPolicy,
 }
+
+/// `extra_body` 校验策略。
+///
+/// 它是 `validate_extra_body` 里 `match` 的驱动值：新增一个走别家兼容字段的
+/// 网关时，要么复用已有策略，要么在这里加变体并补齐校验分支（否则编译失败）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExtraBodyPolicy {
+    /// OpenAI 官方：`safety_identifier` + `metadata`。
+    OpenAi,
+    /// DeepSeek：`user_id`（且限定字符集）。
+    DeepSeek,
+    /// 不校验服务商专属字段（MiMo / 自定义网关）。
+    Unrestricted,
+}
+
+/// 由一张表生成 `AiProvider` 的全部重复定义。
+///
+/// **不是** `#[derive]` 过程宏：这里不生成任何配置字段声明，`ConfigFieldSchema`
+/// 调用仍逐字段手写（[`super::schema`]）。宏只负责把「同一份 provider 事实」
+/// 派生到类型与常量上。
+macro_rules! ai_providers {
+    ($( $variant:ident => {
+        id: $id:literal,
+        label: $label:literal,
+        endpoint: $endpoint:expr,
+        model: $model:expr,
+        authentication: $auth:expr,
+        extra_body: $policy:expr $(,)?
+    } ),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub(crate) enum AiProvider {
+            $( $variant, )+
+        }
+
+        impl AiProvider {
+            /// 全部服务商，顺序即面板下拉顺序。
+            pub(crate) const ALL: [Self; AI_PROVIDERS.len()] = [ $( Self::$variant, )+ ];
+
+            pub(crate) const fn as_str(self) -> &'static str {
+                match self {
+                    $( Self::$variant => $id, )+
+                }
+            }
+
+            pub(crate) const fn default_endpoint(self) -> Option<&'static str> {
+                match self {
+                    $( Self::$variant => $endpoint, )+
+                }
+            }
+
+            pub(crate) const fn default_model(self) -> Option<&'static str> {
+                match self {
+                    $( Self::$variant => $model, )+
+                }
+            }
+
+            pub(crate) const fn authentication(self) -> Authentication {
+                match self {
+                    $( Self::$variant => $auth, )+
+                }
+            }
+
+            pub(crate) const fn extra_body_policy(self) -> ExtraBodyPolicy {
+                match self {
+                    $( Self::$variant => $policy, )+
+                }
+            }
+        }
+
+        pub(crate) const AI_PROVIDERS: &[AiProviderSpec] = &[
+            $(
+                AiProviderSpec {
+                    variant: AiProvider::$variant,
+                    id: $id,
+                    label: $label,
+                    default_endpoint: $endpoint,
+                    default_model: $model,
+                    authentication: $auth,
+                    extra_body_policy: $policy,
+                },
+            )+
+        ];
+    };
+}
+
+ai_providers! {
+    Mimo => {
+        id: "mimo",
+        label: "小米 MiMo",
+        endpoint: Some("https://api.xiaomimimo.com/v1/chat/completions"),
+        model: Some("mimo-v2.5"),
+        authentication: Authentication::ApiKey,
+        extra_body: ExtraBodyPolicy::Unrestricted,
+    },
+    OpenAi => {
+        id: "openai",
+        label: "OpenAI",
+        endpoint: Some("https://api.openai.com/v1/chat/completions"),
+        model: Some("gpt-5.6-mini"),
+        authentication: Authentication::Bearer,
+        extra_body: ExtraBodyPolicy::OpenAi,
+    },
+    DeepSeek => {
+        id: "deepseek",
+        label: "DeepSeek",
+        endpoint: Some("https://api.deepseek.com/chat/completions"),
+        model: Some("deepseek-v4-flash"),
+        authentication: Authentication::Bearer,
+        extra_body: ExtraBodyPolicy::DeepSeek,
+    },
+    Custom => {
+        id: "custom",
+        label: "自定义网关",
+        endpoint: None,
+        model: None,
+        authentication: Authentication::Bearer,
+        extra_body: ExtraBodyPolicy::Unrestricted,
+    },
+}
+
+/// `AI_PROVIDERS` 与 `ALL` 必须同长：表是派生源，手写数组不是。
+const _: () = assert!(AI_PROVIDERS.len() == AiProvider::ALL.len());
 
 /// 思考强度。OpenAI 兼容网关把它放在 `reasoning.effort`（Responses）
 /// 或 `reasoning_effort`（Chat Completions）里。
@@ -59,40 +196,99 @@ pub(crate) enum AiProvider {
 /// - 面板能直接给出下拉选项，不必知道 JSON 结构；
 /// - 两个线上协议的字段名差异由这里收敛；
 /// - 取值有校验，写错不会静默失效。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReasoningEffort {
-    /// 不显式发送，由服务端默认决定。
-    #[default]
-    Unset,
-    Minimal,
-    Low,
-    Medium,
-    High,
+///
+/// 变体、线上值、serde 表示与面板下拉标签同出 `reasoning_efforts!` 一张表：
+/// 面板此前在 3 处手抄同一份选项（点歌 / 审核 / AI 聊天 / 海龟汤），
+/// 现在只遍历 [`ReasoningEffort::panel_options`]。
+macro_rules! reasoning_efforts {
+    ($( $(#[$meta:meta])* $variant:ident => {
+        wire: $wire:expr,
+        panel: $panel:literal,
+        label: $label:literal $(,)?
+    } ),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum ReasoningEffort {
+            $(
+                $(#[$meta])*
+                $variant,
+            )+
+        }
+
+        pub(crate) const REASONING_EFFORTS: &[ReasoningEffortSpec] = &[
+            $(
+                ReasoningEffortSpec {
+                    variant: ReasoningEffort::$variant,
+                    wire: $wire,
+                    panel: $panel,
+                    label: $label,
+                },
+            )+
+        ];
+
+        impl ReasoningEffort {
+            /// 调用请求体里的字段值；Unset 返回 None（不发送该字段）。
+            pub(crate) const fn as_wire_value(self) -> Option<&'static str> {
+                match self {
+                    $( Self::$variant => $wire, )+
+                }
+            }
+
+            /// 从线上值反查；无法识别时视为不发送。
+            fn from_wire_value(value: &str) -> Self {
+                REASONING_EFFORTS
+                    .iter()
+                    .find(|spec| spec.wire == Some(value))
+                    .map_or(Self::Unset, |spec| spec.variant)
+            }
+
+            /// 面板下拉的（配置值, 显示名），顺序即表格顺序。
+            pub(crate) fn panel_options() -> Vec<(String, String)> {
+                REASONING_EFFORTS
+                    .iter()
+                    .map(|spec| (spec.panel.to_string(), spec.label.to_string()))
+                    .collect()
+            }
+        }
+    };
 }
 
-impl ReasoningEffort {
-    /// 调用请求体里的字段值；Unset 返回 None（不发送该字段）。
-    pub(crate) fn as_wire_value(self) -> Option<&'static str> {
-        match self {
-            Self::Unset => None,
-            Self::Minimal => Some("minimal"),
-            Self::Low => Some("low"),
-            Self::Medium => Some("medium"),
-            Self::High => Some("high"),
-        }
-    }
+/// 一条思考强度登记。`wire` 是请求体里的值（`Unset` 为 `None` = 不发送），
+/// `panel` 是面板下拉的配置值，`label` 是显示名。
+pub(crate) struct ReasoningEffortSpec {
+    pub variant: ReasoningEffort,
+    pub wire: Option<&'static str>,
+    pub panel: &'static str,
+    pub label: &'static str,
+}
 
-    /// 从线上值反查；无法识别时视为不发送。
-    fn from_wire_value(value: &str) -> Self {
-        match value {
-            "minimal" => Self::Minimal,
-            "low" => Self::Low,
-            "medium" => Self::Medium,
-            "high" => Self::High,
-            _ => Self::Unset,
-        }
-    }
+reasoning_efforts! {
+    #[default]
+    Unset => {
+        wire: None,
+        panel: "unset",
+        label: "不指定（服务端默认）",
+    },
+    Minimal => {
+        wire: Some("minimal"),
+        panel: "minimal",
+        label: "最低",
+    },
+    Low => {
+        wire: Some("low"),
+        panel: "low",
+        label: "低",
+    },
+    Medium => {
+        wire: Some("medium"),
+        panel: "medium",
+        label: "中",
+    },
+    High => {
+        wire: Some("high"),
+        panel: "high",
+        label: "高",
+    },
 }
 
 /// 一条思考强度适配规则。
@@ -274,11 +470,14 @@ impl fmt::Debug for AiConfig {
 impl Default for AiConfig {
     fn default() -> Self {
         Self {
-            provider: "openai".to_string(),
+            provider: AiProvider::OpenAi.as_str().to_string(),
             api_key: String::new(),
             endpoint: String::new(),
             responses_endpoint: String::new(),
-            model: OPENAI_MODEL.to_string(),
+            model: AiProvider::OpenAi
+                .default_model()
+                .expect("OpenAI 是官方网关，必有默认模型")
+                .to_string(),
             http_proxy: String::new(),
             wire_api: WireApi::default(),
             extra_body: HashMap::new(),
@@ -389,24 +588,27 @@ impl AiConfig {
 }
 
 pub(crate) fn authentication(provider: AiProvider) -> Authentication {
-    if provider == AiProvider::Mimo {
-        Authentication::ApiKey
-    } else {
-        Authentication::Bearer
-    }
+    provider.authentication()
+}
+
+/// `ai.provider` 的合法值清单（顺序即表面顺序），错误文案与面板提示共用。
+///
+/// 由 [`AI_PROVIDERS`] 派生：新增服务商只改表，文案与校验同时跟上。
+pub(crate) fn provider_id_list() -> String {
+    AI_PROVIDERS
+        .iter()
+        .map(|spec| spec.id)
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 pub(crate) fn parse_provider(value: &str) -> Result<AiProvider> {
-    match normalize_optional_text(value, "provider")?
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "mimo" => Ok(AiProvider::Mimo),
-        "openai" => Ok(AiProvider::OpenAi),
-        "deepseek" => Ok(AiProvider::DeepSeek),
-        "custom" => Ok(AiProvider::Custom),
-        _ => bail!("ai.provider 只允许 mimo/openai/deepseek/custom"),
-    }
+    let value = normalize_optional_text(value, "provider")?.to_ascii_lowercase();
+    AI_PROVIDERS
+        .iter()
+        .find(|spec| spec.id == value)
+        .map(|spec| spec.variant)
+        .ok_or_else(|| anyhow::anyhow!("ai.provider 只允许 {}", provider_id_list()))
 }
 
 /// 功能未单独指定模型时沿用 `ai.model`。
@@ -422,13 +624,10 @@ pub(crate) fn effective_model<'a>(config: &'a AiConfig, feature_model: &'a str) 
 pub(crate) fn resolve_endpoint(provider: AiProvider, value: &str) -> Result<String> {
     let text = normalize_optional_text(value, "endpoint")?;
     let endpoint = if text.is_empty() {
-        match provider {
-            AiProvider::Mimo => MIMO_ENDPOINT,
-            AiProvider::OpenAi => OPENAI_ENDPOINT,
-            AiProvider::DeepSeek => DEEPSEEK_ENDPOINT,
-            AiProvider::Custom => bail!("custom provider 缺少 ai.endpoint"),
+        match provider.default_endpoint() {
+            Some(default) => default.to_string(),
+            None => bail!("{} provider 缺少 ai.endpoint", provider.as_str()),
         }
-        .to_string()
     } else {
         text
     };
@@ -468,13 +667,10 @@ pub(crate) fn resolve_model(provider: AiProvider, value: &str) -> Result<String>
     if !text.is_empty() {
         return Ok(text);
     }
-    Ok(match provider {
-        AiProvider::Mimo => MIMO_MODEL,
-        AiProvider::OpenAi => OPENAI_MODEL,
-        AiProvider::DeepSeek => DEEPSEEK_MODEL,
-        AiProvider::Custom => bail!("custom provider 缺少 ai.model"),
+    match provider.default_model() {
+        Some(default) => Ok(default.to_string()),
+        None => bail!("{} provider 缺少 ai.model", provider.as_str()),
     }
-    .to_string())
 }
 
 pub(crate) fn validate_extra_body(
@@ -493,8 +689,8 @@ pub(crate) fn validate_extra_body(
         }
         Ok(())
     };
-    match provider {
-        AiProvider::OpenAi => {
+    match provider.extra_body_policy() {
+        ExtraBodyPolicy::OpenAi => {
             optional_string("safety_identifier", 64)?;
             if let Some(metadata) = extra_body.get("metadata").filter(|value| !value.is_null()) {
                 let object = metadata
@@ -516,7 +712,7 @@ pub(crate) fn validate_extra_body(
                 }
             }
         }
-        AiProvider::DeepSeek => {
+        ExtraBodyPolicy::DeepSeek => {
             optional_string("user_id", 512)?;
             if let Some(user_id) = extra_body.get("user_id").and_then(Value::as_str)
                 && !user_id
@@ -526,7 +722,7 @@ pub(crate) fn validate_extra_body(
                 bail!("ai.extra_body.user_id 只允许 a-zA-Z0-9-_");
             }
         }
-        AiProvider::Mimo | AiProvider::Custom => {}
+        ExtraBodyPolicy::Unrestricted => {}
     }
     Ok(())
 }
@@ -2807,12 +3003,13 @@ mod tests {
 
     #[test]
     fn official_providers_resolve_their_default_endpoints_and_models() {
-        for (provider, endpoint, model) in [
-            ("mimo", MIMO_ENDPOINT, MIMO_MODEL),
-            ("openai", OPENAI_ENDPOINT, OPENAI_MODEL),
-            ("deepseek", DEEPSEEK_ENDPOINT, DEEPSEEK_MODEL),
-        ] {
-            let mut connection = config(provider);
+        for spec in AI_PROVIDERS {
+            let (Some(endpoint), Some(model)) = (spec.default_endpoint, spec.default_model) else {
+                // custom 的默认值就是「必须由用户填写」，由
+                // `custom_provider_requires_endpoint_and_model` 覆盖。
+                continue;
+            };
+            let mut connection = config(spec.id);
             connection.endpoint = String::new();
             connection.model = String::new();
 
@@ -2821,10 +3018,141 @@ mod tests {
             assert_eq!(
                 target.endpoint.replace("/chat/completions", "/responses"),
                 endpoint.replace("/chat/completions", "/responses"),
-                "provider={provider}"
+                "provider={}",
+                spec.id
             );
-            assert_eq!(target.model, model, "provider={provider}");
+            assert_eq!(target.model, model, "provider={}", spec.id);
         }
+    }
+
+    /// 错误白名单：未知 `ai.provider` 的文案稳定，可被前端/日志匹配。
+    ///
+    /// 文案里的合法值清单由 `AI_PROVIDERS` 派生，所以既钉住**句式**也钉住
+    /// **内容**：新增服务商必须同步改这句（而不是悄悄漂移）。
+    #[test]
+    fn unknown_provider_is_rejected_with_a_stable_message() {
+        for value in ["", "bogus", "azure", "openai-compatible"] {
+            let error = parse_provider(value).expect_err("未知服务商必须被拒绝");
+            assert_eq!(
+                error.to_string(),
+                "ai.provider 只允许 mimo/openai/deepseek/custom",
+                "value={value:?}"
+            );
+        }
+        // 非空但未知的值不能回显进文案（配置可能含敏感串）。
+        assert_eq!(
+            parse_provider("bogus").unwrap_err().to_string(),
+            "ai.provider 只允许 mimo/openai/deepseek/custom"
+        );
+    }
+
+    /// 表驱动的面板下拉与表本身逐项一致：`config_sections()` 的 AI 段
+    /// 「服务商」下拉 = `AI_PROVIDERS` 的 (id, label)，顺序也一致。
+    ///
+    /// 变异靶子：从 `AI_PROVIDERS` 删掉一个 provider 而面板处手写第二份
+    /// 不变 → 这里红；反之手写处多一个 → 也红。
+    #[test]
+    fn ai_providers_match_panel_options() {
+        use crate::config::schema::{FieldKind, config_sections};
+
+        let sections = config_sections();
+        let ai = sections
+            .iter()
+            .find(|section| section.name == "ai")
+            .expect("ai 段必须存在");
+        let provider = ai
+            .fields
+            .iter()
+            .find(|field| field.path == "ai.provider")
+            .expect("ai.provider 字段必须存在");
+        let FieldKind::Enum(options) = &provider.kind else {
+            panic!("ai.provider 必须是 Enum，实际 {:?}", provider.kind);
+        };
+        let expected: Vec<(String, String)> = AI_PROVIDERS
+            .iter()
+            .map(|spec| (spec.id.to_string(), spec.label.to_string()))
+            .collect();
+        assert_eq!(options, &expected, "面板下拉必须与 AI_PROVIDERS 逐项一致");
+
+        // 「思考强度」下拉同理：AI 段里 3 处（点歌/审核/AI 聊天）由
+        // `REASONING_EFFORTS` 派生，本切片的 3 个段必须全部命中。
+        //
+        // 海龟汤（`schema/games.rs`）是本切片文件域之外的第四份手抄，
+        // 值与表逐字相同，所以下面按「每个 .reasoning 都必须等于表」全量断言，
+        // 它也被顺手钉住；迁表留给接手 `games.rs` 的切片。
+        let reasoning: Vec<(String, String)> = ReasoningEffort::panel_options();
+        let mut derived: Vec<&str> = Vec::new();
+        for section in &sections {
+            for field in &section.fields {
+                if !field.path.ends_with(".reasoning") {
+                    continue;
+                }
+                let FieldKind::Enum(options) = &field.kind else {
+                    continue;
+                };
+                assert_eq!(
+                    options, &reasoning,
+                    "{} 的思考强度下拉必须与 REASONING_EFFORTS 一致",
+                    field.path
+                );
+                derived.push(field.path.as_str());
+            }
+        }
+        for path in [
+            "song_ai.reasoning",
+            "song_review.reasoning",
+            "ai_chat.reasoning",
+        ] {
+            assert!(
+                derived.contains(&path),
+                "{} 的思考强度下拉不见了（或其 kind 不再是 Enum）：{:?}",
+                path,
+                derived
+            );
+        }
+    }
+
+    /// 唯一事实源守卫：源码里除了 `AI_PROVIDERS` 的登记块与测试断言，
+    /// 不允许再出现第二份 provider 清单。
+    ///
+    /// 用 `include_str!` 读本文件源码而不是靠人工 review：手写第二份
+    /// `("mimo", "小米 MiMo")` 之类的二元组就会命中。
+    #[test]
+    fn ai_provider_table_is_the_only_source() {
+        let source = include_str!("ai.rs");
+        // 只看生产代码：测试块里的字面量是断言，不是第二份事实源。
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("测试模块必须以 `#[cfg(test)]\nmod tests` 开头");
+        for spec in AI_PROVIDERS {
+            // 每个 id 在生产代码里恰好登记一次（表里那一行）。
+            let needle = format!("id: \"{}\"", spec.id);
+            assert_eq!(
+                production.matches(needle.as_str()).count(),
+                1,
+                "{} 在生产代码里出现了多次 `id: \"…\"` 登记",
+                spec.id
+            );
+            // 标签同理：任何 "id 与 label 成对再写一遍" 的地方都会让计数 > 1。
+            let label_needle = format!("label: \"{}\"", spec.label);
+            assert_eq!(
+                production.matches(label_needle.as_str()).count(),
+                1,
+                "{} 的显示名在生产代码里登记了多次",
+                spec.label
+            );
+        }
+        // 反向：面板下拉里不得再手抄值→标签二元组。
+        let schema_source = include_str!("schema/ai.rs");
+        assert!(
+            !schema_source.contains("\"小米 MiMo\""),
+            "schema/ai.rs 里仍有手抄的服务商显示名"
+        );
+        assert!(
+            !schema_source.contains("\"不指定（服务端默认）\""),
+            "schema/ai.rs 里仍有手抄的思考强度显示名"
+        );
     }
 
     #[test]

@@ -1,127 +1,216 @@
 <template>
-  <div id="page-tools">
-    <h1 class="page-title">高级控制</h1>
-    <p class="page-subtitle">OCR、模板匹配、手动输入与只读观测；写操作会真实操作游戏</p>
+  <div id="page-tools" class="tools-page">
+    <header class="tools-head">
+      <h1 class="page-title">高级控制</h1>
+      <p class="page-subtitle">OCR、模板匹配、手动输入与只读观测；写操作会真实操作游戏</p>
+    </header>
 
-    <div class="tools-layout">
-    <div class="tools-grid">
-      <section class="panel">
-        <div class="panel-head"><h2>画面与识别</h2></div>
-        <div class="panel-body tools-body">
-          <div class="tools-two">
-            <button class="btn primary" :disabled="tracking" @click="runTool('/tools/ocr')">全屏 OCR</button>
-            <button class="btn" :disabled="tracking" @click="runTool('/tools/scan-chat')">扫描聊天</button>
-          </div>
-          <div class="tools-grid-row">
-            <input v-model="ocrRect" placeholder="OCR 区域 x,y,width,height" />
-            <button class="btn" :disabled="tracking" @click="runTool('/tools/ocr', { rect: ocrRect })">区域 OCR</button>
-          </div>
-          <div class="tools-two">
-            <button class="btn" :disabled="tracking" @click="runTool('/tools/ui-state')">检测 UI</button>
-            <button class="btn" :disabled="tracking" @click="runTool('/tools/hall-name')">大厅名称</button>
-          </div>
-          <button class="btn stretch" :disabled="screenshotBusy" @click="openScreenshot">
-            {{ screenshotBusy ? '截图中…' : '获取截图' }}
-          </button>
-        </div>
-      </section>
-
-      <section class="panel">
-        <div class="panel-head"><h2>模板匹配</h2></div>
-        <div class="panel-body tools-body">
-          <select v-model="templateName">
-            <option value="">（选择模板）</option>
-            <option v-for="item in templates" :key="item.name || item[0]" :value="item.name || item[0]">{{ item.label || item[1] || item.name || item[0] }}</option>
-          </select>
-          <div class="tools-grid-row">
-            <input v-model="templateRect" placeholder="匹配区域 x,y,width,height，留空全屏" />
-            <button class="btn small ghost" type="button" @click="useConfiguredTemplateRegion">读取配置区域</button>
-          </div>
-          <input v-model="threshold" placeholder="阈值，留空使用配置" inputmode="decimal" />
-          <div class="tools-two">
-            <button class="btn" :disabled="tracking" @click="matchTemplate(false)">匹配</button>
-            <button class="btn warn" :disabled="tracking" @click="matchTemplate(true)">匹配并点击</button>
-          </div>
-        </div>
-      </section>
-
-      <section class="panel">
-        <div class="panel-head"><h2>手动输入</h2><small>会向游戏发送真实输入</small></div>
-        <div class="panel-body tools-body">
-          <div class="tools-xyz">
-            <input v-model="clickX" placeholder="x" inputmode="numeric" aria-label="x 坐标" />
-            <input v-model="clickY" placeholder="y" inputmode="numeric" aria-label="y 坐标" />
-            <button class="btn warn" :disabled="tracking" @click="clickPoint">点击</button>
-          </div>
-          <div class="tools-grid-row">
-            <input v-model="keyName" placeholder="按键，如 Escape / Return / F2" />
-            <button class="btn warn" :disabled="tracking" @click="sendKey">发送按键</button>
-          </div>
-        </div>
-      </section>
-
-      <section class="panel">
-        <div class="panel-head"><h2>诊断</h2></div>
-        <div class="panel-body tools-body">
-          <button class="btn stretch" :disabled="tracking" @click="runTool('/tools/ocr-backends')">OCR 后端探测</button>
-          <div class="tools-grid-row">
-            <input v-model.number="captureRounds" inputmode="numeric" placeholder="截图 API 轮数" aria-label="截图 API 轮数" />
-            <button class="btn" :disabled="tracking" @click="runTool('/tools/capture-benchmark', { rounds: captureRounds })">截图性能</button>
-          </div>
-          <div class="tools-grid-row">
-            <input v-model.number="changeSamples" inputmode="numeric" placeholder="变化采样次数" aria-label="变化采样次数" />
-            <button class="btn" :disabled="tracking" @click="runTool('/tools/chat-change-samples', { samples: changeSamples })">聊天变化</button>
-          </div>
-          <div class="tools-grid-row">
-            <input v-model.number="benchmarkRounds" inputmode="numeric" placeholder="面板基准轮数" aria-label="面板基准轮数" />
-            <button class="btn" :disabled="tracking" @click="runTool('/tools/panel-benchmark', { rounds: benchmarkRounds })">面板基准</button>
-          </div>
-          <div class="tools-ai-row">
-            <input v-model="aiKeyword" placeholder="AI 候选诊断关键词" />
-            <label class="tools-check"><input v-model="aiAccompaniment" type="checkbox" />优先伴奏</label>
-            <button class="btn" :disabled="tracking" @click="aiPreview">AI 诊断</button>
-          </div>
-        </div>
-      </section>
+    <!-- 工具条：高频操作一排排开，统高等宽；危险操作全部下沉到折叠区末尾 -->
+    <div class="tools-bar">
+      <div class="tools-bar-actions">
+        <button class="btn primary tools-bar-btn" :disabled="tracking" @click="runTool('/tools/ocr')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2"/><circle cx="12" cy="12" r="3.5"/></svg>
+          <span>全屏 OCR</span>
+        </button>
+        <button class="btn tools-bar-btn" :disabled="tracking" @click="runTool('/tools/scan-chat')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2z"/></svg>
+          <span>扫描聊天</span>
+        </button>
+        <button class="btn tools-bar-btn" :disabled="tracking" @click="runTool('/tools/ui-state')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="15" rx="2"/><path d="M3 9h18M9 9v10"/></svg>
+          <span>检测 UI</span>
+        </button>
+        <button class="btn tools-bar-btn" :disabled="tracking" @click="runTool('/tools/hall-name')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="3" width="14" height="18" rx="3"/><path d="M9 8h6M9 12h6M9 16h3"/></svg>
+          <span>大厅名称</span>
+        </button>
+        <button class="btn tools-bar-btn" :disabled="screenshotBusy" @click="openScreenshot">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+          <span>{{ screenshotBusy ? '截图中…' : '获取截图' }}</span>
+        </button>
+      </div>
+      <div class="tools-bar-meta">
+        <i class="tools-bar-dot" :class="{ busy: tracking }"></i>
+        <span class="tools-bar-state">{{ tracking ? `跟踪 #${activeTask}` : '待命' }}</span>
+        <span class="tools-bar-last">{{ lastRunText }}</span>
+      </div>
     </div>
 
-    <aside class="tools-side">
-      <section class="panel">
-        <div class="panel-head">
-          <h2>任务结果</h2>
-          <span class="tools-row">
-            <small>{{ activeTask ? `#${activeTask}` : '未开始' }}</small>
-            <button v-if="tracking" class="btn small" @click="stopTracking">停止跟踪</button>
-          </span>
-        </div>
-        <div class="panel-body"><pre class="tools-output">{{ resultText }}</pre></div>
-      </section>
-      <section class="panel">
-        <div class="panel-head">
-          <h2>最近任务</h2>
-          <button class="btn small" @click="loadRecentTasks">刷新</button>
-        </div>
-        <div class="panel-body">
-          <div v-if="!recentTasks.length" class="config-field-hint">暂无任务</div>
-          <button
-            v-for="task in recentTasks"
-            :key="task.id"
-            type="button"
-            class="tools-task"
-            :class="{ active: task.id === activeTask }"
-            @click="inspectTask(task.id)"
-          >
-            <span class="tools-task-state" :class="task.status">{{ statusLabel(task.status) }}</span>
-            <span>#{{ task.id }} {{ task.label }}</span>
-          </button>
-        </div>
-      </section>
-    </aside>
+    <div class="tools-deck">
+      <div class="tools-deck-main">
+        <!-- 区域 OCR：中等频率，默认收起；摘要行保留一键执行 -->
+        <details class="tools-fold" open>
+          <summary class="tools-fold-sum">
+            <svg class="tools-fold-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+            <span class="tools-fold-title">区域 OCR</span>
+            <span class="tools-fold-meta">{{ ocrRect ? `区域 ${ocrRect}` : '未填区域 · 默认整屏' }}</span>
+            <span class="tools-fold-trail">
+              <button class="btn small tools-fold-btn" type="button" :disabled="tracking" @click.stop.prevent="runTool('/tools/ocr', { rect: ocrRect })">区域 OCR</button>
+            </span>
+          </summary>
+          <div class="tools-fold-body">
+            <div class="tools-field">
+              <label class="tools-field-label" for="tools-ocr-rect">识别区域</label>
+              <div class="tools-grid-row">
+                <input id="tools-ocr-rect" v-model="ocrRect" placeholder="x,y,width,height（留空 = 整屏）" />
+                <button class="btn" :disabled="tracking" @click="runTool('/tools/ocr', { rect: ocrRect })">运行</button>
+              </div>
+            </div>
+          </div>
+        </details>
+
+        <!-- 手动输入：高频，默认展开 -->
+        <details class="tools-fold" open>
+          <summary class="tools-fold-sum">
+            <svg class="tools-fold-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+            <span class="tools-fold-title">手动输入</span>
+            <span class="tools-fold-meta">{{ keyName ? `按键 ${keyName}` : (clickX || clickY) ? `坐标 ${clickX || '?'} , ${clickY || '?'}` : '坐标与按键 · 会向游戏发送真实输入' }}</span>
+            <span class="tools-fold-trail">
+              <small class="tools-fold-note">会发送真实输入</small>
+            </span>
+          </summary>
+          <div class="tools-fold-body">
+            <div class="tools-field">
+              <label class="tools-field-label" for="tools-click-x">点击坐标</label>
+              <div class="tools-xyz">
+                <input id="tools-click-x" v-model="clickX" placeholder="x" inputmode="numeric" />
+                <input v-model="clickY" placeholder="y" inputmode="numeric" aria-label="y 坐标" />
+                <button class="btn warn" :disabled="tracking" @click="clickPoint">点击</button>
+              </div>
+            </div>
+            <div class="tools-field">
+              <label class="tools-field-label" for="tools-key-name">按键名</label>
+              <div class="tools-grid-row">
+                <input id="tools-key-name" v-model="keyName" placeholder="Escape / Return / F2" />
+                <button class="btn warn" :disabled="tracking" @click="sendKey">发送按键</button>
+              </div>
+            </div>
+          </div>
+        </details>
+
+        <!-- 模板匹配：低频，默认收起；摘要行保留「匹配」 -->
+        <details class="tools-fold">
+          <summary class="tools-fold-sum">
+            <svg class="tools-fold-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+            <span class="tools-fold-title">模板匹配</span>
+            <span class="tools-fold-meta">{{ templateName || '未选择模板' }}</span>
+            <span class="tools-fold-trail">
+              <button class="btn small tools-fold-btn" type="button" :disabled="tracking" @click.stop.prevent="matchTemplate(false)">匹配</button>
+            </span>
+          </summary>
+          <div class="tools-fold-body">
+            <div class="tools-field">
+              <label class="tools-field-label" for="tools-template-name">模板</label>
+              <select id="tools-template-name" v-model="templateName">
+                <option value="">（选择模板）</option>
+                <option v-for="item in templates" :key="item.name || item[0]" :value="item.name || item[0]">{{ item.label || item[1] || item.name || item[0] }}</option>
+              </select>
+            </div>
+            <div class="tools-field">
+              <label class="tools-field-label" for="tools-template-rect">匹配区域</label>
+              <div class="tools-grid-row">
+                <input id="tools-template-rect" v-model="templateRect" placeholder="x,y,width,height（留空 = 全屏）" />
+                <button class="btn small ghost" type="button" @click="useConfiguredTemplateRegion">读取配置区域</button>
+              </div>
+            </div>
+            <div class="tools-field">
+              <label class="tools-field-label" for="tools-threshold">阈值</label>
+              <input id="tools-threshold" v-model="threshold" placeholder="留空使用配置" inputmode="decimal" />
+            </div>
+            <div class="tools-fold-foot">
+              <button class="btn" :disabled="tracking" @click="matchTemplate(false)">匹配</button>
+              <button class="btn warn" :disabled="tracking" @click="matchTemplate(true)">匹配并点击</button>
+            </div>
+          </div>
+        </details>
+
+        <!-- 诊断：低频，默认收起 -->
+        <details class="tools-fold">
+          <summary class="tools-fold-sum">
+            <svg class="tools-fold-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+            <span class="tools-fold-title">诊断</span>
+            <span class="tools-fold-meta">OCR 后端 · 截图性能 · 聊天变化 · 面板基准 · AI 诊断</span>
+          </summary>
+          <div class="tools-fold-body">
+            <button class="btn stretch" :disabled="tracking" @click="runTool('/tools/ocr-backends')">OCR 后端探测</button>
+            <div class="tools-field">
+              <label class="tools-field-label" for="tools-capture-rounds">截图 API 轮数</label>
+              <div class="tools-grid-row">
+                <input id="tools-capture-rounds" v-model.number="captureRounds" inputmode="numeric" placeholder="例如 3" />
+                <button class="btn" :disabled="tracking" @click="runTool('/tools/capture-benchmark', { rounds: captureRounds })">截图性能</button>
+              </div>
+            </div>
+            <div class="tools-field">
+              <label class="tools-field-label" for="tools-change-samples">变化采样次数</label>
+              <div class="tools-grid-row">
+                <input id="tools-change-samples" v-model.number="changeSamples" inputmode="numeric" placeholder="例如 10" />
+                <button class="btn" :disabled="tracking" @click="runTool('/tools/chat-change-samples', { samples: changeSamples })">聊天变化</button>
+              </div>
+            </div>
+            <div class="tools-field">
+              <label class="tools-field-label" for="tools-benchmark-rounds">面板基准轮数</label>
+              <div class="tools-grid-row">
+                <input id="tools-benchmark-rounds" v-model.number="benchmarkRounds" inputmode="numeric" placeholder="例如 3" />
+                <button class="btn" :disabled="tracking" @click="runTool('/tools/panel-benchmark', { rounds: benchmarkRounds })">面板基准</button>
+              </div>
+            </div>
+            <div class="tools-field">
+              <label class="tools-field-label" for="tools-ai-keyword">AI 候选诊断关键词</label>
+              <div class="tools-ai-row">
+                <input id="tools-ai-keyword" v-model="aiKeyword" placeholder="关键词" />
+                <label class="tools-check"><input v-model="aiAccompaniment" type="checkbox" />优先伴奏</label>
+                <button class="btn" :disabled="tracking" @click="aiPreview">AI 诊断</button>
+              </div>
+            </div>
+          </div>
+        </details>
+      </div>
+
+      <aside class="tools-rail">
+        <section class="panel">
+          <div class="panel-head">
+            <h2>任务结果</h2>
+            <span class="tools-row">
+              <small>{{ activeTask ? `#${activeTask}` : '未开始' }}</small>
+              <button v-if="tracking" class="btn small" @click="stopTracking">停止跟踪</button>
+            </span>
+          </div>
+          <div class="panel-body"><pre class="tools-output">{{ resultText }}</pre></div>
+        </section>
+        <section class="panel">
+          <div class="panel-head">
+            <h2>最近任务</h2>
+            <button class="btn small" @click="loadRecentTasks">刷新</button>
+          </div>
+          <div class="panel-body">
+            <div v-if="!recentTasks.length" class="config-field-hint">暂无任务</div>
+            <button
+              v-for="task in recentTasks"
+              :key="task.id"
+              type="button"
+              class="tools-task"
+              :class="{ active: task.id === activeTask }"
+              @click="inspectTask(task.id)"
+            >
+              <span class="tools-task-state" :class="task.status">{{ statusLabel(task.status) }}</span>
+              <span>#{{ task.id }} {{ task.label }}</span>
+            </button>
+          </div>
+        </section>
+      </aside>
     </div>
 
-    <section class="panel tools-wide">
-      <div class="panel-head"><h2>游戏状态只读观测</h2><small>不点击、不输入、不派发命令</small></div>
-      <div class="panel-body tools-body">
+    <!-- 只读观测：最不常用，默认收起 -->
+    <details class="tools-fold tools-fold-wide">
+      <summary class="tools-fold-sum">
+        <svg class="tools-fold-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+        <span class="tools-fold-title">游戏状态只读观测</span>
+        <span class="tools-fold-meta">{{ readOnly.enabled ? `已启用 · ${readOnly.state === 'push' ? '推送' : '主动读取'}` : '未启用' }} · 不点击、不输入、不派发命令</span>
+        <span class="tools-fold-trail">
+          <button class="btn small tools-fold-btn" type="button" @click.stop.prevent="loadReadOnlyMode">刷新状态</button>
+        </span>
+      </summary>
+      <div class="tools-fold-body">
         <div class="tools-row">
           <label class="tools-check"><input v-model="readOnly.enabled" type="checkbox" @change="setReadOnlyMode" />启用只读观测</label>
           <select v-model="readOnly.state" style="max-width:180px" @change="setReadOnlyMode">
@@ -131,15 +220,21 @@
           <button class="btn" @click="loadReadOnlyMode">刷新状态</button>
         </div>
         <p class="config-field-hint">程序继续正常监听、点歌和播放；主动读取只在点击时观察一次；推送只记录正常运行中触发的命令或流程。</p>
-        <div class="tools-row">
-          <input v-model="readOnlyLabel" maxlength="120" placeholder="证据标签（可选）" />
-          <button class="btn primary" :disabled="readOnlyBusy || !readOnly.enabled || readOnly.state !== 'active'" @click="readOnce">读取一次</button>
+        <div class="tools-field">
+          <label class="tools-field-label" for="tools-evidence-label">证据标签（可选）</label>
+          <div class="tools-row">
+            <input id="tools-evidence-label" v-model="readOnlyLabel" maxlength="120" placeholder="留空则不带标签" />
+            <button class="btn primary" :disabled="readOnlyBusy || !readOnly.enabled || readOnly.state !== 'active'" @click="readOnce">读取一次</button>
+          </div>
         </div>
         <p v-if="readOnlyStatus" class="config-field-hint">{{ readOnlyStatus }}</p>
-        <div class="tools-row">
-          <input v-model.number="evidenceLimit" inputmode="numeric" placeholder="条数" aria-label="证据条数" style="max-width:120px" />
-          <button class="btn small" @click="loadEvidenceEntries">读取证据列表</button>
-          <button class="btn small ghost" @click="clearEvidence">清空</button>
+        <div class="tools-field">
+          <label class="tools-field-label" for="tools-evidence-limit">证据条数</label>
+          <div class="tools-row">
+            <input id="tools-evidence-limit" v-model.number="evidenceLimit" inputmode="numeric" placeholder="20" style="max-width:120px" />
+            <button class="btn small" @click="loadEvidenceEntries">读取证据列表</button>
+            <button class="btn small ghost" @click="clearEvidence">清空</button>
+          </div>
         </div>
         <div class="tools-evidence">
           <article v-for="(item, index) in evidenceEntries" :key="index" class="tools-evidence-card">
@@ -147,7 +242,7 @@
           </article>
         </div>
       </div>
-    </section>
+    </details>
 
     <div v-if="screenshotUrl" class="tools-modal" @click.self="closeScreenshot">
       <div class="tools-modal-body">
@@ -187,6 +282,27 @@ const aiAccompaniment = ref(false)
 
 const screenshotBusy = ref(false)
 const screenshotUrl = ref('')
+// 工具条副标题：最近一次操作 + 耗时。纯展示，不影响任何执行路径。
+const lastRunText = ref('尚无执行记录')
+
+const TOOL_LABELS = {
+  '/tools/scan-chat': '扫描聊天',
+  '/tools/ui-state': '检测 UI',
+  '/tools/hall-name': '大厅名称',
+  '/tools/ocr-backends': 'OCR 后端探测',
+  '/tools/capture-benchmark': '截图性能',
+  '/tools/chat-change-samples': '聊天变化',
+  '/tools/panel-benchmark': '面板基准',
+  '/tools/ai-preview': 'AI 诊断',
+  '/tools/template': '模板匹配',
+  '/tools/click': '点击',
+  '/tools/key': '发送按键',
+}
+
+function toolLabel(path, values) {
+  if (path === '/tools/ocr') return values && values.rect ? '区域 OCR' : '全屏 OCR'
+  return TOOL_LABELS[path] || path
+}
 
 const readOnly = reactive({ enabled: false, state: 'active' })
 const readOnlyLoaded = ref(false)
@@ -220,6 +336,8 @@ async function runTool(path, values) {
   if (tracking.value) return
   tracking.value = true
   resultText.value = '任务已提交…'
+  const startedAt = Date.now()
+  const label = toolLabel(path, values)
   try {
     const task = await request(path + params(values), 'POST')
     const parsed = typeof task === 'string' ? JSON.parse(task) : task
@@ -231,6 +349,7 @@ async function runTool(path, values) {
     report(error, '提交失败')
   } finally {
     tracking.value = false
+    lastRunText.value = `上次 ${label} · ${((Date.now() - startedAt) / 1000).toFixed(1)}s`
     loadRecentTasks()
   }
 }
@@ -446,10 +565,8 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped>
-.tools-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr)); gap: 12px; padding: 0 24px 12px; }
-.tools-wide { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr)); gap: 12px; padding: 0 24px 12px; }
-.tools-body { display: flex; flex-direction: column; gap: 8px; }
-.tools-two { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+/* 本页特有的结构样式；通用皮肤（按钮/输入）在 components.css 的
+   「高级控制页 · 方案 C」段末尾，二者都不改既有全局规则。 */
 .tools-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .tools-row input:not([type="checkbox"]):not([type="radio"]) { flex: 1 1 140px; min-width: 100px; }
 .tools-row input[type="checkbox"] { flex: 0 0 auto; width: 36px; min-width: 36px; }

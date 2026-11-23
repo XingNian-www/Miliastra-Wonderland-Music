@@ -7,10 +7,12 @@
 #   make check      cargo check --lib --no-default-features（0 warning 硬门禁）
 #   make test       cargo test --lib --no-default-features（根 crate；CI 另跑 --workspace）
 #   make windows    Windows 目标编译检查（mingw 交叉，补 Linux 门禁盲区）
-#   make visual     面板视觉核验（假数据截图 + 布局审计）
 #   make layers     scripts/check-layers.py --check + --self-test
 #   make panel      面板 API 覆盖率（默认 report-only，PANEL_STRICT=1 才阻断）
 #   make web        web/dist 构建（build.rs 以 web/dist/index.html 为就绪判据）
+#   make panel-mock 面板假数据同步检查 + 单测（不需要游戏进程/令牌）
+#   make panel-visual 面板假数据视觉核验：截图 + 布局测量到 target/panel-visual/
+#                   （二级页签加 --click：bash scripts/panel-visual-check.sh --click 其他玩法）
 #   make privacy    隐私扫描（optional：未配置 MILIASTRA_PANEL_URL 时告警跳过）
 #   make verify     依次执行以上全部（privacy 失败不阻断，除非 PRIVACY_STRICT=1）
 #
@@ -32,7 +34,7 @@ WEB_DIR := web
 PANEL_STRICT ?= 0
 PRIVACY_STRICT ?= 0
 
-.PHONY: help fmt check test test-workspace layers panel web privacy verify
+.PHONY: help fmt check test test-workspace layers panel panel-mock panel-visual web privacy verify
 
 help:
 	@sed -n '2,32p' Makefile
@@ -45,11 +47,6 @@ fmt:
 # 用 mingw 交叉到 x86_64-pc-windows-gnu，不需要 MSVC 工具链；详见脚本头部的能力边界。
 windows:
 	bash scripts/check-windows.sh
-
-# 面板视觉核验：假数据起服 → chromium 截图 → 布局审计。
-# 前端改动必须过这一关（截图肉眼可看），不依赖真实后端。
-visual:
-	bash scripts/panel-visual-check.sh
 
 check:
 	# `--locked`：CI 的 Windows Release 构建用 `cargo build --locked`。改了
@@ -101,6 +98,17 @@ panel:
 web:
 	cd $(WEB_DIR) && npm run build
 	test -f $(WEB_DIR)/dist/index.html
+
+# 假数据是视觉核验的地基：fixtures 与 Rust schema 脱钩时截出来的页面字段是错的，
+# 而这种错只会在肉眼比对时发现。--check 在产物过期时退出 1，node 单测再钉一遍形状。
+panel-mock:
+	$(PYTHON) scripts/panel-mock-gen.py --check || $(PYTHON) scripts/panel-mock-gen.py
+	cd $(WEB_DIR) && npm test
+
+# 不用真后端就能截图：构建 --mode mock 产物，再交给既有的 panel-layout-audit.py。
+# 产物在 target/ 下（已被 .gitignore 的 **/target/ 覆盖），不入库。
+panel-visual:
+	bash scripts/panel-visual-check.sh --rebuild
 
 privacy:
 	@if [ -z "$${MILIASTRA_PANEL_URL:-}" ]; then \

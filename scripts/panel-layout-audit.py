@@ -135,6 +135,19 @@ INJECT = """
     try { pre.textContent = JSON.stringify(MEASURE_JS()); } catch (error) { pre.textContent = JSON.stringify({ error: String(error) }); }
     document.body.appendChild(pre);
   }, 4500);
+  // 二级页签（AI 配置的「记忆/请求记录」、娱乐玩法的「其他玩法」、任务页的
+  // 「接口记录」等）是 Vue 内部状态，`#route` 切不到。`--click` 给一段按钮文本，
+  // 在测量之前点一下，这样截图与测量看的才是那个页签。
+  // 点击放在测量前 1.2s：给页签内的异步取数留出渲染时间。
+  const clickText = '__CLICK__';
+  if (clickText) {
+    setTimeout(() => {
+      const candidates = [...document.querySelectorAll('button, a, [role="tab"]')];
+      const target = candidates.find((el) => (el.textContent || '').includes(clickText));
+      if (target) target.click();
+      else console.warn('[panel-layout-audit] 没找到要点的页签：' + clickText);
+    }, 1800);
+  }
 })();
 </script>
 """
@@ -196,6 +209,11 @@ def main():
     parser.add_argument("--routes", default="overview,playback,login,game,entertainment,commands,aiconfig,config,visual,tools,debug,tasks,identity,settings")
     parser.add_argument("--widths", default="1500,1024,400")
     parser.add_argument("--no-screenshot", action="store_true")
+    parser.add_argument(
+        "--click",
+        default="",
+        help="按按钮文本点击一次再测量（用于二级页签；页签是 Vue 内部状态，URL 切不到）",
+    )
     args = parser.parse_args()
 
     dist = Path(args.dist).resolve()
@@ -208,6 +226,8 @@ def main():
     index = (dist / "index.html").read_text(encoding="utf-8")
     injected = INJECT.replace("__BASE__", args.base).replace("__TOKEN__", args.token)
     injected = injected.replace("MEASURE_JS()", "(" + MEASURE + ")()")
+    # 单引号转义：页签文本会直接进 JS 字符串字面量。
+    injected = injected.replace("__CLICK__", args.click.replace("\\", "\\\\").replace("'", "\\'"))
     site = out / "site"
     if site.exists():
         shutil.rmtree(site)

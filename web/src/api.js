@@ -6,6 +6,11 @@
 //   2. 令牌一律由 headers() 注入 `X-Miliastra-Token`，调用方不要自己拼鉴权头。
 //   3. 401 统一抛 AuthError，由 store.handleAuth() 清令牌并提示去设置页重填。
 //   4. 非 2xx 统一抛 Error，文案优先取响应体里的 message / error 字段。
+//   5. 假数据（`--mode mock` 构建，见 scripts/panel-visual-check.sh）也只在这一层
+//      换掉 `fetch`：页面与真实请求走**同一份代码**，任何页面都不允许写
+//      `if (mock)` 分支——否则截出来的就不是生产路径。
+import { MOCK_ENABLED } from './mock/buildFlag.js'
+
 const TOKEN_COOKIE = 'miliastraAccessToken'
 /**
  * 旧版本把令牌双写到 localStorage 的键。只用于启动时的一次性迁移/清理，
@@ -185,7 +190,20 @@ function headers(extra) {
  * 只给 request / fetchBlob / fetchRaw 用；页面不要直接调。
  */
 async function send(path, method = 'GET', options = {}) {
-  const response = await fetch(path, {
+  // 假数据模式下换掉 fetch 本身，而不是在上层加分支：`send` 之后的 401 / 非 2xx /
+  // 错误文案 / blob 解析全部原样生效，页面拿到的调用栈与真实请求完全一致。
+  // 判定写作 `if (MOCK_ENABLED)` 而不是引入动态 import：常量在构建期就被折叠，
+  // 生产产物里这段与下面的 `import()` 都会被 tree-shake 掉（见 buildFlag.js）。
+  if (MOCK_ENABLED) {
+    const { mockFetch } = await import('./mock/index.js')
+    return sendWith(mockFetch, path, method, options)
+  }
+  return sendWith(fetch, path, method, options)
+}
+
+/** 真正的发送逻辑；`doFetch` 只是把 `fetch` 参数化，便于假数据替换而不复制粘贴。 */
+async function sendWith(doFetch, path, method, options) {
+  const response = await doFetch(path, {
     method,
     headers: headers(options.headers),
     body: options.body,

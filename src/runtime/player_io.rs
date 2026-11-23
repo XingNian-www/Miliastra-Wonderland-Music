@@ -663,22 +663,12 @@ impl<T> PlayerOperation<T> {
             }
         };
         let started_at = Instant::now();
-        loop {
-            let remaining = CONTROL_CANCEL_DRAIN_TIMEOUT.saturating_sub(started_at.elapsed());
-            match receiver.recv_timeout(remaining) {
-                Ok(_) => {
-                    self.settle(PlayerOperationState::Completed);
-                    return;
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    self.restore(receiver);
-                    return;
-                }
-                Err(RecvTimeoutError::Disconnected) => {
-                    self.settle(PlayerOperationState::Disconnected);
-                    return;
-                }
-            }
+        // 三条分支都直接返回，不需要循环（clippy::never_loop 会拦下多余的那层）。
+        let remaining = CONTROL_CANCEL_DRAIN_TIMEOUT.saturating_sub(started_at.elapsed());
+        match receiver.recv_timeout(remaining) {
+            Ok(_) => self.settle(PlayerOperationState::Completed),
+            Err(RecvTimeoutError::Timeout) => self.restore(receiver),
+            Err(RecvTimeoutError::Disconnected) => self.settle(PlayerOperationState::Disconnected),
         }
     }
 

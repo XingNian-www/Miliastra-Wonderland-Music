@@ -153,6 +153,17 @@ jobs:
           }
           printf '发现 %d 个前端测试文件：\n' "${#test_files[@]}"
           printf '  %s\n' "${test_files[@]}"
+          # 这一步**不装 node_modules**，所以测试链路上不能出现任何来自
+          # `dependencies` 的 import（`vue`、`pinia` 等）。2026-11-23 首次真跑时就踩了：
+          # `util/configSchema.js` 从 `../store.js` 引 `nestedGet`，而 `store.js` 依赖
+          # `vue`，于是测试文件在**模块加载阶段**就 ERR_MODULE_NOT_FOUND，
+          # 本地因装过依赖而完全看不出来。下面的探针把这条约束变成可执行检查。
+          # 只检查 `util/` 下的纯逻辑模块：它们必须能被无依赖加载。
+          # `composables/`、`pages/` 是 Vue 组件，本来就该用 store，不在约束内。
+          if grep -rn "store\.js'" src/util --include='*.js' --include='*.mjs' 2>/dev/null; then
+            echo "::error::web/src/util 下不得依赖 store.js（它 import vue，CI 未装依赖）"
+            exit 1
+          fi
           # 用 runner 自身的递归发现（Node 20 起支持），不要依赖 shell glob：
           # CI 的 bash 默认没有 globstar，`src/**/*.test.mjs` 在子目录上匹配不到。
           node --test
@@ -256,6 +267,7 @@ jobs:
             build-essential \
             pkg-config \
             cmake \
+            lld \
             libclang-dev \
             libasound2-dev \
             libavcodec-dev \
@@ -268,6 +280,9 @@ jobs:
           set -euo pipefail
           command -v pkg-config
           command -v cmake
+          # `lld` 不是 GitHub Ubuntu 镜像的必备包：2026-11-23 首次真跑这个 workflow 时
+          # 就在这一步因 `command -v ld.lld` 退出 1 而整 job 失败（此前 quality-gate
+          # 在 main 上从未被触发过，所以这个假设一直没被验证）。必须显式装 `lld`。
           command -v ld.lld
           pkg-config --exists alsa
           pkg-config --exists libavcodec libavformat libavutil libswresample

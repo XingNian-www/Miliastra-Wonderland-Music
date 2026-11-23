@@ -5,7 +5,15 @@
 // 保证「保存前的本地校验」与「字段旁的错误提示」永远同一套措辞。
 
 import { f32Text } from './format.js'
-import { nestedGet } from '../store.js'
+// 不要把 `nestedGet` 从 `store.js` 引进来：`store.js` 依赖 `vue`，而 CI 的
+// `node --test` 一步**特意不装依赖**（见 quality-gate.yml 注释），那样会让整个
+// 测试文件在模块加载阶段就 `ERR_MODULE_NOT_FOUND: Cannot find package 'vue'`。
+// 这 4 行是纯函数，就地保留一份，谁也不必为读一个字段去拉 Vue。
+function nestedGet(object, path) {
+  return String(path)
+    .split('.')
+    .reduce((value, key) => (value == null ? value : value[key]), object)
+}
 
 /** 配置中心的 IA 与旧版一致：这些段各有独立页面，不在配置中心重复出现。 */
 export const HIDDEN_SECTIONS = new Set(['identity', 'ai', 'ai_chat', 'tts', 'command_access'])

@@ -154,3 +154,53 @@ pub(super) fn undercover_end_route(
         .undercover_control(false)
         .map_err(command_error)
 }
+
+pub(super) fn number_bomb_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let mut value = serde_json::to_value(
+        state
+            .application
+            .queries
+            .number_bomb_snapshot()
+            .map_err(internal_error)?,
+    )
+    .map_err(internal_error)?;
+    // 与 turtle_soup / undercover 同一红线：玩家展示名必须走身份映射，
+    // 否则已登记身份会以内部比较键（UUID）形式出现在面板里。
+    map_api_identity_json(&mut value, &state.live_configs.identity);
+    serde_json::to_string(&value).map_err(internal_error)
+}
+
+pub(super) fn idiom_chain_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let mut value = serde_json::to_value(
+        state
+            .application
+            .queries
+            .idiom_chain_snapshot()
+            .map_err(internal_error)?,
+    )
+    .map_err(internal_error)?;
+    map_api_identity_json(&mut value, &state.live_configs.identity);
+    serde_json::to_string(&value).map_err(internal_error)
+}
+
+pub(super) fn card_game_route(
+    _query: &[(String, String)],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let mut value = serde_json::to_value(
+        state
+            .application
+            .queries
+            .card_game_snapshot()
+            .map_err(internal_error)?,
+    )
+    .map_err(internal_error)?;
+    map_api_identity_json(&mut value, &state.live_configs.identity);
+    serde_json::to_string(&value).map_err(internal_error)
+}

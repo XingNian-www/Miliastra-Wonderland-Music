@@ -196,6 +196,66 @@ pub struct NumberBombConfig {
     pub upper_bound_cap: u32,
 }
 
+/// 数字炸弹的对外快照（配置面板「玩法状态」用）。
+///
+/// 与 [`TurtleSoupSnapshot`] / [`UndercoverSnapshot`] 同一口径：**只读投影**，
+/// 供 HTTP 层直接序列化，不持有任何句柄。`phase` 用字符串而不是枚举，
+/// 是为了让面板不必跟着 Rust 侧改类型（新增阶段不破坏前端）。
+///
+/// **身份红线**：`creator` / `players[].display` 是已脱敏的展示名，由 composition
+/// 层传入 `map_api_identity_json` 再替换一次；`key` 一律不进快照——
+/// 已登记身份的比较键是 UUID，泄漏出去等于拿到可追踪标识。
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct NumberBombSnapshot {
+    pub enabled: bool,
+    /// `idle` / `lobby` / `playing`
+    pub phase: &'static str,
+    pub players: Vec<NumberBombPlayerSnapshot>,
+    /// 当前区间下界（含）。
+    pub lower: u32,
+    /// 当前区间上界（含）。
+    pub upper: u32,
+    /// 已经猜过、不会再被接受的数字。
+    pub guessed: Vec<u32>,
+    /// 轮到谁（`players` 的下标）。
+    pub turn: usize,
+    /// 本回合已用秒数。
+    pub elapsed_seconds: u64,
+    /// 回合计时上限。
+    pub turn_timeout_seconds: u64,
+    /// 上一轮结果：输家下标 + 炸弹数字。
+    pub last_result: Option<NumberBombRoundSnapshot>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct NumberBombPlayerSnapshot {
+    pub display: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct NumberBombRoundSnapshot {
+    /// `players` 的下标。
+    pub loser: usize,
+    pub bomb: u32,
+}
+
+impl Default for NumberBombSnapshot {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            phase: "idle",
+            players: Vec::new(),
+            lower: 0,
+            upper: 0,
+            guessed: Vec::new(),
+            turn: 0,
+            elapsed_seconds: 0,
+            turn_timeout_seconds: 0,
+            last_result: None,
+        }
+    }
+}
+
 impl Default for NumberBombConfig {
     fn default() -> Self {
         Self {
@@ -348,6 +408,49 @@ impl NumberBombService {
             config,
             session: None,
             rng: SplitMix64::new(seed),
+        }
+    }
+
+    /// 对外快照：配置面板「玩法状态」只读投影。
+    ///
+    /// `now` 由调用方传入（生产用 `Clock`），这样「本回合已用秒数」在测试里可复现，
+    /// 也不会因为快照本身去 `Instant::now()` 而绕开注入的时钟。
+    pub(crate) fn snapshot(&self, now: Instant) -> NumberBombSnapshot {
+        let Some(session) = self.session.as_ref() else {
+            return NumberBombSnapshot {
+                enabled: self.config.enabled,
+                turn_timeout_seconds: self.config.turn_timeout_seconds,
+                ..NumberBombSnapshot::default()
+            };
+        };
+        let phase = match session.phase {
+            Phase::Lobby => "lobby",
+            Phase::Playing => "playing",
+        };
+        NumberBombSnapshot {
+            enabled: self.config.enabled,
+            phase,
+            players: session
+                .players
+                .iter()
+                .map(|player| NumberBombPlayerSnapshot {
+                    display: player.display.clone(),
+                })
+                .collect(),
+            lower: session.lower,
+            upper: session.upper,
+            guessed: session.guessed.iter().copied().collect(),
+            turn: session.turn,
+            // 大厅阶段不计时；与 `tick` 的 `clock_active` 判据保持一致。
+            elapsed_seconds: session
+                .timer
+                .elapsed_at(now, session.phase == Phase::Playing)
+                .as_secs(),
+            turn_timeout_seconds: self.config.turn_timeout_seconds,
+            last_result: session.last_result.map(|result| NumberBombRoundSnapshot {
+                loser: result.loser,
+                bomb: result.bomb,
+            }),
         }
     }
 
@@ -1008,6 +1111,57 @@ mod tests {
             extra_range_per_player: 100,
             upper_bound_cap: 1000,
         }
+    }
+
+    /// 空服务 → 快照必须表达「空闲」且带上配置里的回合上限。
+    ///
+    /// 面板靠 `phase` 决定是否显示「进行中」卡片；把 idle 写成非 idle
+    /// 会让面板在没有人玩的时候也占一屏，所以这里钉死默认投影。
+    #[test]
+    fn snapshot_of_an_idle_service_is_idle() {
+        let service = NumberBombService::with_seed(config(), 7);
+        let now = Instant::now();
+        let snapshot = service.snapshot(now);
+        assert!(!snapshot.players.iter().any(|p| p.display.is_empty()));
+        assert_eq!(snapshot.phase, "idle");
+        assert!(snapshot.players.is_empty());
+        assert!(snapshot.guessed.is_empty());
+        assert_eq!(snapshot.turn, 0);
+        assert!(snapshot.last_result.is_none());
+        // 空闲时也要给出配置值：面板用它显示「每回合 60 秒」这类说明。
+        assert_eq!(snapshot.turn_timeout_seconds, config().turn_timeout_seconds);
+        assert_eq!(snapshot.lower, 0);
+        assert_eq!(snapshot.upper, 0);
+    }
+
+    /// 开局后快照必须带出**展示名**，且**不得**带内部比较键。
+    ///
+    /// 身份红线：`Player.key` 在已登记身份下是 UUID，一旦进快照就等于把
+    /// 可追踪标识泄漏给任何能读面板的人。快照结构体里根本没有 `key` 字段，
+    /// 这条测试防止有人「为了方便」把它加回来。
+    #[test]
+    fn snapshot_reports_display_names_and_never_the_player_key() {
+        let (mut service, mut entertainment) = service();
+        let now = Instant::now();
+        service
+            .handle_command(
+                &mut entertainment,
+                "uuid-甲",
+                "甲",
+                &NumberBombCommand::Start,
+                now,
+            )
+            .unwrap();
+        let snapshot = service.snapshot(now);
+        assert_ne!(snapshot.phase, "idle", "开局后不得再是 idle");
+        assert_eq!(snapshot.players.len(), 1);
+        assert_eq!(snapshot.players[0].display, "甲");
+        let json = serde_json::to_string(&snapshot).expect("快照必须可序列化");
+        assert!(
+            !json.contains("uuid-"),
+            "快照里出现了内部比较键，身份红线被破坏：{json}"
+        );
+        assert!(!json.contains("\"key\""), "快照不得含有 key 字段：{json}");
     }
 
     fn service() -> (NumberBombService, EntertainmentState) {

@@ -12,7 +12,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::protocol::WebToolRequest;
+use crate::features::card_games::CardGameSnapshot;
 use crate::features::hall::{HallCommand, HallRuntimeState};
+use crate::features::idiom_chain::IdiomChainSnapshot;
+use crate::features::number_bomb::NumberBombSnapshot;
 use crate::features::playback::{
     PlaybackCommand, PlaybackRuntimeState, PlayerStatus, QueueItem, SongRequestLeaderboardEntry,
 };
@@ -129,6 +132,12 @@ pub(crate) trait HttpCommandPort: Send + Sync {
 pub(crate) trait HttpQueryPort: Send + Sync {
     fn turtle_soup_snapshot(&self) -> Result<TurtleSoupSnapshot>;
     fn undercover_snapshot(&self) -> Result<UndercoverSnapshot>;
+    /// 牌类玩法状态：一个端点同时覆盖斗地主与跑得快（快照里的 `variant` 区分）。
+    fn card_game_snapshot(&self) -> Result<CardGameSnapshot>;
+    /// 成语接龙状态。
+    fn idiom_chain_snapshot(&self) -> Result<IdiomChainSnapshot>;
+    /// 数字炸弹状态。与 `undercover_snapshot` 同一口径：只读投影，供面板展示。
+    fn number_bomb_snapshot(&self) -> Result<NumberBombSnapshot>;
     fn diagnostic_task_snapshot(&self, id: u64) -> Result<Option<DiagnosticTaskSnapshot>>;
     fn playback_queue_snapshot(&self) -> Result<Vec<QueueItem>>;
     fn playback_state_snapshot(&self) -> Result<PlaybackRuntimeState>;

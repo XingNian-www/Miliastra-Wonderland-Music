@@ -9,8 +9,11 @@ use anyhow::{Result, anyhow};
 
 use super::{AppServices, FormalTaskExecutionContext, PendingTask, PendingTaskExecution};
 use crate::config::LiveConfigs;
+use crate::features::card_games::CardGameSnapshot;
 use crate::features::command::RoutedCommand;
 use crate::features::hall::HallRuntimeState;
+use crate::features::idiom_chain::IdiomChainSnapshot;
+use crate::features::number_bomb::NumberBombSnapshot;
 use crate::features::playback::{PlaybackRuntimeState, QueueItem, SongRequestLeaderboardEntry};
 use crate::features::startup::StartupTask;
 use crate::features::turtle_soup::TurtleSoupSnapshot;
@@ -295,6 +298,18 @@ impl HttpTaskPort for FormalTaskClient {
 impl HttpQueryPort for FormalTaskClient {
     fn turtle_soup_snapshot(&self) -> Result<TurtleSoupSnapshot> {
         Ok(self.business.turtle_soup_snapshot()?)
+    }
+
+    fn card_game_snapshot(&self) -> Result<CardGameSnapshot> {
+        Ok(self.business.card_game_snapshot()?)
+    }
+
+    fn idiom_chain_snapshot(&self) -> Result<IdiomChainSnapshot> {
+        Ok(self.business.idiom_chain_snapshot()?)
+    }
+
+    fn number_bomb_snapshot(&self) -> Result<NumberBombSnapshot> {
+        Ok(self.business.number_bomb_snapshot()?)
     }
 
     fn undercover_snapshot(&self) -> Result<UndercoverSnapshot> {

@@ -12,11 +12,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
+use serde::Serialize;
 
 use super::commands::LandlordCommand;
 use super::config::LandlordConfig;
 use super::deadline::CardGameDeadlineKind;
-use super::landlord::LandlordGame;
+use super::landlord::{CardGameVariant, GameState, LandlordGame};
 use super::outcome::{
     CardGameFriendBatchOutcome, CardGameReplyTemplate, LandlordOutcome, LandlordPrivateDelivery,
 };
@@ -554,6 +555,56 @@ impl PendingCardGameEffect {
 pub struct CardGameService {
     state: CardGameState,
     enabled: bool,
+}
+
+/// 牌类玩法的对外快照（配置面板「玩法状态」用）。
+///
+/// 一个服务同时承载**斗地主**与**跑得快**，靠 [`CardGameVariant`] 区分；
+/// 因此面板只需要读一个快照就能同时渲染两种玩法，不必各开一个端点。
+///
+/// **身份红线**：`players[].name` 是展示名（note 优先）；内部 `key`
+/// （已登记身份下是 UUID）一律不进快照——结构体层面就没有该字段。
+#[derive(Clone, Debug, Serialize)]
+pub struct CardGameSnapshot {
+    pub enabled: bool,
+    /// `idle` / `lobby` / `bidding` / `playing`
+    pub phase: &'static str,
+    /// `斗地主` / `跑得快`；空闲时为 `None`。
+    pub variant: Option<&'static str>,
+    pub players: Vec<CardGamePlayerSnapshot>,
+    /// 轮到谁（`players` 的下标）。
+    pub current: Option<usize>,
+    /// 地主 / 庄家（`players` 的下标）。
+    pub landlord: Option<usize>,
+    /// 本回合已用秒数（大厅阶段也计：面板要显示等待开局多久）。
+    pub elapsed_seconds: u64,
+    pub lobby_timeout_seconds: u64,
+    pub turn_timeout_seconds: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CardGamePlayerSnapshot {
+    pub name: String,
+    /// 手牌张数。不暴露具体牌面：面板只需要「还有几张」，暴露牌面等于作弊。
+    pub hand_count: usize,
+    pub trustee: bool,
+    pub timeouts: u32,
+}
+
+impl Default for CardGameSnapshot {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            phase: "idle",
+            variant: None,
+            players: Vec::new(),
+            current: None,
+            landlord: None,
+            elapsed_seconds: 0,
+            lobby_timeout_seconds: 0,
+            turn_timeout_seconds: 0,
+        }
+    }
 }
 
 impl CardGameService {
@@ -1592,6 +1643,69 @@ impl CardGameService {
             Self::release_active_card_game(entertainment);
         }
         Ok(aborted || reserved)
+    }
+
+    /// 对外快照：配置面板「玩法状态」只读投影，同时覆盖斗地主与跑得快。
+    pub(crate) fn snapshot(&self, now: Instant) -> CardGameSnapshot {
+        let snapshot_of = |players: &[super::landlord::Player],
+                           variant: CardGameVariant,
+                           current: Option<usize>,
+                           landlord: Option<usize>,
+                           timer: &super::landlord::ActiveTimer|
+         -> CardGameSnapshot {
+            CardGameSnapshot {
+                enabled: self.enabled,
+                // 阶段由调用方覆盖（大厅/叫牌/出牌各不相同），这里只给默认。
+                phase: "playing",
+                variant: Some(match variant {
+                    CardGameVariant::Landlord => "斗地主",
+                    CardGameVariant::HunanRunFast => "跑得快",
+                }),
+                players: players
+                    .iter()
+                    .map(|player| CardGamePlayerSnapshot {
+                        name: player.name.clone(),
+                        hand_count: player.hand.len(),
+                        trustee: player.trustee,
+                        timeouts: player.timeouts,
+                    })
+                    .collect(),
+                current,
+                landlord,
+                elapsed_seconds: timer.elapsed_at(now, true).as_secs(),
+                lobby_timeout_seconds: self.state.game.config.lobby_timeout_seconds,
+                turn_timeout_seconds: self.state.game.config.turn_timeout_seconds,
+            }
+        };
+        match &self.state.game.state {
+            GameState::Idle => CardGameSnapshot {
+                enabled: self.enabled,
+                lobby_timeout_seconds: self.state.game.config.lobby_timeout_seconds,
+                turn_timeout_seconds: self.state.game.config.turn_timeout_seconds,
+                ..CardGameSnapshot::default()
+            },
+            GameState::Lobby(lobby) => CardGameSnapshot {
+                phase: "lobby",
+                ..snapshot_of(&lobby.players, lobby.variant, None, None, &lobby.timer)
+            },
+            GameState::Bidding(bidding) => CardGameSnapshot {
+                phase: "bidding",
+                ..snapshot_of(
+                    &bidding.players,
+                    CardGameVariant::Landlord,
+                    Some(bidding.current),
+                    bidding.caller,
+                    &bidding.timer,
+                )
+            },
+            GameState::Playing(playing) => snapshot_of(
+                &playing.players,
+                playing.variant,
+                Some(playing.current),
+                Some(playing.landlord),
+                &playing.timer,
+            ),
+        }
     }
 
     #[cfg(test)]

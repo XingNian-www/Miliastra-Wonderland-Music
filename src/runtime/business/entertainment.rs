@@ -6,11 +6,14 @@ use miliastra_kernel::clock::Clock;
 use miliastra_kernel::identity::{BusinessOperationIdAllocator, SessionGeneration};
 use miliastra_kernel::timer::TimerRuntimeHandle;
 
+use crate::features::card_games::CardGameSnapshot;
 use crate::features::card_games::{CardGameService, CardGameTimedOutcome};
 use crate::features::entertainment::{EntertainmentKind, EntertainmentState};
-use crate::features::idiom_chain::{IdiomChainCommand, IdiomChainOutcome, IdiomChainService};
+use crate::features::idiom_chain::{
+    IdiomChainCommand, IdiomChainOutcome, IdiomChainService, IdiomChainSnapshot,
+};
 use crate::features::invite::{InviteRequest, InviteService, InviteStart};
-use crate::features::number_bomb::NumberBombService;
+use crate::features::number_bomb::{NumberBombService, NumberBombSnapshot};
 use crate::features::turtle_soup::{TurtleSoupAiCompletion, TurtleSoupService, TurtleSoupSnapshot};
 use crate::features::undercover::{
     UndercoverRuntimeService, UndercoverSnapshot, UndercoverTimedOutcome,
@@ -113,6 +116,22 @@ impl EntertainmentRuntimeState {
             .as_ref()
             .map(TurtleSoupService::snapshot)
             .ok_or(BusinessRuntimeError::RuntimeStopped)
+    }
+
+    /// 牌类快照：**一个端点同时覆盖斗地主与跑得快**（靠快照里的 `variant` 区分）。
+    pub(super) fn card_game_snapshot(&self, now: Instant) -> CardGameSnapshot {
+        self.card_games.snapshot(now)
+    }
+
+    /// 成语接龙快照（无时钟参数：它的状态里没有时间量）。
+    pub(super) fn idiom_chain_snapshot(&self) -> IdiomChainSnapshot {
+        self.idiom_chain.snapshot()
+    }
+
+    /// 数字炸弹快照。与 `undercover_snapshot` 一样收 `now`：
+    /// 「本回合已用秒数」必须走注入的时钟，方便测试固定时间。
+    pub(super) fn number_bomb_snapshot(&self, now: Instant) -> NumberBombSnapshot {
+        self.number_bomb.snapshot(now)
     }
 
     pub(super) fn invite_should_accept(&self, sequence: Option<u32>) -> bool {

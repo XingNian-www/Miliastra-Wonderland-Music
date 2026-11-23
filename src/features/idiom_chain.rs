@@ -365,6 +365,44 @@ pub struct IdiomChainGame {
     session: Option<IdiomChainSession>,
 }
 
+/// 成语接龙的对外快照（配置面板「玩法状态」用）。
+///
+/// 与 `NumberBombSnapshot` / `TurtleSoupSnapshot` 同一口径：只读投影、可序列化。
+/// **身份红线**：`starter` 是展示名，`starter_key`（已登记身份下是 UUID）
+/// 绝不进快照——两个字段在结构体层面就不存在。
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct IdiomChainSnapshot {
+    pub enabled: bool,
+    /// `idle` / `active`
+    pub phase: &'static str,
+    /// `成语接龙` / `同音接龙`；空闲时为 `None`。
+    pub mode: Option<&'static str>,
+    pub starter: Option<String>,
+    /// 当前需要接的字（首字），空闲时为 `None`。
+    pub expected_first: Option<String>,
+    /// 已接龙条数（本局累计）。
+    pub total: usize,
+    /// 最近若干条成语，按发生顺序。
+    pub history: Vec<String>,
+    /// 词库大小：面板用来提示「未加载词库」这类配置问题。
+    pub lexicon_len: usize,
+}
+
+impl Default for IdiomChainSnapshot {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            phase: "idle",
+            mode: None,
+            starter: None,
+            expected_first: None,
+            total: 0,
+            history: Vec::new(),
+            lexicon_len: 0,
+        }
+    }
+}
+
 pub(crate) struct IdiomChainService {
     game: IdiomChainGame,
 }
@@ -376,6 +414,31 @@ impl IdiomChainService {
 
     fn from_game(game: IdiomChainGame) -> Self {
         Self { game }
+    }
+
+    /// 对外快照：配置面板「玩法状态」只读投影。
+    pub(crate) fn snapshot(&self) -> IdiomChainSnapshot {
+        let game = &self.game;
+        let Some(session) = game.session.as_ref() else {
+            return IdiomChainSnapshot {
+                enabled: game.enabled,
+                lexicon_len: game.lexicon_len(),
+                ..IdiomChainSnapshot::default()
+            };
+        };
+        IdiomChainSnapshot {
+            enabled: game.enabled,
+            phase: "active",
+            mode: Some(session.mode.label()),
+            // 字段名叫 `starter_key` 是为了「是否本人可结束」的比较，但存的
+            // 是 composition 层传入的玩家字符串；HTTP 层还会再走一次
+            // `map_api_identity_json` 做身份映射，因此这里给原值即可。
+            starter: Some(session.starter_key.clone()),
+            expected_first: Some(session.expected_first.to_string()),
+            total: session.total_count,
+            history: session.history.iter().cloned().collect(),
+            lexicon_len: game.lexicon_len(),
+        }
     }
 
     pub(crate) fn lexicon_len(&self) -> usize {
@@ -1165,6 +1228,46 @@ fn templated_outcome(action: &'static str, template: IdiomReplyTemplate) -> Idio
 
 #[cfg(test)]
 mod tests {
+
+    /// 空闲快照：`phase=idle`，但必须带上词库大小——面板靠它提示
+    /// 「词库没加载」，没有这个数就只能显示一个没有原因的「空闲」。
+    #[test]
+    fn snapshot_of_an_idle_service_is_idle_with_lexicon_size() {
+        let service = IdiomChainService::from_game(game(&["画蛇添足", "足智多谋"]));
+        let snapshot = service.snapshot();
+        assert_eq!(snapshot.phase, "idle");
+        assert!(snapshot.mode.is_none());
+        assert_eq!(snapshot.total, 0);
+        assert!(snapshot.history.is_empty());
+        assert_eq!(snapshot.lexicon_len, 2, "空闲时也要报词库大小");
+    }
+
+    /// 开局后快照必须带出模式/首字，且不得出现内部比较键。
+    #[test]
+    fn snapshot_reports_active_session_without_internal_keys() {
+        let mut service = IdiomChainService::from_game(game(&["画蛇添足", "足智多谋"]));
+        let mut entertainment = EntertainmentState::new();
+        service
+            .handle(
+                &mut entertainment,
+                "Alice",
+                &IdiomChainCommand::Start {
+                    idiom: "画蛇添足".to_string(),
+                    mode: IdiomChainMode::Exact,
+                },
+            )
+            .unwrap();
+        let snapshot = service.snapshot();
+        assert_eq!(snapshot.phase, "active");
+        assert_eq!(snapshot.mode, Some("成语接龙"));
+        assert_eq!(snapshot.starter, Some("Alice".to_string()));
+        assert_eq!(snapshot.expected_first, Some("足".to_string()));
+        let json = serde_json::to_string(&snapshot).expect("快照必须可序列化");
+        assert!(
+            !json.contains("starter_key"),
+            "快照不得含内部字段名：{json}"
+        );
+    }
     use super::*;
     use crate::features::entertainment::EntertainmentState;
     use miliastra_kernel::clock::{Clock, ManualClock};

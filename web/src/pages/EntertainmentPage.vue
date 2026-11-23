@@ -125,6 +125,15 @@
             <div class="turtle-stat"><span>回合超时</span><strong>{{ timeoutText }}</strong></div>
             <div class="turtle-stat"><span>上限</span><strong>{{ otherConfig.number_bomb?.upper_bound_cap ?? '—' }}</strong></div>
           </div>
+          <div class="turtle-stats" style="margin-top:10px">
+            <div class="turtle-stat"><span>实时状态</span><strong>{{ phaseLabel(numberBomb.phase) }}</strong></div>
+            <div class="turtle-stat"><span>在场</span><strong>{{ numberBombPlayers.length }}</strong></div>
+            <div class="turtle-stat"><span>已用</span><strong>{{ formatSeconds(numberBomb.elapsed_seconds) }}</strong></div>
+          </div>
+          <p v-if="numberBombLive" class="config-field-hint">
+            当前区间 {{ numberBomb.lower ?? '—' }} ~ {{ numberBomb.upper ?? '—' }}，轮到第 {{ (numberBomb.turn ?? 0) + 1 }} 位；
+            已排除 {{ numberBombGuessed.length }} 个数字。
+          </p>
           <p class="config-field-hint">命令 @数字炸弹；配置在「配置中心 → 娱乐玩法」修改。</p>
         </div>
       </div>
@@ -138,6 +147,14 @@
             <div class="turtle-stat"><span>历史保留</span><strong>{{ otherConfig.idiom_chain?.history_limit ?? '—' }}</strong></div>
             <div class="turtle-stat"><span>允许中断</span><strong>{{ otherConfig.idiom_chain?.allow_anyone_stop ? '是' : '否' }}</strong></div>
           </div>
+          <div class="turtle-stats" style="margin-top:10px">
+            <div class="turtle-stat"><span>实时状态</span><strong>{{ phaseLabel(idiomChain.phase) }}</strong></div>
+            <div class="turtle-stat"><span>已接龙</span><strong>{{ idiomChain.total ?? 0 }}</strong></div>
+            <div class="turtle-stat"><span>词库条目</span><strong>{{ idiomChain.lexicon_len ?? '—' }}</strong></div>
+          </div>
+          <p v-if="idiomLive" class="config-field-hint">
+            开局者 {{ idiomChain.starter || '—' }}，下一条需以「{{ idiomChain.expected_first || '—' }}」开头。
+          </p>
           <p class="config-field-hint">命令 @接龙 / @接龙结束；词库缺失时会在日志里报错。</p>
         </div>
       </div>
@@ -145,11 +162,23 @@
       <div class="panel wide">
         <div class="panel-head"><h2>塔罗 / 卡牌</h2><small>命令玩法</small></div>
         <div class="panel-body">
-          <p class="config-field-hint">塔罗（@抽牌 / @重抽 / @解读）与卡牌对局没有独立开关，随命令与权限开放；运行情况见下方动态。</p>
           <div class="turtle-stats">
+            <div class="turtle-stat"><span>实时对局</span><strong>{{ phaseLabel(cardGame.phase) }}</strong></div>
+            <div class="turtle-stat"><span>玩法</span><strong>{{ cardGame.variant || '—' }}</strong></div>
+            <div class="turtle-stat"><span>在场</span><strong>{{ cardGamePlayers.length }}</strong></div>
             <div class="turtle-stat"><span>塔罗动态</span><strong>{{ tarotLogs.length }}</strong></div>
             <div class="turtle-stat"><span>卡牌动态</span><strong>{{ cardLogs.length }}</strong></div>
           </div>
+          <div v-if="cardGamePlayers.length" class="undercover-players" style="margin-top:12px">
+            <div v-for="(player, index) in cardGamePlayers" :key="`${player.name}-${index}`" class="undercover-player">
+              <span class="undercover-position">{{ index + 1 }}</span>
+              <span class="undercover-name">{{ player.name || '未知玩家' }}</span>
+              <span class="undercover-state" :class="{ out: player.hand_count === 0 }">
+                {{ player.hand_count }} 张{{ player.trustee ? ' · 托管' : '' }}
+              </span>
+            </div>
+          </div>
+          <p class="config-field-hint">塔罗（@抽牌 / @重抽 / @解读）与卡牌对局没有独立开关，随命令与权限开放；运行情况见下方动态。</p>
         </div>
       </div>
 
@@ -194,6 +223,23 @@ const turtle = ref({})
 const undercover = ref({})
 const monitorRaw = ref(null)
 const otherConfig = ref({})
+// 三个玩法状态端点（/card-game 同时覆盖斗地主与跑得快）
+const numberBomb = ref({})
+const idiomChain = ref({})
+const cardGame = ref({})
+
+const PHASE_LABELS = { idle: '空闲', lobby: '大厅', bidding: '叫牌', playing: '出牌中', active: '进行中' }
+// 后端快照只给 `phase`（`idle`/`lobby`/`bidding`/`playing`/`active`），
+// **没有** `phaseLabel` 字段——那是海龟汤快照的口径。早期版本误用了
+// `numberBomb.phaseLabel`，于是无论实际在玩还是空闲都显示「空闲」。
+// 未收录的 phase 原样显示，避免新增阶段时面板显示空白。
+const phaseLabel = (phase) => PHASE_LABELS[phase] || (phase ? String(phase) : '空闲')
+const numberBombLive = computed(() => (numberBomb.value.phase || 'idle') !== 'idle')
+const numberBombPlayers = computed(() => numberBomb.value.players || [])
+const numberBombGuessed = computed(() => numberBomb.value.guessed || [])
+const idiomLive = computed(() => (idiomChain.value.phase || 'idle') === 'active')
+const cardGameLive = computed(() => (cardGame.value.phase || 'idle') !== 'idle')
+const cardGamePlayers = computed(() => cardGame.value.players || [])
 
 const rangeText = computed(() => {
   const cfg = otherConfig.value.number_bomb || {}
@@ -309,9 +355,18 @@ async function refresh(manual = false) {
     const fallbackOk = turtleResult.status === 'fulfilled' || undercoverResult.status === 'fulfilled'
     loaded.value = loaded.value || fallbackOk
     loadError.value = `读取对局状态失败：${error.message || error}`
-  } finally {
-    loading.value = false
   }
+  // 三个「其他玩法」状态各自独立取：任一失败不影响海龟汤/卧底的主流程，
+  // 也不把整页拖成错误态（后端可能还没有这些端点）。
+  const [numberBombResult, idiomResult, cardResult] = await Promise.allSettled([
+    getJson('/number-bomb'),
+    getJson('/idiom-chain'),
+    getJson('/card-game'),
+  ])
+  if (numberBombResult.status === 'fulfilled') numberBomb.value = numberBombResult.value || {}
+  if (idiomResult.status === 'fulfilled') idiomChain.value = idiomResult.value || {}
+  if (cardResult.status === 'fulfilled') cardGame.value = cardResult.value || {}
+  loading.value = false
   if (manual) toast('已刷新对局状态')
 }
 

@@ -48,7 +48,7 @@ pub(crate) use outcome::{
 pub use service::{
     CardGameApplication, CardGameCancel, CardGameCommandStart, CardGameEffectClaim,
     CardGameEffectKey, CardGameEffectLane, CardGameEffectResult, CardGameEffectTask,
-    CardGameResume, CardGameRuntimePort, CardGameTimedOutcome,
+    CardGameResume, CardGameRuntimePort, CardGameSnapshot, CardGameTimedOutcome,
 };
 #[cfg(test)]
 pub(crate) use service::{

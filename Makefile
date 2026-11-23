@@ -7,6 +7,7 @@
 #   make check      cargo check --lib --no-default-features（0 warning 硬门禁）
 #   make test       cargo test --lib --no-default-features（根 crate；CI 另跑 --workspace）
 #   make windows    Windows 目标编译检查（mingw 交叉，补 Linux 门禁盲区）
+#   make visual     面板视觉核验（假数据截图 + 布局审计）
 #   make layers     scripts/check-layers.py --check + --self-test
 #   make panel      面板 API 覆盖率（默认 report-only，PANEL_STRICT=1 才阻断）
 #   make web        web/dist 构建（build.rs 以 web/dist/index.html 为就绪判据）
@@ -44,6 +45,11 @@ fmt:
 # 用 mingw 交叉到 x86_64-pc-windows-gnu，不需要 MSVC 工具链；详见脚本头部的能力边界。
 windows:
 	bash scripts/check-windows.sh
+
+# 面板视觉核验：假数据起服 → chromium 截图 → 布局审计。
+# 前端改动必须过这一关（截图肉眼可看），不依赖真实后端。
+visual:
+	bash scripts/panel-visual-check.sh
 
 check:
 	# `--locked`：CI 的 Windows Release 构建用 `cargo build --locked`。改了

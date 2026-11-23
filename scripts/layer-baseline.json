@@ -297,7 +297,7 @@
         },
         {
           "path": "src/composition/application/formal_task.rs",
-          "count": 6
+          "count": 9
         },
         {
           "path": "src/composition/application/listener/chat_routing.rs",
@@ -1112,7 +1112,7 @@
         },
         {
           "path": "src/interfaces/http/ports.rs",
-          "count": 5
+          "count": 8
         },
         {
           "path": "src/interfaces/http/protocol.rs",
@@ -1436,7 +1436,7 @@
         },
         {
           "path": "src/runtime/business/entertainment.rs",
-          "count": 7
+          "count": 8
         },
         {
           "path": "src/runtime/business/hall.rs",
@@ -2064,7 +2064,7 @@
       "pub_items": 52
     },
     "src/composition/application/formal_task.rs": {
-      "lines": 1524,
+      "lines": 1539,
       "pub_items": 22
     },
     "src/composition/application/lifecycle.rs": {
@@ -2336,8 +2336,8 @@
       "pub_items": 47
     },
     "src/features/idiom_chain.rs": {
-      "lines": 1721,
-      "pub_items": 43
+      "lines": 1824,
+      "pub_items": 45
     },
     "src/features/invite.rs": {
       "lines": 575,
@@ -2352,8 +2352,8 @@
       "pub_items": 51
     },
     "src/features/number_bomb.rs": {
-      "lines": 1973,
-      "pub_items": 22
+      "lines": 2127,
+      "pub_items": 26
     },
     "src/features/playlist.rs": {
       "lines": 2570,
@@ -2428,7 +2428,7 @@
       "pub_items": 51
     },
     "src/features/card_games/mod.rs": {
-      "lines": 58,
+      "lines": 59,
       "pub_items": 9
     },
     "src/features/card_games/outcome.rs": {
@@ -2448,8 +2448,8 @@
       "pub_items": 21
     },
     "src/features/card_games/service.rs": {
-      "lines": 1755,
-      "pub_items": 55
+      "lines": 1869,
+      "pub_items": 58
     },
     "src/features/command/registry.rs": {
       "lines": 1080,
@@ -2632,11 +2632,11 @@
       "pub_items": 3
     },
     "src/interfaces/http/ports.rs": {
-      "lines": 638,
+      "lines": 647,
       "pub_items": 25
     },
     "src/interfaces/http/protocol.rs": {
-      "lines": 2159,
+      "lines": 2177,
       "pub_items": 12
     },
     "src/interfaces/http/tools.rs": {
@@ -2660,8 +2660,8 @@
       "pub_items": 26
     },
     "src/interfaces/http/routes/entertainment.rs": {
-      "lines": 156,
-      "pub_items": 7
+      "lines": 206,
+      "pub_items": 10
     },
     "src/interfaces/http/routes/health.rs": {
       "lines": 129,
@@ -2748,8 +2748,8 @@
       "pub_items": 3
     },
     "src/runtime/business.rs": {
-      "lines": 6317,
-      "pub_items": 145
+      "lines": 6354,
+      "pub_items": 148
     },
     "src/runtime/chat_listener.rs": {
       "lines": 179,
@@ -2812,8 +2812,8 @@
       "pub_items": 166
     },
     "src/runtime/business/entertainment.rs": {
-      "lines": 400,
-      "pub_items": 20
+      "lines": 419,
+      "pub_items": 23
     },
     "src/runtime/business/hall.rs": {
       "lines": 97,

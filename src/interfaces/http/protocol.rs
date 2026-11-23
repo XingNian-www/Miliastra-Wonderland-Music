@@ -765,6 +765,24 @@ const ROUTES: &[RouteSpec] = &[
         handler: turtle_soup_end_route,
     },
     RouteSpec {
+        path: "/card-game",
+        json: true,
+        mutating: false,
+        handler: card_game_route,
+    },
+    RouteSpec {
+        path: "/idiom-chain",
+        json: true,
+        mutating: false,
+        handler: idiom_chain_route,
+    },
+    RouteSpec {
+        path: "/number-bomb",
+        json: true,
+        mutating: false,
+        handler: number_bomb_route,
+    },
+    RouteSpec {
         path: "/undercover",
         json: true,
         mutating: false,

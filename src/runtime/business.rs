@@ -21,7 +21,7 @@ use crate::features::administration::{
 use crate::features::card_games::{
     CardGameCancel, CardGameCommandStart, CardGameDeadlineKind, CardGameDeadlineToken,
     CardGameEffectClaim, CardGameEffectKey, CardGameEffectResult, CardGameResume,
-    CardGameRuntimePort, CardGameService, CardGameTimedOutcome, LandlordCommand,
+    CardGameRuntimePort, CardGameService, CardGameSnapshot, CardGameTimedOutcome, LandlordCommand,
 };
 use crate::features::entertainment::{EntertainmentKind, EntertainmentState};
 use crate::features::hall::{
@@ -29,7 +29,7 @@ use crate::features::hall::{
 };
 use crate::features::idiom_chain::{
     IdiomChainCommand, IdiomChainDeadlineKind, IdiomChainDeadlineToken, IdiomChainOutcome,
-    IdiomChainService,
+    IdiomChainService, IdiomChainSnapshot,
 };
 use crate::features::invite::{InviteRequest, InviteService, InviteStart};
 use crate::features::moderation::{
@@ -39,7 +39,8 @@ use crate::features::moderation::{
 #[cfg(test)]
 use crate::features::number_bomb::NumberBombConfig;
 use crate::features::number_bomb::{
-    NumberBombCommand, NumberBombCommandOutcome, NumberBombService, NumberBombTimeout,
+    NumberBombCommand, NumberBombCommandOutcome, NumberBombService, NumberBombSnapshot,
+    NumberBombTimeout,
 };
 use crate::features::playback::{
     ActivePlaybackIdentity, ExternalPlaybackObservation, PlaybackMutationIntent,
@@ -470,6 +471,9 @@ enum RuntimeMessage {
     Undercover(UndercoverRuntimeMessage),
     UndercoverSnapshot(SyncSender<Result<UndercoverSnapshot, BusinessRuntimeError>>),
     NumberBomb(NumberBombRuntimeMessage),
+    NumberBombSnapshot(SyncSender<Result<NumberBombSnapshot, BusinessRuntimeError>>),
+    IdiomChainSnapshot(SyncSender<IdiomChainSnapshot>),
+    CardGameSnapshot(SyncSender<CardGameSnapshot>),
     TurtleSoup(TurtleSoupRuntimeMessage),
     TurtleSoupSnapshot(SyncSender<Result<TurtleSoupSnapshot, BusinessRuntimeError>>),
     InviteShouldAccept {
@@ -1941,6 +1945,30 @@ impl BusinessRuntimeHandle {
             clock_active,
             response,
         })
+    }
+
+    pub(crate) fn card_game_snapshot(&self) -> Result<CardGameSnapshot, BusinessRuntimeError> {
+        let (response, receiver) = mpsc::sync_channel(1);
+        self.send_query(RuntimeMessage::CardGameSnapshot(response))?;
+        receiver
+            .recv()
+            .map_err(|_| BusinessRuntimeError::RuntimeStopped)
+    }
+
+    pub(crate) fn idiom_chain_snapshot(&self) -> Result<IdiomChainSnapshot, BusinessRuntimeError> {
+        let (response, receiver) = mpsc::sync_channel(1);
+        self.send_query(RuntimeMessage::IdiomChainSnapshot(response))?;
+        receiver
+            .recv()
+            .map_err(|_| BusinessRuntimeError::RuntimeStopped)
+    }
+
+    pub(crate) fn number_bomb_snapshot(&self) -> Result<NumberBombSnapshot, BusinessRuntimeError> {
+        let (response, receiver) = mpsc::sync_channel(1);
+        self.send_query(RuntimeMessage::NumberBombSnapshot(response))?;
+        receiver
+            .recv()
+            .map_err(|_| BusinessRuntimeError::RuntimeStopped)?
     }
 
     pub(crate) fn turtle_soup_snapshot(&self) -> Result<TurtleSoupSnapshot, BusinessRuntimeError> {
@@ -3627,6 +3655,15 @@ fn run_business_runtime(receiver: Receiver<RuntimeMessage>, worker_config: Busin
             }
             RuntimeMessage::TurtleSoupSnapshot(response) => {
                 let _ = response.send(entertainment.turtle_soup_snapshot());
+            }
+            RuntimeMessage::NumberBombSnapshot(response) => {
+                let _ = response.send(Ok(entertainment.number_bomb_snapshot(clock.now())));
+            }
+            RuntimeMessage::IdiomChainSnapshot(response) => {
+                let _ = response.send(entertainment.idiom_chain_snapshot());
+            }
+            RuntimeMessage::CardGameSnapshot(response) => {
+                let _ = response.send(entertainment.card_game_snapshot(clock.now()));
             }
             RuntimeMessage::InviteShouldAccept { sequence, response } => {
                 let _ = response.send(entertainment.invite_should_accept(sequence));

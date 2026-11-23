@@ -24,7 +24,10 @@ use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::features::card_games::CardGameSnapshot;
 use crate::features::hall::HallRuntimeState;
+use crate::features::idiom_chain::IdiomChainSnapshot;
+use crate::features::number_bomb::NumberBombSnapshot;
 use crate::features::playback::{
     PlaybackRuntimeState, PlayerStatus, SongRequestLeaderboardEntry, test_candidate, test_track,
 };
@@ -1226,6 +1229,9 @@ struct RecordingHttpState {
     turtle_soup: TurtleSoupSnapshot,
     turtle_soup_submissions: Vec<TurtleSoupSubmission>,
     undercover: UndercoverSnapshot,
+    number_bomb: NumberBombSnapshot,
+    idiom_chain: IdiomChainSnapshot,
+    card_game: CardGameSnapshot,
     listener: ChatListenerState,
 }
 
@@ -1253,6 +1259,9 @@ impl RecordingHttpState {
             turtle_soup: TurtleSoupSnapshot::default(),
             turtle_soup_submissions: Vec::new(),
             undercover: UndercoverSnapshot::default(),
+            number_bomb: NumberBombSnapshot::default(),
+            idiom_chain: IdiomChainSnapshot::default(),
+            card_game: CardGameSnapshot::default(),
             listener: ChatListenerState::new(),
         }
     }
@@ -1641,6 +1650,33 @@ impl HttpQueryPort for RecordingHttpPort {
             .lock()
             .map_err(|_| anyhow!("recording HTTP port lock poisoned"))?
             .turtle_soup
+            .clone())
+    }
+
+    fn card_game_snapshot(&self) -> Result<CardGameSnapshot> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("recording HTTP port lock poisoned"))?
+            .card_game
+            .clone())
+    }
+
+    fn idiom_chain_snapshot(&self) -> Result<IdiomChainSnapshot> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("recording HTTP port lock poisoned"))?
+            .idiom_chain
+            .clone())
+    }
+
+    fn number_bomb_snapshot(&self) -> Result<NumberBombSnapshot> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("recording HTTP port lock poisoned"))?
+            .number_bomb
             .clone())
     }
 

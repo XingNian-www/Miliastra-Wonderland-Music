@@ -3661,3 +3661,340 @@ input[type="checkbox"]:checked::after {
   gap: 8px;
   white-space: nowrap;
 }
+
+/* ============================================================================
+ * 高级控制页 · 方案 C（IDE 工具条 + 可折叠面板）
+ *
+ * 这一页是「游戏旁边开着的调试控制台」：全屏 OCR / 扫描聊天 / 获取截图是每秒
+ * 都在点的动作，所以它们升到顶部一条统高工具条；区域 OCR、模板匹配、手动输入、
+ * 诊断、只读观测降为可折叠区块，默认只展开两项。
+ *
+ * 全部规则都以 `.tools-page` 收口：不新造通用类名，也不覆盖既有 `.btn` /
+ * `.tools-xxx`，避免影响别的页面。
+ * ========================================================================== */
+
+.tools-page {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.tools-head {
+  padding: 0 22px;
+}
+
+.tools-head .page-title {
+  margin: 0 0 2px;
+}
+
+.tools-head .page-subtitle {
+  margin: 0 0 2px;
+}
+
+/* ---------- 顶部工具条 ---------- */
+
+.tools-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 0 22px;
+  padding: 7px 10px;
+  background: var(--bg-1);
+  border: 1px solid var(--sep-1);
+  border-radius: var(--radius-m);
+  box-shadow: var(--shadow-1);
+}
+
+.tools-bar-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* 统高 + 等宽：宽度写死比让 flex 拉伸更稳（不会出现两字按钮被拉宽）。
+   图标 14px、文字 12.5px，128px 刚好容下「获取截图」这类四字标签。 */
+.tools-bar-btn {
+  flex: 0 0 auto;
+  width: 128px;
+  height: var(--btn-h);
+  min-height: var(--btn-h);
+  padding: 0 10px;
+  gap: 6px;
+  font-size: 12.5px;
+}
+
+.tools-bar-btn svg {
+  width: var(--ic-sm);
+  height: var(--ic-sm);
+  flex: none;
+  opacity: 0.85;
+}
+
+.tools-bar-btn span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tools-bar-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 1 auto;
+  min-width: 0;
+  padding-left: 8px;
+  border-left: 1px solid var(--sep-2);
+  color: var(--text-3);
+  font-size: var(--fs-tiny);
+  line-height: var(--lh-tiny);
+  white-space: nowrap;
+}
+
+.tools-bar-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-3);
+  flex: none;
+}
+
+.tools-bar-dot.busy {
+  background: var(--warn);
+  box-shadow: 0 0 0 3px var(--warn-glow);
+}
+
+.tools-bar-state {
+  color: var(--text-2);
+}
+
+.tools-bar-last {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---------- 两栏：折叠区 + 任务侧栏 ---------- */
+
+.tools-deck {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 360px;
+  gap: 12px;
+  /* 折叠之后两栏自然高度接近（左 350px / 右 400px 量级），靠 align-items:start
+     让它们各自按内容收口即可；不要硬拉满视口——那会把「任务结果」撑成一块
+     巨大的空白输出框，比原来的高度差更难看。 */
+  align-items: start;
+  padding: 0 22px;
+}
+
+.tools-deck-main {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.tools-rail {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* 输出区是这一页的主视野之一（IDE 的终端面板）：给足高度，
+   让右栏与左侧折叠列表在默认展开态下高度接近。 */
+.tools-rail .tools-output {
+  min-height: 300px;
+  max-height: 460px;
+}
+
+/* 最近任务列表跟着任务结果的高度收口，不留一块空白卡片。 */
+.tools-rail > .panel:last-child .panel-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* ---------- 折叠区块 ---------- */
+
+.tools-fold {
+  background: var(--panel-bg);
+  border: 1px solid var(--sep-1);
+  border-radius: var(--radius-l);
+  box-shadow: var(--shadow-1);
+  overflow: hidden;
+  min-width: 0;
+}
+
+.tools-fold-wide {
+  margin: 0 22px;
+}
+
+.tools-fold-sum {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 38px;
+  padding: 0 12px;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.tools-fold-sum::-webkit-details-marker {
+  display: none;
+}
+
+.tools-fold-sum:hover {
+  background: var(--fill-1);
+}
+
+.tools-fold-sum:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.tools-fold-chev {
+  width: 14px;
+  height: 14px;
+  flex: none;
+  color: var(--text-3);
+  transition: transform 0.15s ease, color 0.15s ease;
+}
+
+.tools-fold[open] .tools-fold-chev {
+  transform: rotate(90deg);
+  color: var(--text-2);
+}
+
+.tools-fold-title {
+  flex: none;
+  font-size: var(--fs-item);
+  line-height: var(--lh-item);
+  font-weight: 600;
+  color: var(--text-1);
+  white-space: nowrap;
+}
+
+/* 摘要行：折叠时它就是这一块的「一行说明」，所以必须单行省略而不是换行。 */
+.tools-fold-meta {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-3);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-meta);
+}
+
+.tools-fold-trail {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+
+.tools-fold-btn {
+  height: var(--btn-h-sm);
+  min-height: var(--btn-h-sm);
+  padding: 0 8px;
+}
+
+/* 带标签的字段：折叠正文里每个控件都要有常驻 label，不能只靠 placeholder。 */
+.tools-fold-body .tools-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+
+.tools-field-label {
+  color: var(--text-3);
+  font-size: var(--fs-tiny);
+  line-height: var(--lh-tiny);
+  letter-spacing: 0.2px;
+}
+
+.tools-fold-body .tools-field > input,
+.tools-fold-body .tools-field > select,
+.tools-fold-body .tools-field > .tools-grid-row,
+.tools-fold-body .tools-field > .tools-row,
+.tools-fold-body .tools-field > .tools-xyz,
+.tools-fold-body .tools-field > .tools-ai-row {
+  width: 100%;
+}
+
+/* 危险操作统一落在区块末尾并靠右，与高频主按钮分开。 */
+.tools-fold[open] .tools-fold-btn {
+  display: none;
+}
+
+.tools-fold-note {
+  color: var(--text-3);
+  font-size: var(--fs-tiny);
+  white-space: nowrap;
+}
+
+.tools-fold-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px 12px;
+  border-top: 1px solid var(--sep-2);
+}
+
+/* 危险操作统一落在区块末尾并靠右，与高频主按钮分开。 */
+.tools-fold-foot {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.tools-fold-foot .btn {
+  flex: 0 0 auto;
+}
+
+@media (max-width: 1100px) {
+  .tools-deck {
+    grid-template-columns: 1fr;
+  }
+
+  /* 窄屏侧栏落到下方，输出区不需要为了「陪衬左栏」保留 300px。 */
+  .tools-rail .tools-output {
+    min-height: 160px;
+    max-height: 320px;
+  }
+}
+
+@media (max-width: 640px) {
+  .tools-bar,
+  .tools-head,
+  .tools-deck,
+  .tools-fold-wide {
+    margin-left: 0;
+    margin-right: 0;
+  }
+
+  .tools-deck,
+  .tools-head {
+    padding-left: 0;
+    padding-right: 0;
+  }
+
+  .tools-bar-meta {
+    border-left: 0;
+    padding-left: 0;
+  }
+
+  .tools-fold-btn {
+    display: none;
+  }
+}

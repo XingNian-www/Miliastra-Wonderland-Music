@@ -368,16 +368,25 @@ pub(crate) struct PlaybackControllerSnapshot {
 }
 
 impl PlaybackCommand {
+    /// 「删除」是好友会话专用的隐藏命令，大厅身份不能触发（`parse_hall` 认它，
+    /// 所以门控必须在这里，不能靠前缀表缺项来表达）。
+    const FRIEND_ONLY_PREFIX: &str = "删除";
+
     pub(crate) fn claims_chat(envelope: &CommandEnvelope) -> bool {
         if envelope.prefix() != CommandPrefix::At {
             return false;
         }
+        let text = envelope.command_text();
         match envelope.authority() {
-            CommandAuthority::HallMember => PLAYBACK_COMMAND_PREFIXES
+            // 前缀表不再手写：它曾被证明与 `command_catalog::PLAYBACK` 的
+            // name+aliases 全集逐字等价（21 条，两个方向都无差集），
+            // 因此改为直接从命令表派生——新增播放命令只需登记一次。
+            CommandAuthority::HallMember => crate::features::command_catalog::PLAYBACK
                 .iter()
-                .filter(|prefix| **prefix != "删除")
-                .any(|prefix| envelope.command_text().starts_with(prefix)),
-            CommandAuthority::Friend => envelope.command_text() == "删除",
+                .flat_map(|spec| spec.all_names())
+                .filter(|name| *name != Self::FRIEND_ONLY_PREFIX)
+                .any(|name| text.starts_with(name)),
+            CommandAuthority::Friend => text == Self::FRIEND_ONLY_PREFIX,
         }
     }
 
@@ -484,30 +493,6 @@ impl PlaybackCommand {
         }
     }
 }
-
-const PLAYBACK_COMMAND_PREFIXES: &[&str] = &[
-    "队列删除",
-    "队列清空",
-    "下一首",
-    "下一曲",
-    "删除",
-    "上一首",
-    "上一曲",
-    "暂停",
-    "继续",
-    "恢复",
-    "播放",
-    "音量",
-    "状态",
-    "切换",
-    "停止歌词",
-    "后台歌词",
-    "单曲歌词",
-    "持续歌词",
-    "歌词",
-    "队列",
-    "列表",
-];
 
 fn parse_queue_indexes(argument: &str) -> Vec<usize> {
     argument
@@ -1181,8 +1166,13 @@ pub(crate) use application::{
 };
 
 #[cfg(test)]
+#[path = "claim_tests.rs"]
+mod claim_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::features::playback::state::ObservationReliability;
     use miliastra_kernel::clock::SystemClock;
     use std::fs;

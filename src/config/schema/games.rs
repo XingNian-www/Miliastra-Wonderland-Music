@@ -257,13 +257,9 @@ pub(super) fn turtle_soup_section() -> Vec<ConfigFieldSchema> {
         ConfigFieldSchema::db_idle_reload(
             "reasoning",
             "思考强度",
-            FieldKind::Enum(vec![
-                ("unset".to_string(), "不指定（服务端默认）".to_string()),
-                ("minimal".to_string(), "最低".to_string()),
-                ("low".to_string(), "低".to_string()),
-                ("medium".to_string(), "中".to_string()),
-                ("high".to_string(), "高".to_string()),
-            ]),
+            // 与 ai / 点歌 / 审核三处共用同一张表（W4a 的 `REASONING_EFFORTS`），
+            // 不再手抄第四份下拉；选项文案由 `ReasoningEffort::panel_options` 提供。
+            FieldKind::Enum(crate::config::ai::ReasoningEffort::panel_options()),
             "海龟汤裁决的思考强度；留空跟随服务端默认。裁决逻辑复杂，通常用中或高",
         ),
         ConfigFieldSchema::db_idle_reload(

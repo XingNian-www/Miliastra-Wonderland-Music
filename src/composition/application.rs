@@ -555,73 +555,15 @@ impl HttpReloadGates {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-enum ShutdownReason {
-    Running = 0,
-    ConfigReload = 1,
-    ConfigReloadWithStartup = 2,
-    UserExit = 3,
-}
+/// 关停原因、关停顺序数据与有界等待（架构重构 W1a 前置）。
+///
+/// 这四样东西原先散在 `application.rs`（reason 状态机）与 `lifecycle.rs`（19 步手写
+/// 关停 + 两处无界 `join`）里，顺序只靠注释维系。搬到独立模块后：
+/// [`ShutdownReason`] / [`ShutdownState`] 的 4 态与收尾分叉表、[`SHUTDOWN_STEPS`]
+/// 的 golden 顺序、[`join_worker_threads`] 的有界 join 各自只有一处定义。
+mod shutdown;
 
-#[derive(Clone, Debug)]
-pub(in crate::composition) struct ShutdownState {
-    reason: Arc<AtomicU8>,
-}
-
-impl ShutdownState {
-    fn new() -> Self {
-        Self {
-            reason: Arc::new(AtomicU8::new(ShutdownReason::Running as u8)),
-        }
-    }
-
-    fn reason(&self) -> ShutdownReason {
-        match self.reason.load(AtomicOrdering::SeqCst) {
-            value if value == ShutdownReason::Running as u8 => ShutdownReason::Running,
-            value if value == ShutdownReason::ConfigReload as u8 => ShutdownReason::ConfigReload,
-            value if value == ShutdownReason::ConfigReloadWithStartup as u8 => {
-                ShutdownReason::ConfigReloadWithStartup
-            }
-            value if value == ShutdownReason::UserExit as u8 => ShutdownReason::UserExit,
-            value => panic!("invalid shutdown reason value: {value}"),
-        }
-    }
-
-    fn try_claim_config_reload(&self) -> bool {
-        self.reason
-            .compare_exchange(
-                ShutdownReason::Running as u8,
-                ShutdownReason::ConfigReload as u8,
-                AtomicOrdering::SeqCst,
-                AtomicOrdering::SeqCst,
-            )
-            .is_ok()
-    }
-
-    fn release_config_reload_claim(&self) {
-        let _ = self.reason.compare_exchange(
-            ShutdownReason::ConfigReload as u8,
-            ShutdownReason::Running as u8,
-            AtomicOrdering::SeqCst,
-            AtomicOrdering::SeqCst,
-        );
-    }
-
-    fn require_startup_after_reload(&self) {
-        let _ = self.reason.compare_exchange(
-            ShutdownReason::ConfigReload as u8,
-            ShutdownReason::ConfigReloadWithStartup as u8,
-            AtomicOrdering::SeqCst,
-            AtomicOrdering::SeqCst,
-        );
-    }
-
-    fn request_user_exit(&self) {
-        self.reason
-            .store(ShutdownReason::UserExit as u8, AtomicOrdering::SeqCst);
-    }
-}
+pub(in crate::composition) use shutdown::{ShutdownReason, ShutdownState};
 
 /// 配置重载替代进程发布就绪前必须完成的启动动作。
 ///

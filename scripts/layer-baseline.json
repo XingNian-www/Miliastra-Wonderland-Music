@@ -501,10 +501,6 @@
           "count": 8
         },
         {
-          "path": "src/composition/application/lifecycle.rs",
-          "count": 1
-        },
-        {
           "path": "src/composition/application/listener/loop_driver.rs",
           "count": 1
         },
@@ -518,6 +514,10 @@
         },
         {
           "path": "src/composition/application/shared_observer.rs",
+          "count": 1
+        },
+        {
+          "path": "src/composition/application/shutdown.rs",
           "count": 1
         },
         {
@@ -825,6 +825,10 @@
           "count": 1
         },
         {
+          "path": "src/features/reply_template/custom.rs",
+          "count": 1
+        },
+        {
           "path": "src/features/reply_template/mod.rs",
           "count": 3
         },
@@ -1120,7 +1124,7 @@
         },
         {
           "path": "src/interfaces/http/routes/commands.rs",
-          "count": 21
+          "count": 24
         },
         {
           "path": "src/interfaces/http/routes/config.rs",
@@ -2032,7 +2036,7 @@
       "pub_items": 21
     },
     "src/composition/application.rs": {
-      "lines": 3327,
+      "lines": 3269,
       "pub_items": 33
     },
     "src/composition/application/ai_chat_commands.rs": {
@@ -2064,7 +2068,7 @@
       "pub_items": 22
     },
     "src/composition/application/lifecycle.rs": {
-      "lines": 384,
+      "lines": 336,
       "pub_items": 1
     },
     "src/composition/application/moderation.rs": {
@@ -2086,6 +2090,10 @@
     "src/composition/application/shared_observer.rs": {
       "lines": 699,
       "pub_items": 2
+    },
+    "src/composition/application/shutdown.rs": {
+      "lines": 587,
+      "pub_items": 34
     },
     "src/composition/application/song_request_port.rs": {
       "lines": 251,
@@ -2483,6 +2491,10 @@
       "lines": 1033,
       "pub_items": 74
     },
+    "src/features/reply_template/custom.rs": {
+      "lines": 724,
+      "pub_items": 15
+    },
     "src/features/reply_template/hall.rs": {
       "lines": 175,
       "pub_items": 10
@@ -2492,8 +2504,8 @@
       "pub_items": 27
     },
     "src/features/reply_template/mod.rs": {
-      "lines": 1683,
-      "pub_items": 45
+      "lines": 1688,
+      "pub_items": 46
     },
     "src/features/reply_template/moderation.rs": {
       "lines": 37,
@@ -2628,7 +2640,7 @@
       "pub_items": 30
     },
     "src/interfaces/http/routes/commands.rs": {
-      "lines": 778,
+      "lines": 800,
       "pub_items": 4
     },
     "src/interfaces/http/routes/config.rs": {

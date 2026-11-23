@@ -1,7 +1,10 @@
 use super::ShutdownReason;
+use super::shutdown::{
+    SHUTDOWN_JOIN_BUDGET, ShutdownHandles, ShutdownReport, ShutdownStep, WorkerThread,
+    join_worker_threads,
+};
 use super::*;
 use crate::RunOutcome;
-use crate::runtime::ui::panic_payload_text;
 
 fn should_run_startup_automation(
     config_reload_child: bool,
@@ -11,43 +14,35 @@ fn should_run_startup_automation(
     !config_reload_child || reload_requires_startup || !reusable_window_available
 }
 
+/// 收尾：把 `run()` 的并发结果映射成进程退出结论。
+///
+/// 4 态的**按原因分叉**在这里只查表（[`ShutdownReason::finale`]），不再手写 match：
+/// 「哪种原因该吞掉收尾错误」是一个数据事实（见 `shutdown.rs` 的类型文档表），
+/// 散在 match 里就会有人只改一处。
 fn committed_run_result(result: Result<()>, reason: ShutdownReason) -> Result<RunOutcome> {
-    match (result, reason) {
-        (Err(error), ShutdownReason::ConfigReload | ShutdownReason::ConfigReloadWithStartup) => {
-            // 任务引擎停止接收工作后，进程替代不可逆。即使最后一次转发失败，也要保留看门狗交接信息。
-            log::error!(
-                "配置重载已提交，但关停收尾出错（步骤：提交重载后关停各子系统），部分子系统可能没有干净退出：{error:#}"
-            );
-            Ok(match reason {
-                ShutdownReason::ConfigReload => RunOutcome::Reload,
-                ShutdownReason::ConfigReloadWithStartup => RunOutcome::ReloadWithStartup,
-                _ => unreachable!(),
-            })
-        }
-        (Err(error), ShutdownReason::UserExit) => {
-            // 并发收尾失败不能把用户明确退出变成看门狗错误恢复，重新启动刚被用户停止的进程。
-            log::error!(
-                "用户退出已提交，但关停收尾出错（步骤：提交退出后关停各子系统），部分子系统可能没有干净退出：{error:#}"
-            );
-            Ok(RunOutcome::Stopped)
-        }
-        (result, ShutdownReason::Running) => result.map(|()| RunOutcome::Stopped),
-        (Ok(()), ShutdownReason::ConfigReload) => Ok(RunOutcome::Reload),
-        (Ok(()), ShutdownReason::ConfigReloadWithStartup) => Ok(RunOutcome::ReloadWithStartup),
-        (Ok(()), ShutdownReason::UserExit) => Ok(RunOutcome::Stopped),
+    let finale = reason.finale();
+    match result {
+        Ok(()) => Ok(finale.outcome),
+        Err(error) => match finale.tail_error_prefix {
+            // 收尾阶段出错：进程替代已提交、不可逆，因此保留原结论 + 记 error。
+            Some(prefix) => {
+                log::error!("{prefix}{error:#}");
+                Ok(finale.outcome)
+            }
+            // `Running` 是普通运行期，收尾错误照常上抛给看门狗做错误恢复。
+            None => Err(error),
+        },
     }
 }
 
 impl ApplicationRuntime {
     pub(crate) fn run(&mut self) -> Result<RunOutcome> {
-        let mut deferred_chat_sender = None;
-        let mut playback_monitor = None;
-        let mut shared_chat_observer = None;
+        let mut handles = ShutdownHandles::default();
         let mut shared_chat_subscriber = None;
         let result = (|| -> Result<()> {
             self.start_formal_task_runtime()?;
             shared_chat_subscriber = Some(self.ui.chat_timeline.subscribe_business()?);
-            shared_chat_observer = Some(self.start_shared_chat_observer()?);
+            handles.shared_chat_observer = Some(self.start_shared_chat_observer()?);
             self.shared
                 .monitor
                 .publish(MonitorEvent::Status("运行中".to_string()));
@@ -93,20 +88,83 @@ impl ApplicationRuntime {
                     )
                 }
             }
-            deferred_chat_sender = Some(self.start_deferred_chat_sender());
-            playback_monitor = Some(self.start_playback_monitor());
+            handles.deferred_chat_sender = Some(WorkerThread::new(
+                "deferred-chat-sender",
+                self.start_deferred_chat_sender(),
+                "延迟聊天发送线程崩溃（步骤：关停时等待线程退出），排队中的回复没能发出，\
+本次关停无法正常收尾：",
+            ));
+            handles.playback_monitor = Some(WorkerThread::new(
+                "playback-monitor",
+                self.start_playback_monitor(),
+                "播放监控线程崩溃（步骤：关停时等待线程退出），本次关停可能不完整，\
+播放状态可能停在最后已知值：",
+            ));
             self.run_scan_loop(
                 shared_chat_subscriber
                     .take()
                     .context("shared chat subscriber unavailable")?,
             )
         })();
-        drop(shared_chat_observer.take());
-        // 外部聊天源必须在观察线程**停稳之后**才关：外部源线程退出路径会
+        let reason = self.shared.shutdown.reason();
+        let report = self.shutdown_all(reason, SHUTDOWN_JOIN_BUDGET, &mut handles);
+        let finale = reason.finale();
+        self.shared
+            .monitor
+            .publish(MonitorEvent::Status(finale.status_label.to_string()));
+        // 预算内全都退出是**常态**，只在 debug 留一行；超期才值得人看（`shutdown_all` 已逐条 warn）。
+        if report.timed_out() {
+            log::warn!(
+                "本次关停有 {} 条线程未在预算内退出（{}），进程不再等待它们",
+                report.detached().len(),
+                report.detached().join("、")
+            );
+        } else {
+            log::debug!(
+                "关停序列已完成：{} 步 / {} ms",
+                report.steps(),
+                report.elapsed().as_millis()
+            );
+        }
+        committed_run_result(result, reason)
+    }
+
+    /// **唯一**的关停入口：19 步按 [`super::shutdown::SHUTDOWN_STEPS`] 的固定顺序执行。
+    ///
+    /// 行为契约（W1a 前置，尚未进 supervisor）：
+    ///
+    /// - **顺序**逐项等于 golden 数据（`lifecycle_tests::shutdown_order_matches_the_golden_sequence`）。
+    /// - **默认路径完全等价**于拆分前的 19 段手写关停：每一步的动作、日志文案、
+    ///   返回类型处理逐字保留。
+    /// - **唯一新增语义**：两处曾经无界的 `join()` 现在有预算；超期只 warn + 记账，
+    ///   **绝不**提前 `return`（超期线程排在序列中段，提前返回会把业务/UI/OCR/播放器
+    ///   全部丢下不关）。
+    /// - `reason` 目前**不改变**序列（4 态共用同一序列）；它只被记录与转交，
+    ///   收尾分叉在 [`ShutdownReason::finale`]。这是 W1 要重新审视的那条边界，
+    ///   眼下先显式化参数，避免 supervisor 落地时再改一次调用点。
+    fn shutdown_all(
+        &mut self,
+        reason: ShutdownReason,
+        budget: Duration,
+        handles: &mut ShutdownHandles,
+    ) -> ShutdownReport {
+        let mut report = ShutdownReport::new(budget);
+        let exit = reason.finale().outcome;
+        log::debug!(
+            "开始关停（原因：{reason:?}，退出码：{}，预算：{} ms）",
+            exit.exit_code(),
+            budget.as_millis()
+        );
+
+        // 1. 共享聊天观察线程：靠 `Drop` 停 + join 自己的线程。
+        drop(handles.shared_chat_observer.take());
+        report.enter(ShutdownStep::SharedChatObserver);
+
+        // 2. 外部聊天源必须在观察线程**停稳之后**才关：外部源线程退出路径会
         // `set_active(false)`，此时若观察线程还在跑，它会在关停那一瞬间判定
         // 「外部源不再接管」而回落到 OCR 扫描——关停期平白多一次截图与识别，
         // 日志里还会出现误导性的 OCR 噪音。先 join 观察线程，外部源状态就一直
-        // 保持到没有读侧为止。
+        // 保持到没有读侧为止。顺序理由全表见 `shutdown.rs` 的 [`SHUTDOWN_STEPS`]。
         if let Some(external_chat_workers) = self.owned.external_chat_workers.take() {
             let started = external_chat_workers.started();
             external_chat_workers.shutdown();
@@ -114,15 +172,27 @@ impl ApplicationRuntime {
                 log::info!("外部聊天源后台线程已全部退出（共 {started} 条）");
             }
         }
+        report.enter(ShutdownStep::ExternalChatWorkers);
+
+        // 3. 全局运行标志：先让各循环在等待时看见「该走了」。
         self.shared.running.store(false, AtomicOrdering::SeqCst);
+        report.enter(ShutdownStep::RunningFlag);
+
+        // 4. 唤醒任务引擎等待线程（失败只影响唤醒延迟，不阻断关停）。
         if let Err(error) = self.business.task_engine.wake() {
             log::debug!("关停时唤醒任务引擎等待线程失败：{error}");
         }
+        report.enter(ShutdownStep::TaskEngineWake);
+
+        // 5. 后台歌词线程。
         if let Err(error) = self.business.background_lyrics.stop_all() {
             log::error!(
                 "后台歌词线程关闭失败（步骤：关停后台歌词），可能有线程残留，进程退出时会被系统强制回收：{error:#}"
             );
         }
+        report.enter(ShutdownStep::BackgroundLyrics);
+
+        // 6. 全局热键。
         if let Some(hotkeys) = self.owned.hotkeys.take()
             && let Err(error) = hotkeys.shutdown()
         {
@@ -130,32 +200,36 @@ impl ApplicationRuntime {
                 "全局热键线程关闭失败（步骤：关停热键监听），热键可能占用到进程结束：{error:#}"
             );
         }
+        report.enter(ShutdownStep::Hotkeys);
+
+        // 7. HTTP 面板（自带 5 秒宽限，超期 warn 后返回 Ok）。
         if let Some(http_server) = self.owned.http_server.take()
             && let Err(error) = http_server.shutdown()
         {
             log::error!("HTTP 面板关闭失败（步骤：关停 Web 服务），端口可能仍被占用：{error:#}");
         }
-        if let Some(deferred_chat_sender) = deferred_chat_sender
-            && let Err(error) = deferred_chat_sender.join()
-        {
-            // panic 载荷是判断「为什么崩」的唯一线索，不能丢；
-            // 统一转成可读文本，与 monitor 投影线程的写法保持一致。
-            log::error!(
-                "延迟聊天发送线程崩溃（步骤：关停时等待线程退出），排队中的回复没能发出，\
-本次关停无法正常收尾：{}",
-                panic_payload_text(error.as_ref())
-            );
-        }
-        if let Some(playback_monitor) = playback_monitor
-            && let Err(error) = playback_monitor.join()
-        {
-            log::error!(
-                "播放监控线程崩溃（步骤：关停时等待线程退出），本次关停可能不完整，\
-播放状态可能停在最后已知值：{}",
-                panic_payload_text(error.as_ref())
-            );
-        }
+        report.enter(ShutdownStep::HttpServer);
+
+        // 8–9. 两处曾经**无界**的裸线程 join。
+        //
+        // 拆出来合成一次有界等待：预算均分给两条线程，超期只 warn + 记账，
+        // 且**继续**执行第 10 步起的所有关停（这是本波唯一的行为变更）。
+        let workers = [
+            handles.deferred_chat_sender.take(),
+            handles.playback_monitor.take(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        report.enter(ShutdownStep::DeferredChatSender);
+        join_worker_threads(workers, budget, &mut report);
+        report.enter(ShutdownStep::PlaybackMonitor);
+
+        // 10. 管理投票线程（自带逐条 join，失败逐条记账）。
         self.join_moderation_workers();
+        report.enter(ShutdownStep::ModerationWorkers);
+
+        // 11. 正式任务运行时（超期 warn，继续关停其余运行时）。
         if let Some(runtime) = self.owned.formal_task_runtime.take() {
             match runtime.shutdown() {
                 Ok(report) if report.timed_out() => log::error!(
@@ -167,7 +241,13 @@ impl ApplicationRuntime {
                 ),
             }
         }
+        report.enter(ShutdownStep::FormalTaskRuntime);
+
+        // 12. 落在业务运行时**之前**：值守模式要读业务运行时的快照。
         self.persist_current_chat_listener_mode();
+        report.enter(ShutdownStep::ListenerModePersist);
+
+        // 13. 业务运行时（丢了期限是 warn，其它错误是 error）。
         if let Some(business_runtime) = self.owned.business_runtime.take() {
             match business_runtime.shutdown() {
                 Ok(snapshot) => log::info!(
@@ -182,6 +262,9 @@ impl ApplicationRuntime {
                 ),
             }
         }
+        report.enter(ShutdownStep::BusinessRuntime);
+
+        // 14. UI 运行时（自带 2 秒宽限 + detach 记账）。
         if let Some(ui_runtime) = self.owned.ui_runtime.take() {
             match ui_runtime.shutdown() {
                 Ok(report) if report.timed_out() => log::warn!(
@@ -194,6 +277,9 @@ impl ApplicationRuntime {
                 ),
             }
         }
+        report.enter(ShutdownStep::UiRuntime);
+
+        // 15. OCR 运行时（自带宽限，超期 `timed_out`）。
         if let Some(ocr_runtime) = self.owned.ocr_runtime.take() {
             match ocr_runtime.shutdown() {
                 Ok(report) if report.timed_out => {
@@ -207,14 +293,23 @@ impl ApplicationRuntime {
                 _ => {}
             }
         }
+        report.enter(ShutdownStep::OcrRuntime);
+
+        // 16. 播放器运行时。
         if let Some(player_runtime) = self.owned.player_runtime.take()
             && let Err(error) = player_runtime.shutdown()
         {
             log::error!("播放器运行时关闭失败（步骤：关停播放器），播放状态可能没有保存：{error}");
         }
+        report.enter(ShutdownStep::PlayerRuntime);
+
+        // 17. 登录助手（子进程 + 管道排空）。
         if let Err(error) = self.playback.login_helper.shutdown() {
             log::error!("登录助手关闭失败（步骤：关停登录助手），助手线程可能残留：{error}");
         }
+        report.enter(ShutdownStep::LoginHelper);
+
+        // 18. 原生播放器（音频设备）。
         if let Some(native_playback) = self.owned.native_playback_runtime.take()
             && let Err(error) = native_playback.shutdown()
         {
@@ -222,163 +317,20 @@ impl ApplicationRuntime {
                 "原生播放器关闭失败（步骤：关停原生播放器），音频设备可能仍被占用：{error:#}"
             );
         }
+        report.enter(ShutdownStep::NativePlayback);
+
+        // 19. OpenAI 运行时（最后：不改其它组件状态，失败仅 warn 级）。
         if let Some(openai_runtime) = self.owned.openai_runtime.take() {
             openai_runtime.shutdown();
             log::info!("OpenAI 运行时已正常关闭");
         }
-        let shutdown_reason = self.shared.shutdown.reason();
-        let outcome = match shutdown_reason {
-            ShutdownReason::ConfigReload => RunOutcome::Reload,
-            ShutdownReason::ConfigReloadWithStartup => RunOutcome::ReloadWithStartup,
-            ShutdownReason::Running | ShutdownReason::UserExit => RunOutcome::Stopped,
-        };
-        let status = match outcome {
-            RunOutcome::Stopped => "已退出",
-            RunOutcome::Reload | RunOutcome::ReloadWithStartup => "配置重载关停完成",
-        };
-        self.shared
-            .monitor
-            .publish(MonitorEvent::Status(status.to_string()));
-        committed_run_result(result, shutdown_reason)
+        report.enter(ShutdownStep::OpenAiRuntime);
+
+        report.finish();
+        report
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use anyhow::anyhow;
-
-    use super::{
-        ReloadStartupActions, ReloadStartupGate, ShutdownReason, ShutdownState,
-        committed_run_result, should_run_startup_automation,
-    };
-    use crate::RunOutcome;
-    use crate::features::startup::StartupTaskKind;
-
-    #[test]
-    fn config_reload_child_skips_cold_start_only_with_a_reusable_window() {
-        assert!(should_run_startup_automation(false, false, false));
-        assert!(should_run_startup_automation(false, false, true));
-        assert!(should_run_startup_automation(true, false, false));
-        assert!(!should_run_startup_automation(true, false, true));
-        assert!(should_run_startup_automation(true, true, true));
-    }
-
-    #[test]
-    fn reload_startup_gate_requires_every_requested_action_to_succeed() {
-        let gate = ReloadStartupGate::default();
-        let required = ReloadStartupActions::from_flags(true, true, true);
-        gate.require(required);
-
-        assert_eq!(gate.required_actions(), required);
-        assert_eq!(gate.missing_actions(), required);
-        assert!(!gate.is_satisfied());
-
-        gate.record_success(StartupTaskKind::StartGame);
-        assert!(gate.missing_actions().includes_enter_wonderland());
-        assert!(!gate.missing_actions().includes_start_game());
-        assert!(!gate.is_satisfied());
-
-        gate.record_success(StartupTaskKind::EnterWonderland);
-        assert!(gate.is_satisfied());
-    }
-
-    #[test]
-    fn disabled_startup_has_no_reload_ready_gate() {
-        let gate = ReloadStartupGate::default();
-        let actions = ReloadStartupActions::from_flags(false, true, true);
-        assert!(actions.is_empty());
-        gate.require(actions);
-        assert!(gate.is_satisfied());
-    }
-
-    #[test]
-    fn automatic_entry_is_not_unconditionally_queued_at_startup() {
-        let mut config = crate::config::AppConfig::default();
-        config.startup.enabled = true;
-        config.startup.enter_game = true;
-        config.startup.enter_wonderland = true;
-        config.startup.launch_game = false;
-        assert!(ReloadStartupActions::from_startup_config(&config).is_empty());
-        config.startup.launch_game = true;
-        let actions = ReloadStartupActions::from_startup_config(&config);
-        assert!(actions.includes_start_game());
-        assert!(!actions.includes_enter_wonderland());
-    }
-
-    #[test]
-    fn startup_success_before_a_reload_requirement_does_not_acknowledge_it() {
-        let gate = ReloadStartupGate::default();
-        gate.record_success(StartupTaskKind::StartGame);
-        gate.require(ReloadStartupActions::from_flags(true, true, false));
-
-        assert!(!gate.is_satisfied());
-        assert!(gate.missing_actions().includes_start_game());
-    }
-
-    #[test]
-    fn user_exit_wins_before_or_after_a_reload_claim() {
-        let exit_first = ShutdownState::new();
-        exit_first.request_user_exit();
-        assert!(!exit_first.try_claim_config_reload());
-        assert_eq!(exit_first.reason(), ShutdownReason::UserExit);
-
-        let reload_first = ShutdownState::new();
-        assert!(reload_first.try_claim_config_reload());
-        reload_first.request_user_exit();
-        reload_first.release_config_reload_claim();
-        assert_eq!(reload_first.reason(), ShutdownReason::UserExit);
-    }
-
-    #[test]
-    fn an_abandoned_reload_claim_can_be_retried() {
-        let shutdown = ShutdownState::new();
-        assert!(shutdown.try_claim_config_reload());
-        shutdown.release_config_reload_claim();
-        assert_eq!(shutdown.reason(), ShutdownReason::Running);
-        assert!(shutdown.try_claim_config_reload());
-        assert_eq!(shutdown.reason(), ShutdownReason::ConfigReload);
-    }
-
-    #[test]
-    fn committed_reload_can_require_startup_without_overriding_user_exit() {
-        let shutdown = ShutdownState::new();
-        assert!(shutdown.try_claim_config_reload());
-        shutdown.require_startup_after_reload();
-        assert_eq!(shutdown.reason(), ShutdownReason::ConfigReloadWithStartup);
-        assert_eq!(
-            committed_run_result(Ok(()), shutdown.reason()).unwrap(),
-            RunOutcome::ReloadWithStartup
-        );
-
-        shutdown.request_user_exit();
-        assert_eq!(shutdown.reason(), ShutdownReason::UserExit);
-    }
-
-    #[test]
-    fn committed_reload_keeps_its_exit_outcome_after_a_tail_error() {
-        assert_eq!(
-            committed_run_result(
-                Err(anyhow!("final forward failed")),
-                ShutdownReason::ConfigReload,
-            )
-            .unwrap(),
-            RunOutcome::Reload
-        );
-        assert!(
-            committed_run_result(Err(anyhow!("ordinary failure")), ShutdownReason::Running)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn committed_user_exit_ignores_a_concurrent_tail_error() {
-        assert_eq!(
-            committed_run_result(
-                Err(anyhow!("final forward failed")),
-                ShutdownReason::UserExit,
-            )
-            .unwrap(),
-            RunOutcome::Stopped
-        );
-    }
-}
+#[path = "lifecycle_tests.rs"]
+mod lifecycle_tests;

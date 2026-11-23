@@ -3,6 +3,7 @@
 // 草稿形状是 `{ 命令 id: 回复行数组 }`；只有改过的命令才进草稿。
 // 保存时过滤掉 active === false 的行（停用 = 不提交），并带上 baseRevision 做乐观并发。
 
+import { customReplyKey } from '../util/replyKey.js'
 import { computed, nextTick, ref } from 'vue'
 import { getJson, requestJson } from '../api.js'
 import { handleAuth, toast } from '../store.js'
@@ -134,7 +135,9 @@ export function useCommandReplies({ selectedEntry, ensureSelection, hasReplyDraf
     if (!target || savingReplies.value) return
     const rows = target.rows.slice()
     rows.push({
-      key: `custom:${Date.now().toString(36)}`,
+      // 自定义回复必须落在 `custom.<命名空间>.<名字>` 命名空间里才查得到
+      // （后端 `custom::override_slot` 只认这个前缀）。
+      key: customReplyKey(target.id),
       text: '',
       defaultText: null,
       editable: true,

@@ -418,9 +418,9 @@ mod tests {
 
     /// 连发 200 条 deferred 控制命令后，completion 线程数不随命令数增长。
     ///
-    /// 旧实现每条命令起一条 `player-control-completion` 线程（本用例下全部卡在
-    /// 闸门上，可观测到 ~200 条）；新实现只有 1 条常驻 lane。阈值留 8 条余量，
-    /// 以容忍并行测试里其它 runtime 短暂启动的同名线程。
+    /// 旧实现每条命令起一条线程（此处全卡在闸门上，可观测到 ~200 条）；新实现 1 条常驻 lane。
+    ///
+    /// 阈值 64：`/proc/self/task` 是进程级视图，并行跑时他人 runtime 也贡献同前缀线程（曾假红在 `+8`）；要判别的是 200 vs 1 的数量级爆炸，64 够且抗噪。
     #[cfg(target_os = "linux")]
     #[test]
     fn control_completion_thread_count_is_constant() {
@@ -460,7 +460,7 @@ mod tests {
         while Instant::now() < deadline {
             let current = count_named(NAME);
             peak = peak.max(current);
-            if current > before + 8 {
+            if current > before + 64 {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -469,7 +469,7 @@ mod tests {
         runtime.shutdown().unwrap();
 
         assert!(
-            peak <= before + 8,
+            peak <= before + 64,
             "200 条控制命令后 completion 线程数从 {before} 涨到 {peak}：线程数必须恒定"
         );
     }

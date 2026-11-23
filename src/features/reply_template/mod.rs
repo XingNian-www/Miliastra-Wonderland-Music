@@ -19,6 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 // 按消费模块拆分的模板文件：每个模块只写自己的文件，避免并行开发时互相覆盖。
 pub(crate) mod card_games;
+pub(crate) mod custom; // W6a：`custom.<namespace>.<key>` 零编译扩展命名空间
 pub(crate) mod hall;
 pub(crate) mod idiom_chain;
 pub(crate) mod moderation;
@@ -841,6 +842,10 @@ pub(crate) fn stored_override(
     stored: &std::collections::BTreeMap<String, Vec<crate::config::StoredReply>>,
     key: &str,
 ) -> Option<String> {
+    // 自定义命名空间与覆盖槽优先，顺序见 `custom` 模块文档。
+    if let Some(text) = custom::override_slot(stored, key) {
+        return Some(text);
+    }
     let entry = command_reply_entry_for_key(key)?;
     let text = stored
         .get(entry.id)?

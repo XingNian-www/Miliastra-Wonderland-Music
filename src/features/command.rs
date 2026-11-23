@@ -258,7 +258,9 @@ impl<T> FeatureCommandMatch<T> {
 ///
 /// 住在命令模型里（而不是路由层），是因为它描述的是"这条命令属于谁"这一领域事实；
 /// 面板也要用它做分组，而 features 层不该反向依赖 interfaces。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// `Ord` 供路由表的一致性测试去重/判可达（`BTreeSet<ChatCommandModule>`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ChatCommandModule {
     SongRequest,
     Playback,
@@ -329,6 +331,31 @@ impl PrivatePayload {
 }
 
 impl ModuleCommand {
+    /// 这条命令属于哪个业务模块。
+    ///
+    /// 与 [`Self::private_payload`] 同样**不加 `_ =>` 兜底**：新增变体必须显式登记
+    /// 归属，否则编译失败。路由表的 `ChatHandler.module` 与解析产出的归属是否一致
+    /// 由 `interfaces::chat::router` 的 name-driven oracle 校验。
+    pub(crate) fn module(&self) -> ChatCommandModule {
+        match self {
+            Self::SongRequest(_) => ChatCommandModule::SongRequest,
+            Self::Playback(_) => ChatCommandModule::Playback,
+            Self::Hall(_) => ChatCommandModule::Hall,
+            Self::Administration(_) => ChatCommandModule::Administration,
+            Self::IdiomChain(_) => ChatCommandModule::IdiomChain,
+            Self::CardGame(_) => ChatCommandModule::CardGame,
+            Self::TurtleSoup(_) => ChatCommandModule::TurtleSoup,
+            Self::Tarot(_) => ChatCommandModule::Tarot,
+            Self::Playlist(_) => ChatCommandModule::Playlist,
+            Self::Undercover(_) => ChatCommandModule::Undercover,
+            Self::NumberBomb(_) => ChatCommandModule::NumberBomb,
+            Self::Invite(_) => ChatCommandModule::Invite,
+            Self::Moderation(_) => ChatCommandModule::Moderation,
+            Self::CustomWorkflow(_) => ChatCommandModule::CustomWorkflow,
+            Self::AiChat(_) => ChatCommandModule::AiChat,
+        }
+    }
+
     /// 这条命令是否携带私密内容。
     ///
     /// **不要加 `_ =>` 兜底**：那会让新增的 `ModuleCommand` 变体静默落进

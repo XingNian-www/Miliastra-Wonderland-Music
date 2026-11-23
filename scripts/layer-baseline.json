@@ -2300,15 +2300,15 @@
       "pub_items": 2
     },
     "src/features/command.rs": {
-      "lines": 558,
-      "pub_items": 34
+      "lines": 585,
+      "pub_items": 35
     },
     "src/features/command_access.rs": {
       "lines": 1084,
       "pub_items": 17
     },
     "src/features/command_catalog.rs": {
-      "lines": 1550,
+      "lines": 1486,
       "pub_items": 23
     },
     "src/features/custom_workflow.rs": {
@@ -2608,7 +2608,7 @@
       "pub_items": 6
     },
     "src/interfaces/chat/router.rs": {
-      "lines": 1880,
+      "lines": 1884,
       "pub_items": 11
     },
     "src/interfaces/http/facade.rs": {

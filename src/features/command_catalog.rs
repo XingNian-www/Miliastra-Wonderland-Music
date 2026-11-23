@@ -878,7 +878,10 @@ pub(crate) const FRIEND_MISC: &[CommandSpec] = &[
         group: CommandGroup::Administration,
         authorities: FRIEND_ONLY,
         summary: "邀请好友进入大厅",
-        usage: &["@邀请昵称"],
+        // 参数是序号或大厅密码（`docs/user-guide.md` 的 `@邀请1`/`@邀请654321`），
+        // 换成数字示例——原先写 `@邀请昵称`，而解析器只接受数字，面板给出的示例
+        // 根本发不出去（由 `router::alias_oracle_tests` 抓出）。
+        usage: &["@邀请123456"],
         hidden: false,
     },
     CommandSpec {
@@ -1476,75 +1479,8 @@ mod tests {
         .expect("构造信封")
     }
 
-    /// 注册表登记的每条别名，都必须被真实模块的 claims_chat 认领。
-    ///
-    /// 这是"面板显示得出来、游戏里却不认"这类漂移的探针。
-    #[test]
-    fn every_registered_alias_is_claimed_by_a_real_module() {
-        // 带参数的命令（如 @导入QQ歌单<链接>）用裸命令名认领不到，
-        // 因此优先用 spec.usage 里的第一个示例构造信封；示例本身也是登记的一部分。
-        let claimed = |spec: &CommandSpec, name: &str, authority: CommandAuthority| -> bool {
-            let sample = spec
-                .usage
-                .first()
-                .map(|usage| usage.trim_start_matches(['@', '#']))
-                .filter(|usage| !usage.is_empty())
-                .unwrap_or(name);
-            let envelope = envelope_for(sample, spec.prefix, authority);
-            let _ = name;
-            match spec.prefix {
-                CommandPrefix::At => {
-                    crate::features::song_request::SongCommand::claims_chat(&envelope)
-                        || crate::features::playback::PlaybackCommand::claims_chat(&envelope)
-                        || crate::features::hall::HallCommand::claims_chat(&envelope)
-                        || crate::features::administration::AdministrationCommand::claims_chat(
-                            &envelope,
-                        )
-                        || crate::features::playlist::PlaylistCommand::claims_chat(&envelope)
-                        || crate::features::invite::InviteCommand::claims_chat(&envelope)
-                        || crate::features::moderation::ModerationCommand::claims_chat(&envelope)
-                        || crate::features::ai_chat::AiChatCommand::claims_chat(&envelope)
-                }
-                CommandPrefix::Hash => {
-                    // # 开局命令的认领入口是 claims_start_chat（不是 claims_chat），
-                    // 与 router.rs 的 select_hash_module 候选表保持一致。
-                    crate::features::tarot::TarotCommand::claims_chat(&envelope)
-                        || crate::features::idiom_chain::IdiomChainCommand::claims_start_chat(
-                            &envelope,
-                        )
-                        || crate::features::card_games::LandlordCommand::claims_start_chat(
-                            &envelope,
-                        )
-                        || crate::features::turtle_soup::TurtleSoupCommand::claims_start_chat(
-                            &envelope,
-                        )
-                        || crate::features::undercover::UndercoverCommand::claims_start_chat(
-                            &envelope,
-                        )
-                        || crate::features::number_bomb::NumberBombCommand::claims_start_chat(
-                            &envelope,
-                        )
-                        || crate::features::administration::AdministrationCommand::claims_chat(
-                            &envelope,
-                        )
-                }
-                CommandPrefix::Amp => false,
-            }
-        };
-
-        let mut unclaimed: Vec<String> = Vec::new();
-        for spec in static_commands() {
-            for authority in spec.authorities {
-                for name in spec.all_names() {
-                    if !claimed(spec, name, *authority) {
-                        unclaimed.push(format!("{} ({name}, {authority:?})", spec.name));
-                    }
-                }
-            }
-        }
-        assert!(
-            unclaimed.is_empty(),
-            "以下登记项在真实路由中无人认领：{unclaimed:#?}"
-        );
-    }
+    // 说明：`every_registered_alias_is_claimed_by_a_real_module` 曾经**手抄**一份
+    // `claims_chat` 并或起来，于是守卫自己成了漂移源（新增模块要先记住改这里）。
+    // 现改为 `interfaces::chat::router` 里的 name-driven oracle：直接驱动真实
+    // `AT_HANDLERS`/`HASH_START_HANDLERS`，见 `router::alias_oracle_tests`。
 }

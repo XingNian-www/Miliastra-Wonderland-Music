@@ -10,6 +10,21 @@
           <span>未保存</span>
           <em :class="{ 'config-dirty': dirtyCount > 0 }">{{ dirtyCount }} 段</em>
         </span>
+        <!-- 容错加载状态：默认模式下坏条目会被隔离而不是让程序起不来，
+             用户必须能在这里看到「我库里有几条坏数据、分别是什么」，
+             否则「隔离」等于静默吞掉问题。 -->
+        <span v-if="loadStatus.hasQuarantine" class="chip" :title="loadStatus.title">
+          <span>已隔离</span>
+          <em class="config-dirty">{{ loadStatus.count }} 条</em>
+        </span>
+        <span
+          v-else-if="loadStatus.modeLabel"
+          class="chip"
+          title="配置加载模式：容错=坏条目被隔离后继续启动，严格=校验失败即拒绝启动"
+        >
+          <span>加载模式</span>
+          <em>{{ loadStatus.modeLabel }}</em>
+        </span>
         <span class="config-field-hint" style="margin-left: auto">
           隐藏 identity / ai / ai_chat / tts / command_access（各有独立页）{{ savedAt ? ' · 本次保存 ' + savedAt : '' }}
         </span>
@@ -125,6 +140,8 @@
 </template>
 
 <script setup>
+import { computed } from 'vue'
+import { describeLoadStatus } from '../util/loadStatus.js'
 import { state } from '../store.js'
 import ConfigSectionNav from '../components/config/ConfigSectionNav.vue'
 import ConfigFieldGroups from '../components/config/ConfigFieldGroups.vue'
@@ -178,4 +195,8 @@ const {
   onEmojiAllowed,
   openVisual,
 } = useConfigForm()
+
+// 容错加载状态取自 `GET /config` 的附加字段（后端 `load_status_json`）。
+// 口径与降级逻辑抽在 `util/loadStatus.js`，这里只做接线。
+const loadStatus = computed(() => describeLoadStatus(state?.config))
 </script>

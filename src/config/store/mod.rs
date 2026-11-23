@@ -56,6 +56,9 @@ mod subset_tests;
 #[cfg(test)]
 mod quarantine_tests;
 
+/// 测试专用：按线程覆盖进程级加载模式（见 [`codec::test_mode_override`]）。
+#[cfg(test)]
+pub(crate) use codec::test_mode_override;
 pub(crate) use codec::{LoadMode, SECRET_MASK, mask_secrets};
 pub(crate) use quarantine::QuarantineEntry;
 pub(crate) use sqlite::{CONFIG_SCHEMA_VERSION, SharedConfigStore};
@@ -179,16 +182,29 @@ impl ConfigStore {
     /// **不做 schema 迁移**：迁移在 [`Self::open`] 的 `ensure_schema` 里已经完成，
     /// 这里再迁移会重复改库、也会让只读路径（如 HTTP 展示）产生写入。
     ///
-    /// 等价于 [`Self::load_full_with_mode`]`(LoadMode::Strict)`：校验失败即返回错误，
-    /// 与重构前逐字节一致。
+    /// **严格原语**：等价于 [`Self::load_full_with_mode`]`(LoadMode::Strict)`，
+    /// 校验失败即返回错误，与重构前逐字节一致。
+    ///
+    /// 保留它是为了「明确要严格结果」的调用点与既有测试：它**不读**进程模式，
+    /// 断言不会被默认值翻转悄悄削弱。生产读路径（启动链、`lib.rs`、HTTP 路由、
+    /// `aggregate.rs`）一律用 [`Self::load_full_current`]，不直接用本方法。
     pub fn load_full(&self) -> Result<AppConfig> {
         self.load_full_with_mode(LoadMode::Strict)
     }
 
+    /// 按**当前进程模式**（[`LoadMode::current`]）加载完整配置。
+    ///
+    /// 这是启动链与全部只读消费方的唯一入口：启动用哪种模式，面板/看门狗/HTTP
+    /// 就用哪种模式。否则会出现「启动走了 Lenient 成功、面板却按 Strict 读失败」
+    /// ——程序起来了但面板报「数据库中的配置未通过校验」。
+    pub fn load_full_current(&self) -> Result<AppConfig> {
+        self.load_full_with_mode(LoadMode::current())
+    }
+
     /// 按 [`LoadMode`] 加载完整配置。
     ///
-    /// - `Strict`（默认）：任何校验失败都返回错误，行为与重构前一致。
-    /// - `Lenient`（显式开关）：先完整校验；失败时只把 4 类用户容器里的坏条目
+    /// - `Strict`（显式回退）：任何校验失败都返回错误，行为与重构前一致。
+    /// - `Lenient`（默认）：先完整校验；失败时只把 4 类用户容器里的坏条目
     ///   隔离进 `config_quarantine`，再重新校验。结构错误、启动关键项与容器之外的
     ///   校验错误仍然失败——Lenient 不是“什么都放行”。
     ///
@@ -236,14 +252,16 @@ impl ConfigStore {
             }
         };
         log::warn!(
-            "配置加载已按 {} 降级为 Lenient（待用户批准的行为变更）：隔离 {} 条用户容器坏条目（{}），其中 {written} 条已写入 config_quarantine（original_json 中的 secret 字段已掩码）",
-            LoadMode::ENV,
+            "配置加载模式 {}：隔离 {} 条用户容器坏条目（{}），其中 {written} 条已写入 config_quarantine（original_json 中的 secret 字段已掩码）；设 {}={} 可改为严格加载",
+            LoadMode::current().as_str(),
             records.len(),
             records
                 .iter()
                 .map(|record| record.element_ref.as_str())
                 .collect::<Vec<_>>()
-                .join("、")
+                .join("、"),
+            LoadMode::ENV,
+            LoadMode::Strict.as_str(),
         );
         Ok(config)
     }

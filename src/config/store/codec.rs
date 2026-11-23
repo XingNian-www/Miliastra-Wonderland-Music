@@ -37,32 +37,35 @@ pub const SECRET_MASK: &str = "••••••";
 /// 表示**清除**该字段（写入空字符串，绕过保留规则）；Web 页面「清除」按钮使用。
 pub const SECRET_CLEAR_MARKER: &str = "__clear__";
 
-/// 配置库加载模式（W5 容错半，D7）。
+/// 配置库加载模式（W5 容错半，D7；默认值已按用户批准翻转为 [`LoadMode::Lenient`]）。
 ///
-/// - [`LoadMode::Strict`]：**默认**，任何反序列化/结构/业务校验失败都拒绝启动，
-///   与重构前逐字节一致（回退方式 = 保持默认，不设开关）。
-/// - [`LoadMode::Lenient`]：显式开启后，只隔离 4 类**用户容器**里的坏条目
+/// - [`LoadMode::Lenient`]：**默认**。只隔离 4 类**用户容器**里的坏条目
 ///   （重复 UID 的身份映射、未知命令覆盖、未知 workflow step、未知模板倍数），
 ///   把它们写入 `config_quarantine` 并继续启动；结构错误与启动关键项
-///   （`database_path` / `executable_root`）在两种模式下都严格。
+///   （`database_path` / `executable_root`）仍然严格，容器之外的校验错误仍然拒绝启动。
+///   理由：一条手改坏的条目不该让整个进程起不来，坏数据必须**可见**（面板
+///   `GET /config` 的 `loadMode` / `quarantinedCount`）而不是把用户挡在门外。
+/// - [`LoadMode::Strict`]：**显式回退**。任何反序列化/结构/业务校验失败都拒绝启动，
+///   与重构前逐字节一致。设置环境变量 `MILIASTRA_CONFIG_LOAD_MODE=strict` 即可回退。
 ///
-/// **这是待用户批准的行为变更**（Lead 裁决 3）：默认关闭，只有显式设置
-/// 环境变量 `MILIASTRA_CONFIG_LOAD_MODE=lenient` 才会生效；启动链仍然是
-/// 「先 Strict，失败且开关开启才降级重试」，不是一上来就用宽松模式。
+/// 进程内只有**一个**权威来源：[`LoadMode::current`]。启动链、`lib.rs`、
+/// HTTP 读路径与 `aggregate.rs` 一律走它，不允许各调用点自己读环境变量——
+/// 那会让启动用宽松模式、面板却按严格模式读，出现「程序起来了但面板报
+/// 数据库中的配置未通过校验」的故障。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LoadMode {
-    /// 严格（默认）：校验失败即拒绝启动。
-    #[default]
+    /// 严格（显式回退）：校验失败即拒绝启动。
     Strict,
-    /// 宽松（显式开关）：隔离 4 类用户容器的坏条目后继续启动。
+    /// 宽松（默认）：隔离 4 类用户容器的坏条目后继续启动。
+    #[default]
     Lenient,
 }
 
 impl LoadMode {
-    /// 显式开关的环境变量名：值为 `lenient` 时启用，其余（含未设置）都是 `strict`。
+    /// 加载模式开关的环境变量名：`lenient`（或未设置）走默认宽松，`strict` 回退严格。
     pub const ENV: &str = "MILIASTRA_CONFIG_LOAD_MODE";
 
-    /// 从进程环境读取加载模式；未设置或无法识别一律回落到 [`LoadMode::Strict`]。
+    /// 从进程环境读取加载模式（**每次都重新读**，仅供 [`LoadMode::current`] 与测试使用）。
     pub fn from_env() -> Self {
         let value = std::env::var(Self::ENV).ok();
         Self::from_env_value(value.as_deref())
@@ -70,20 +73,55 @@ impl LoadMode {
 
     /// 纯解析（便于测试，不读进程环境）。
     ///
-    /// 只认 `lenient`（大小写/首尾空白不敏感）；`strict`、空串、未设置都回落到
-    /// 严格；无法识别的值告警后同样回落到严格——宽松模式必须是**显式且拼对**的。
+    /// - `strict`（大小写/首尾空白不敏感）→ [`LoadMode::Strict`]（显式回退）；
+    /// - `lenient` → [`LoadMode::Lenient`]；
+    /// - 未设置 / 空串 → [`Self::default`]（当前为 [`LoadMode::Lenient`]）；
+    /// - 无法识别的值 → 告警后回落到 [`Self::default`]（宽松才是默认，拼错开关
+    ///   不应该把用户直接挡在启动门外）。
+    ///
+    /// 回落到 `default()` 而不是写死 `Lenient`：默认值是**唯一**的翻转点，
+    /// 今后再改一处即可整体换默认，解析分支不会分叉。
     pub fn from_env_value(value: Option<&str>) -> Self {
         match value.map(str::trim).filter(|value| !value.is_empty()) {
-            None => Self::Strict,
-            Some(value) if value.eq_ignore_ascii_case("lenient") => Self::Lenient,
             Some(value) if value.eq_ignore_ascii_case("strict") => Self::Strict,
+            Some(value) if value.eq_ignore_ascii_case("lenient") => Self::Lenient,
+            None => Self::default(),
             Some(other) => {
                 log::warn!(
-                    "环境变量 {} 的值「{other}」无法识别（只支持 strict/lenient），按默认的 strict 处理",
-                    Self::ENV
+                    "环境变量 {} 的值「{other}」无法识别（只支持 strict/lenient），按默认的 {} 处理",
+                    Self::ENV,
+                    Self::default().as_str()
                 );
-                Self::Strict
+                Self::default()
             }
+        }
+    }
+
+    /// **进程级唯一入口**：首次读取环境变量后缓存（`OnceLock`），此后全进程只读。
+    ///
+    /// 缓存是刻意的：配置加载模式属于进程生命周期内的固定开关，启动链与面板
+    /// 必须看到同一个值；运行中改环境变量不会（也不应该）让两处产生分歧。
+    pub fn current() -> Self {
+        // 测试专用线程级覆盖（见 [`test_mode_override`]）：单测进程里所有测试共享
+        // 同一个 `OnceLock`，靠改环境变量造模式会让并行测试互相污染；线程局部
+        // 覆盖既确定又无竞争。
+        #[cfg(test)]
+        if let Some(mode) = test_mode_override::current() {
+            return mode;
+        }
+        static PROCESS_MODE: OnceLock<LoadMode> = OnceLock::new();
+        *PROCESS_MODE.get_or_init(|| {
+            let mode = Self::from_env();
+            log::info!("配置加载模式：{}（{}）", mode.as_str(), Self::ENV);
+            mode
+        })
+    }
+
+    /// 稳定的机器可读名（面板 `loadMode` 字段、日志用）。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Lenient => "lenient",
         }
     }
 
@@ -467,5 +505,49 @@ pub(super) fn mask_secrets_inner(value: &mut Value, path: &str) {
             }
         }
         _ => {}
+    }
+}
+
+/// 测试专用：按**线程**覆盖 [`LoadMode::current`] 的返回值。
+///
+/// 为什么不直接改环境变量：`current()` 的缓存是进程级的，而单测进程里所有
+/// `#[test]` 共享它——一个测试把进程模式固定成 `strict`，同进程里靠后的
+/// 测试就再也拿不回默认值，且并行测试的先后顺序不确定。线程局部覆盖让每个
+/// 测试在自己的线程里确定地表达「这次启动用的是哪种模式」，互不干扰。
+///
+/// 生产构建里整个模块都不存在（`#[cfg(test)]` + 编译期裁剪），
+/// 不会成为绕过真实环境变量的后门。
+#[cfg(test)]
+pub(crate) mod test_mode_override {
+    use std::cell::Cell;
+
+    use super::LoadMode;
+
+    thread_local! {
+        static OVERRIDE: Cell<Option<LoadMode>> = const { Cell::new(None) };
+    }
+
+    /// 当前线程的覆盖值；`None` 表示回落到进程级缓存。
+    pub(crate) fn current() -> Option<LoadMode> {
+        OVERRIDE.with(Cell::get)
+    }
+
+    /// 在本线程上强制 [`LoadMode::current`] 返回 `mode`，返回恢复值用的守卫。
+    ///
+    /// 守卫离开作用域即恢复原覆盖，测试 panic 时也不会污染同线程后续测试。
+    pub(crate) fn scoped(mode: LoadMode) -> ScopedOverride {
+        let previous = OVERRIDE.with(|slot| slot.replace(Some(mode)));
+        ScopedOverride { previous }
+    }
+
+    /// 线程局部覆盖的 RAII 守卫。
+    pub(crate) struct ScopedOverride {
+        previous: Option<LoadMode>,
+    }
+
+    impl Drop for ScopedOverride {
+        fn drop(&mut self) {
+            OVERRIDE.with(|slot| slot.set(self.previous));
+        }
     }
 }

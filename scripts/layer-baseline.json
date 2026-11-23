@@ -1050,7 +1050,7 @@
         },
         {
           "path": "src/interfaces/http/routes/config.rs",
-          "count": 11
+          "count": 18
         },
         {
           "path": "src/interfaces/tui.rs",
@@ -1940,7 +1940,7 @@
       "pub_items": 4
     },
     "src/composition.rs": {
-      "lines": 142,
+      "lines": 137,
       "pub_items": 2
     },
     "src/geometry.rs": {
@@ -2184,12 +2184,12 @@
       "pub_items": 8
     },
     "src/config/store/codec.rs": {
-      "lines": 471,
-      "pub_items": 22
+      "lines": 553,
+      "pub_items": 28
     },
     "src/config/store/mod.rs": {
-      "lines": 844,
-      "pub_items": 20
+      "lines": 862,
+      "pub_items": 22
     },
     "src/config/store/quarantine.rs": {
       "lines": 365,
@@ -2216,7 +2216,7 @@
       "pub_items": 5
     },
     "src/config/types/aggregate.rs": {
-      "lines": 1143,
+      "lines": 1145,
       "pub_items": 12
     },
     "src/config/types/general.rs": {
@@ -2636,7 +2636,7 @@
       "pub_items": 5
     },
     "src/interfaces/http/routes/ai.rs": {
-      "lines": 865,
+      "lines": 831,
       "pub_items": 30
     },
     "src/interfaces/http/routes/commands.rs": {
@@ -2644,8 +2644,8 @@
       "pub_items": 4
     },
     "src/interfaces/http/routes/config.rs": {
-      "lines": 592,
-      "pub_items": 14
+      "lines": 678,
+      "pub_items": 18
     },
     "src/interfaces/http/routes/debug.rs": {
       "lines": 1517,
@@ -2784,7 +2784,7 @@
       "pub_items": 30
     },
     "src/runtime/player_io.rs": {
-      "lines": 3542,
+      "lines": 3532,
       "pub_items": 85
     },
     "src/runtime/recovery.rs": {

@@ -196,7 +196,7 @@ pub fn watchdog_restart_ms(config_path: &std::path::Path) -> anyhow::Result<u64>
                 )
             })?;
     let config = store
-        .load_full()
+        .load_full_current()
         .with_context(|| "从统一配置数据库加载完整配置失败")?;
     config.validate()?;
     Ok(config.timing.watchdog_restart_ms)

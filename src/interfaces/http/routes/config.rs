@@ -8,13 +8,36 @@ use crate::config::{
 use serde_json::{Map, Value};
 
 /// 锁定配置存储句柄；锁损坏按内部错误处理。
-fn lock_store(
+pub(super) fn lock_store(
     state: &HttpSharedState,
 ) -> std::result::Result<std::sync::MutexGuard<'_, crate::config::ConfigStore>, AppError> {
     state
         .config_store
         .lock()
         .map_err(|_| internal_error(anyhow!("配置存储锁已损坏")))
+}
+
+/// **HTTP 只读路径的唯一加载入口**：按当前进程模式
+/// （[`crate::config::LoadMode::current`]）加载完整业务配置。
+///
+/// `ai.rs` / `commands.rs` / `config.rs` 的每个只读路由都走这里，不允许各自
+/// 直接调 `load_full()`（严格原语）：启动链在默认 Lenient 下隔离坏条目后能起来，
+/// 读路径却按 Strict 读，用户的直接感受就是「程序起来了、面板却报数据库中的配置
+/// 未通过校验」。单一入口同时保证这几处不会悄悄漂移回严格模式。
+pub(super) fn load_for_read(
+    store: &crate::config::ConfigStore,
+) -> std::result::Result<crate::config::AppConfig, AppError> {
+    store.load_full_current().map_err(internal_error)
+}
+
+/// 同上，但先按统一口径锁住共享句柄；`ai.rs` / `commands.rs` 的只读路由用这个
+/// ——把「拿锁 → 按当前模式加载」收成一行，调用点没有机会自己读环境变量或改
+/// 回严格口径。
+pub(super) fn load_for_read_locked(
+    state: &HttpSharedState,
+) -> std::result::Result<crate::config::AppConfig, AppError> {
+    let store = lock_store(state)?;
+    load_for_read(&store)
 }
 
 /// 保存/回滚成功落库后调用：重读完整配置并覆盖热更新共享值，
@@ -25,7 +48,7 @@ fn apply_live_configs(
     state: &HttpSharedState,
     store: &crate::config::ConfigStore,
 ) -> std::result::Result<(), AppError> {
-    let config = store.load_full().map_err(internal_error)?;
+    let config = load_for_read(store)?;
     state.live_configs.apply(&config);
     Ok(())
 }
@@ -148,6 +171,40 @@ fn field_errors_json(errors: &[ConfigFieldError]) -> Vec<Value> {
         .collect()
 }
 
+/// 容错加载的可观测投影：当前加载模式 + 已隔离条数（+ 明细条目）。
+///
+/// **只增不改**：`sections` / `revision` / `schemaVersion` 字段与语义原样保留，
+/// 本函数只往响应体里追加新键。没有它，用户在默认（Lenient）模式下看不到
+/// 「我的库里有坏数据被隔离了」——只会看到某条配置"莫名其妙地不生效"。
+///
+/// `quarantinedCount`/`quarantined` 取库里 `config_quarantine` 的当前内容，是
+/// **只读**查询；读失败只告警并返回 `null`，不能让面板因为附加信息而整页失败。
+fn load_status_json(store: &crate::config::ConfigStore) -> Value {
+    match store.quarantine_entries() {
+        Ok(entries) => json!({
+            "loadMode": crate::config::LoadMode::current().as_str(),
+            "quarantinedCount": entries.len(),
+            "quarantined": entries
+                .iter()
+                .map(|entry| json!({
+                    "section": entry.section,
+                    "elementRef": entry.element_ref,
+                    "reason": entry.reason,
+                    "createdAtMs": entry.created_at_ms,
+                }))
+                .collect::<Vec<_>>(),
+        }),
+        Err(error) => {
+            log::warn!("读取 config_quarantine 失败，面板容错状态降级为 null：{error:#}");
+            json!({
+                "loadMode": crate::config::LoadMode::current().as_str(),
+                "quarantinedCount": Value::Null,
+                "quarantined": Value::Null,
+            })
+        }
+    }
+}
+
 /// 保存/回滚落库成功后的收尾：先 best-effort 应用即时热更新；失败时不把已提交
 /// 的保存误报为失败，而是把本次 Live 字段降级为运行态闲置重载。
 pub(super) fn save_outcome_response_after_apply(
@@ -262,22 +319,47 @@ fn parse_sections(body: &Value) -> std::result::Result<&Map<String, Value>, AppE
     Ok(sections)
 }
 
-/// GET /config：完整配置（脱敏后，路径保持库中相对值）+ 当前版本号 + schema 版本。
+/// GET /config 的响应体（不含 HTTP 装配）：`sections` / `revision` / `schemaVersion`
+/// 原样保留，并**追加**容错加载状态（`loadMode` / `quarantinedCount` / `quarantined`）。
+///
+/// 单独拆出来是为了能在单测里直接断言「Lenient 启动之后读配置不报错、且能看到
+/// 隔离条数」，不必为了一个只读响应去起整个 HTTP 服务器。
+pub(super) fn config_response(
+    store: &crate::config::ConfigStore,
+) -> std::result::Result<Value, AppError> {
+    // 与读路径同一口径：先按**当前进程模式**完整加载一次并校验。默认 Lenient 下
+    // 坏条目已被隔离，这里能过；若这里仍按 Strict 读，面板就会报
+    // 「数据库中的配置未通过校验」——程序起来了但面板用不了。
+    let loaded = load_for_read(store)?;
+    debug_assert!(loaded.validate().is_ok(), "只读加载后的配置必须通过校验");
+    // current_value 不解析相对路径：避免 Web 表单回填绝对路径后保存回写。
+    let sections = store.current_value().map_err(internal_error)?;
+    let revision = store.current_revision().map_err(internal_error)?;
+    let mut response = json!({
+        "ok": true,
+        "revision": revision,
+        "schemaVersion": crate::config::CONFIG_SCHEMA_VERSION,
+        "sections": sections,
+    });
+    if let (Some(object), Value::Object(load_status)) =
+        (response.as_object_mut(), load_status_json(store))
+    {
+        for (key, value) in load_status {
+            object.insert(key, value);
+        }
+    }
+    Ok(response)
+}
+
+/// GET /config：完整配置（脱敏后，路径保持库中相对值）+ 当前版本号 + schema 版本
+/// + 容错加载状态（`loadMode` / `quarantinedCount` / `quarantined`，只增不改）。
 pub(super) fn config_route(
     _query: &[(String, String)],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
     let store = lock_store(state)?;
-    // current_value 不解析相对路径：避免 Web 表单回填绝对路径后保存回写。
-    let sections = store.current_value().map_err(internal_error)?;
-    let revision = store.current_revision().map_err(internal_error)?;
-    serde_json::to_string(&json!({
-        "ok": true,
-        "revision": revision,
-        "schemaVersion": crate::config::CONFIG_SCHEMA_VERSION,
-        "sections": sections,
-    }))
-    .map_err(internal_error)
+    let response = config_response(&store)?;
+    serde_json::to_string(&response).map_err(internal_error)
 }
 
 /// 全量表情目录落盘路径（相对进程工作目录，与其它 deps 数据一致）。
@@ -590,3 +672,7 @@ pub(super) fn config_visual_import_route(
 ) -> std::result::Result<String, AppError> {
     visual_request(body, state, true)
 }
+
+#[cfg(test)]
+#[path = "config_lenient_tests.rs"]
+mod lenient_read_path_tests;

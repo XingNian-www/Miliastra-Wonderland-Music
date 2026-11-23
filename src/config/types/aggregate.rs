@@ -563,7 +563,9 @@ logging:
         let store =
             crate::config::ConfigStore::open(&bootstrap.database_path, &root, bootstrap.clone())
                 .expect("初始化模式必须能建库");
-        let config = store.load_full().expect("初始化模式必须通过完整配置校验");
+        let config = store
+            .load_full_current()
+            .expect("初始化模式必须通过完整配置校验");
         assert_eq!(
             config.http.access_token,
             super::INIT_ONLY_PLACEHOLDER_TOKEN,

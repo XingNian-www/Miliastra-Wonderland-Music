@@ -90,13 +90,7 @@ pub(super) fn ai_models_route(
     _query: &[(String, String)],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
-    let config = state
-        .config_store
-        .lock()
-        .map_err(|_| internal_error(anyhow!("配置存储锁已损坏")))?
-        .load_full()
-        .map_err(internal_error)?
-        .ai;
+    let config = super::config_routes::load_for_read_locked(state)?.ai;
     let models = crate::config::ai::fetch_models(&config).map_err(model_list_error)?;
     serde_json::to_string(&json!({ "models": models })).map_err(internal_error)
 }
@@ -196,13 +190,7 @@ pub(super) fn ai_models_body_route(
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
     let overrides: AiModelsOverrides = parse_json_body(body, "模型列表参数")?;
-    let mut config = state
-        .config_store
-        .lock()
-        .map_err(|_| internal_error(anyhow!("配置存储锁已损坏")))?
-        .load_full()
-        .map_err(internal_error)?
-        .ai;
+    let mut config = super::config_routes::load_for_read_locked(state)?.ai;
     let dropped_saved_key = apply_ai_model_overrides(&mut config, overrides);
     if dropped_saved_key {
         log::info!("AI 模型列表：接口地址已变更，未复用已保存的 API Key，需要重新填写");
@@ -227,13 +215,7 @@ pub(super) fn tts_models_route(
     _query: &[(String, String)],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
-    let config = state
-        .config_store
-        .lock()
-        .map_err(|_| internal_error(anyhow!("配置存储锁已损坏")))?
-        .load_full()
-        .map_err(internal_error)?
-        .tts;
+    let config = super::config_routes::load_for_read_locked(state)?.tts;
     let catalog = crate::features::tts::fetch_catalog(
         &config,
         &crate::features::tts::TtsCatalogOverrides::default(),
@@ -276,13 +258,7 @@ pub(super) fn tts_models_body_route(
 ) -> std::result::Result<String, AppError> {
     let overrides: TtsModelsOverrides = parse_json_body(body, "TTS 模型列表参数")?;
     let overrides = tts_catalog_overrides(overrides);
-    let config = state
-        .config_store
-        .lock()
-        .map_err(|_| internal_error(anyhow!("配置存储锁已损坏")))?
-        .load_full()
-        .map_err(internal_error)?
-        .tts;
+    let config = super::config_routes::load_for_read_locked(state)?.tts;
     let catalog =
         crate::features::tts::fetch_catalog(&config, &overrides).map_err(tts_catalog_error)?;
     serde_json::to_string(&catalog).map_err(internal_error)
@@ -318,12 +294,7 @@ pub(super) fn ai_vision_status_route(
     _query: &[(String, String)],
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
-    let config = state
-        .config_store
-        .lock()
-        .map_err(|_| internal_error(anyhow!("配置存储锁已损坏")))?
-        .load_full()
-        .map_err(internal_error)?;
+    let config = super::config_routes::load_for_read_locked(state)?;
     let model = ai_vision_model(&config.ai_chat, &config.ai);
     let payload = if !config.ai_chat.vision.enabled {
         disabled_vision_status_payload(
@@ -410,12 +381,7 @@ pub(super) fn ai_vision_status_body_route(
     state: &HttpSharedState,
 ) -> std::result::Result<String, AppError> {
     let overrides: AiVisionStatusOverrides = parse_json_body(body, "AI 识图状态参数")?;
-    let mut config = state
-        .config_store
-        .lock()
-        .map_err(|_| internal_error(anyhow!("配置存储锁已损坏")))?
-        .load_full()
-        .map_err(internal_error)?;
+    let mut config = super::config_routes::load_for_read_locked(state)?;
     let saved_api_key_present = !config.ai.api_key.trim().is_empty();
     let model_override =
         apply_ai_vision_status_overrides(&mut config.ai, &mut config.ai_chat, overrides);

@@ -337,7 +337,7 @@ pub(super) fn commands_catalog_route(
         .config_store
         .lock()
         .map_err(|_| internal_error(anyhow!("配置存储锁已损坏")))?;
-    let config = store.load_full().map_err(internal_error)?;
+    let config = super::config_routes::load_for_read(&store)?;
     let mut view = serde_json::to_value(crate::features::command_catalog::catalog_view(enabled))
         .map_err(internal_error)?;
     view["revision"] = json!(store.current_revision().map_err(internal_error)?);
@@ -612,7 +612,7 @@ pub(super) fn commands_policy_save_route(
         .config_store
         .lock()
         .map_err(|_| internal_error(anyhow!("配置存储锁已损坏")))?;
-    let mut config = store.load_full().map_err(internal_error)?.command_access;
+    let mut config = super::config_routes::load_for_read(&store)?.command_access;
     if let Some(source) = request.default_song_source {
         config.default_song_source = Some(source);
     }

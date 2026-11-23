@@ -102,7 +102,7 @@ fn duplicate_identity_section() -> Value {
 fn lenient_load_isolates_duplicate_identity() {
     let (root, _database_path, store) = open_store("lenient-duplicate-identity");
     write_section(&store, "identity", &duplicate_identity_section());
-    // 默认（Strict）必须与重构前一致：重复 UID 直接拒绝启动。
+    // 严格原语（load_full）必须与重构前一致：重复 UID 直接拒绝启动。
     let strict_error = store.load_full().expect_err("Strict 必须拒绝重复 UID");
     assert!(
         format!("{strict_error:#}").contains("账号重复"),
@@ -300,13 +300,14 @@ fn lenient_load_ignores_unknown_downsample_key() {
 
 #[test]
 fn strict_load_still_fails_on_duplicate_identity() {
-    // 默认行为不变的直接证据：不传 LoadMode（= Strict）时，同一份坏数据仍然启动失败，
-    // 且不产生任何 quarantine 副作用。
+    // 严格原语的行为不变：显式走 load_full()（= Strict）时，同一份坏数据仍然启动失败，
+    // 且不产生任何 quarantine 副作用。默认值翻转**没有**削弱这条断言——
+    // 严格路径仍然逐字节保持重构前的失败行为。
     let (root, _database_path, store) = open_store("strict-duplicate-identity");
     write_section(&store, "identity", &duplicate_identity_section());
     let error = store
         .load_full()
-        .expect_err("默认 Strict 必须保持重构前的失败行为");
+        .expect_err("load_full（Strict 原语）必须保持重构前的失败行为");
     assert!(
         format!("{error:#}").contains("数据库中的配置未通过校验"),
         "错误链必须保留原有上下文: {error:#}"
@@ -549,19 +550,175 @@ fn quarantine_records_are_masked_before_persisting() {
 }
 
 #[test]
-fn lenient_mode_requires_explicit_switch() {
-    // 宽松模式必须显式开启：默认/拼错/空值都回落到 Strict。
-    assert_eq!(LoadMode::from_env_value(None), LoadMode::Strict);
-    assert_eq!(LoadMode::from_env_value(Some("")), LoadMode::Strict);
-    assert_eq!(LoadMode::from_env_value(Some("   ")), LoadMode::Strict);
-    assert_eq!(LoadMode::from_env_value(Some("strict")), LoadMode::Strict);
+fn default_load_mode_is_lenient() {
+    // 行为变更（用户已批准）：默认宽松。未设置 / 空串 / 纯空白都是默认。
+    assert_eq!(
+        LoadMode::default(),
+        LoadMode::Lenient,
+        "默认加载模式必须是 Lenient"
+    );
+    assert_eq!(LoadMode::from_env_value(None), LoadMode::Lenient);
+    assert_eq!(LoadMode::from_env_value(Some("")), LoadMode::Lenient);
+    assert_eq!(LoadMode::from_env_value(Some("   ")), LoadMode::Lenient);
+    assert_eq!(LoadMode::from_env_value(Some("lenient")), LoadMode::Lenient);
     assert_eq!(LoadMode::from_env_value(Some("LENIENT")), LoadMode::Lenient);
     assert_eq!(
         LoadMode::from_env_value(Some(" lenient ")),
         LoadMode::Lenient
     );
-    assert_eq!(LoadMode::from_env_value(Some("1")), LoadMode::Strict);
-    assert_eq!(LoadMode::default(), LoadMode::Strict);
+    // 机器可读名是面板契约：改文案不能让 `loadMode` 字段失配。
+    assert_eq!(LoadMode::Lenient.as_str(), "lenient");
+    assert_eq!(LoadMode::Strict.as_str(), "strict");
+    assert_eq!(LoadMode::Lenient.is_lenient(), true);
+    assert_eq!(LoadMode::Strict.is_lenient(), false);
+}
+
+#[test]
+fn strict_can_still_be_requested_by_env() {
+    // 回退路径：显式 `strict` 仍然严格，行为与重构前一致。
+    assert_eq!(LoadMode::from_env_value(Some("strict")), LoadMode::Strict);
+    assert_eq!(LoadMode::from_env_value(Some("STRICT")), LoadMode::Strict);
+    assert_eq!(
+        LoadMode::from_env_value(Some("  Strict  ")),
+        LoadMode::Strict
+    );
+
+    // 真环境变量路径（不污染进程状态：只读，不改写）。测试进程里若被测框架
+    // 设了该变量，`from_env()` 必须如实反映它；未设置时如实回落到默认。
+    let from_process_env = LoadMode::from_env();
+    match std::env::var(LoadMode::ENV).ok() {
+        Some(value) => assert_eq!(from_process_env, LoadMode::from_env_value(Some(&value))),
+        None => assert_eq!(from_process_env, LoadMode::default()),
+    }
+
+    // 进程级入口的单点语义：用线程局部覆盖断言「请求 strict 就真的严格」，
+    // 不依赖进程级 OnceLock 的首次读取（并行测试下顺序不确定）。
+    let guard = crate::config::test_mode_override::scoped(LoadMode::Strict);
+    assert_eq!(LoadMode::current(), LoadMode::Strict);
+    assert!(!LoadMode::current().is_lenient());
+    drop(guard);
+}
+
+#[test]
+fn unknown_env_value_falls_back_to_lenient() {
+    // 拼错的值不能把用户直接挡在启动门外：回落默认（Lenient），并在日志里告警。
+    assert_eq!(LoadMode::from_env_value(Some("1")), LoadMode::Lenient);
+    assert_eq!(LoadMode::from_env_value(Some("true")), LoadMode::Lenient);
+    assert_eq!(
+        LoadMode::from_env_value(Some("lennient")),
+        LoadMode::Lenient
+    );
+    // 回落目标就是默认值本身：今后改默认时解析分支不会分叉。
+    assert_eq!(
+        LoadMode::from_env_value(Some("garbage")),
+        LoadMode::default()
+    );
+}
+
+#[test]
+fn process_mode_is_cached_after_first_read() {
+    // `current()` 是进程级单点：首次读取后固定，运行中改环境变量不得让启动链
+    // 与读路径产生分歧。线程局部覆盖关闭时，同一进程内多次调用必须一致。
+    let first = LoadMode::current();
+    assert_eq!(LoadMode::current(), first, "current() 必须缓存首次读取结果");
+    // 覆盖生效期间返回值跟随覆盖，松开即恢复缓存值——这正是「单点」的可观测形态。
+    {
+        let guard = crate::config::test_mode_override::scoped(LoadMode::Strict);
+        assert_eq!(LoadMode::current(), LoadMode::Strict);
+        assert_ne!(LoadMode::current(), first, "覆盖必须立刻生效");
+        drop(guard);
+    }
+    assert_eq!(LoadMode::current(), first, "覆盖结束后必须回到进程级缓存值");
+}
+
+#[test]
+fn duplicate_identity_no_longer_blocks_startup_by_default() {
+    // 行为变更的核心证据：**默认模式**下重复 UID 不再是启动失败，而是被隔离。
+    let (root, _database_path, store) = open_store("default-lenient-duplicate");
+    write_section(&store, "identity", &duplicate_identity_section());
+
+    // 用 `LoadMode::default()` 本身作为模式：既走真实默认语义，又不受宿主机
+    // 是否设置了 MILIASTRA_CONFIG_LOAD_MODE 影响（环境变量在别的测试里也会被读）。
+    // 这条断言对 `#[default]` 直接敏感：默认值一旦改回 Strict 即红。
+    assert_eq!(
+        LoadMode::default(),
+        LoadMode::Lenient,
+        "默认值必须已翻转为 Lenient"
+    );
+    let guard = crate::config::test_mode_override::scoped(LoadMode::default());
+    let loaded = store
+        .load_full_current()
+        .expect("默认模式必须隔离重复 UID 并成功启动");
+    drop(guard);
+
+    let entries = store.quarantine_entries().unwrap();
+    assert_eq!(entries.len(), 1, "必须恰好隔离重复的那一条: {entries:?}");
+    assert_eq!(entries[0].element_ref, "identity.mappings[1]");
+
+    // 隔离之后主流程拿到的配置本身是**能通过校验**的：这正是面板不报错的前提。
+    loaded.validate().expect("隔离后的配置必须完整通过校验");
+
+    // 被隔离的条目不能凭重复 UID 获得授权；靠前的那条仍然生效。
+    let directory = IdentityAccess::new(loaded.identity);
+    assert_eq!(
+        directory
+            .resolve_account("genshin", DUPLICATE_UID)
+            .map(|identity| identity.id),
+        Some(Uuid::parse_str(ORIGINAL_ID).unwrap())
+    );
+    assert!(directory.resolve("重复身份").is_none());
+    cleanup(&root);
+}
+
+#[test]
+fn lenient_mode_does_not_weaken_startup_critical_errors() {
+    // 翻转默认值**没有**放松启动关键项：结构错误在默认模式下仍然拒绝启动。
+    let (root, _database_path, store) = open_store("default-lenient-structural");
+    let mut window = read_section_from(&store.bootstrap().database_path, "window");
+    window["legacy_structural_field"] = json!(1);
+    write_section(&store, "window", &window);
+
+    let guard = crate::config::test_mode_override::scoped(LoadMode::Lenient);
+    let error = store
+        .load_full_current()
+        .expect_err("默认 Lenient 也必须拒绝结构错误");
+    drop(guard);
+    assert!(
+        format!("{error:#}").contains("legacy_structural_field")
+            || format!("{error:#}").contains("字段被删除或改名"),
+        "错误必须能定位到多余字段: {error:#}"
+    );
+    assert!(
+        store.quarantine_entries().unwrap().is_empty(),
+        "结构错误不得被写进 quarantine"
+    );
+    cleanup(&root);
+}
+
+#[test]
+fn strict_mode_blocks_the_same_database() {
+    // 变异对照：同一份坏库在 strict 下仍然启动失败，证明「默认模式下能启动」
+    // 是模式翻转的功劳，而不是坏数据根本没写进库。
+    let (root, _database_path, store) = open_store("strict-after-default");
+    write_section(&store, "identity", &duplicate_identity_section());
+
+    let guard = crate::config::test_mode_override::scoped(LoadMode::Strict);
+    let error = store
+        .load_full_current()
+        .expect_err("strict 模式必须拒绝启动");
+    drop(guard);
+
+    assert!(
+        format!("{error:#}").contains("账号重复"),
+        "错误必须指出根因: {error:#}"
+    );
+    assert!(
+        store.quarantine_entries().unwrap().is_empty(),
+        "strict 不得写 quarantine"
+    );
+    // 严格原语同样失败：默认值翻转没有把严格路径也放松。
+    assert!(store.load_full().is_err(), "strict 下 load_full 必须失败");
+    cleanup(&root);
 }
 
 #[test]

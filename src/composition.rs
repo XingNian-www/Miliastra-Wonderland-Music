@@ -42,33 +42,28 @@ pub(crate) fn run(config_path: &Path) -> Result<RunOutcome> {
                 bootstrap.database_path.display()
             ))
         })?;
-    // 启动链容错（W5/D7）：**默认仍然是 Strict**——校验失败就按原样退出，
-    // 与重构前逐字节一致。只有显式设置 `MILIASTRA_CONFIG_LOAD_MODE=lenient`
-    // 才在 Strict 失败后降级重试一次：仅隔离 4 类用户容器（身份映射/命令覆盖/
-    // 自定义流程/模板倍数）里的坏条目并写 quarantine，结构错误与启动关键项
-    // （database_path、executable_root 已在更早的 BootstrapConfig::load 严格解析）
-    // 在两种模式下都不放行。
+    // 启动链容错（W5/D7）：**默认已翻转为 Lenient**（用户批准的行为变更）——
+    // 4 类用户容器（身份映射/命令覆盖/自定义流程/模板倍数）里的坏条目被隔离进
+    // config_quarantine 后继续启动；结构错误与启动关键项（database_path、
+    // executable_root 已在更早的 BootstrapConfig::load 严格解析）仍然拒绝启动。
+    // 回退方式：设 `MILIASTRA_CONFIG_LOAD_MODE=strict`，启动行为与重构前逐字节一致。
     //
-    // **这是待用户批准的行为变更**（Lead 裁决 3）：开关默认关闭，批准前不改变
-    // 任何用户的启动结果；回退方式 = 不设该环境变量（或设成 strict）。
-    let app_config = match store.load_full() {
+    // 模式只从 [`LoadMode::current`] 取（进程级单点，OnceLock 缓存），
+    // 与 HTTP 读路径、lib.rs、aggregate.rs 完全同源。
+    let app_config = match store.load_full_current() {
         Ok(config) => config,
         Err(strict_error) => {
-            let mode = LoadMode::from_env();
+            let mode = LoadMode::current();
             if !mode.is_lenient() {
                 log::error!("从统一配置数据库加载完整配置失败：{strict_error:#}");
                 return Err(strict_error.context("从统一配置数据库加载完整配置失败"));
             }
-            log::warn!(
-                "严格加载失败，检测到 {} 显式要求 lenient：只对 4 类用户容器降级重试（待用户批准的行为变更）。原始错误：{strict_error:#}",
-                LoadMode::ENV
+            // 默认模式下 load_full_current 已经是 Lenient，走到这里说明坏数据超出
+            // 4 类用户容器的隔离范围（结构错误/启动关键项/其它段）：不降级。
+            log::error!(
+                "Lenient 加载仍失败（结构错误、启动关键项或非用户容器错误不降级）：{strict_error:#}"
             );
-            store.load_full_with_mode(mode).map_err(|error| {
-                log::error!(
-                    "Lenient 加载仍失败（结构错误、启动关键项或非用户容器错误不降级）：{error:#}"
-                );
-                error.context("从统一配置数据库加载完整配置失败")
-            })?
+            return Err(strict_error.context("从统一配置数据库加载完整配置失败"));
         }
     };
     let config = ResolvedApplicationConfig::resolve(app_config)?;

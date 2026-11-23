@@ -45,7 +45,6 @@ env:
   CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
 
   # ---- 以下为 Windows 构建专用（Linux job 不需要，见各自 job 的注释）----
-  LIBCLANG_PATH: C:\Program Files\LLVM\bin
   # Windows 预编译依赖的路径变量。原先放在仓库的 `.cargo/config.toml` 里 `[env]`，
   # 但 cargo 的 `[env]` 对**所有 target** 生效且不支持按 target 限定
   # （`[target.'cfg(windows)'.env]` 会被判为 unused key），于是 Linux 门禁也会读到
@@ -53,19 +52,11 @@ env:
   # `cargo test` 链接阶段直接红。改用「谁需要谁导出」的方式：只在 Windows 构建里给，
   # Linux 那边保持不设，让它正常走 pkg-config。
   # 用 `${{ github.workspace }}` 展开成绝对路径（顶层 env 允许 github 上下文）。
-  FFMPEG_DIR: ${{ github.workspace }}\vendor\ffmpeg\8.1\windows-x64
-  MNN_INCLUDE_DIR: ${{ github.workspace }}\vendor\mnn\3.6.0\windows-x64\include
-  MNN_LIB_DIR: ${{ github.workspace }}\vendor\mnn\3.6.0\windows-x64\lib
   # OCR 源码与模型固定到 Cargo.lock 锁定的提交。
   # 下载步骤另外校验 SHA-256，确保模型内容符合预期。
-  OCR_MODEL_BASE_URL: https://raw.githubusercontent.com/zibo-chen/rust-paddle-ocr/7368dfa292ab988e8431de4ec952f015bec40635/models
   # OpenVINO 运行时、FP32 IR 与许可证直接使用仓库已发布的成品运行时包
   # （build-windows-openvino 工作流的 Release 资产），主发布流程不再下载官方
   # runtime、安装 OpenVINO Python 或转换 ONNX，从而缩短构建时间并避免外部依赖抖动。
-  OPENVINO_RUNTIME_RELEASE_TAG: v4.1.0-openvino
-  OPENVINO_RUNTIME_ASSET: miliastra-wonderland-music-openvino-runtime-windows-x64-v4.1.0.zip
-  OPENVINO_RUNTIME_URL: https://github.com/XingNian-www/Miliastra-Wonderland-Music/releases/download/v4.1.0-openvino/miliastra-wonderland-music-openvino-runtime-windows-x64-v4.1.0.zip
-  OPENVINO_RUNTIME_SHA256: b829a123f24fb44143a7be912e0dfba5f739f8d924b2f01543083ff6f49db500
 
 jobs:
   # ===========================================================================
@@ -640,6 +631,21 @@ jobs:
     needs: [version-gate, web-build, repo-scripts, rust-gate]
     if: needs.version-gate.outputs.should_build == 'true'
     runs-on: windows-latest
+
+    # Windows 专用环境变量**必须放 job 级**，不能放顶层 env：顶层 env 对本 workflow
+    # 所有 job 生效，Linux 三个门禁也会读到指向 Windows 目录的 FFMPEG_DIR，
+    # ffmpeg-sys-next 不再走 pkg-config，`cargo check/test` 直接红。
+    # 合并两个 workflow 时我曾误放顶层，CI 立刻复现（Rust 零警告门禁失败）。
+    env:
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+      FFMPEG_DIR: ${{ github.workspace }}\vendor\ffmpeg\8.1\windows-x64
+      MNN_INCLUDE_DIR: ${{ github.workspace }}\vendor\mnn\3.6.0\windows-x64\include
+      MNN_LIB_DIR: ${{ github.workspace }}\vendor\mnn\3.6.0\windows-x64\lib
+      OCR_MODEL_BASE_URL: https://raw.githubusercontent.com/zibo-chen/rust-paddle-ocr/7368dfa292ab988e8431de4ec952f015bec40635/models
+      OPENVINO_RUNTIME_RELEASE_TAG: v4.1.0-openvino
+      OPENVINO_RUNTIME_ASSET: miliastra-wonderland-music-openvino-runtime-windows-x64-v4.1.0.zip
+      OPENVINO_RUNTIME_URL: https://github.com/XingNian-www/Miliastra-Wonderland-Music/releases/download/v4.1.0-openvino/miliastra-wonderland-music-openvino-runtime-windows-x64-v4.1.0.zip
+      OPENVINO_RUNTIME_SHA256: b829a123f24fb44143a7be912e0dfba5f739f8d924b2f01543083ff6f49db500
     steps:
       - name: 检出代码
         uses: actions/checkout@v5

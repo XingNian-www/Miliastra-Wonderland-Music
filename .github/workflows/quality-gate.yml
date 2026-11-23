@@ -90,7 +90,11 @@ jobs:
 
       - name: 分层方向检查
         # 只允许上层依赖下层；规则在 scripts/layer-policy.json，违规时退出码 1 并打印反向边。
-        run: python3 scripts/check-layers.py
+        #
+        # 必须带 `--check`：不带参数时脚本走 `--report`（W0 引入 allowlist 制后的默认），
+        # 只打印现状、**永远退出 0**。曾经 CI 这一步就是这样空转的——层边与预算
+        # 早已升级为可阻断的 allowlist，但 CI 还在用旧的报告模式。
+        run: python3 scripts/check-layers.py --check
 
       - name: 日志文案检查
         # 禁止 {:?} 调试格式、字段堆砌、全英文消息等；规则见 technical-docs/logging-style.md。

@@ -870,6 +870,22 @@ def self_test():
         'fake_targets': ['RunOutcome', 'CONFIG_RELOAD_CHILD_ENV'],
     }
 
+    # 0. CI 必须用阻断模式。
+    #
+    # 这道闸门曾在 CI 里**空转**：`quality-gate.yml` 跑的是不带参数的
+    # `python3 scripts/check-layers.py`，而 W0 引入 allowlist 制后默认走
+    # `--report`（退出码恒 0）。也就是说层边与预算棘轮早已可阻断，CI 却一直
+    # 报 PASS。这里把它钉住：CI 工作流必须带 `--check`。
+    workflow = os.path.join(ROOT, '.github', 'workflows', 'quality-gate.yml')
+    if os.path.isfile(workflow):
+        with open(workflow, encoding='utf-8') as handle:
+            lines = handle.read().splitlines()
+        invocations = [line.strip() for line in lines
+                       if 'check-layers.py' in line and not line.strip().startswith('#')]
+        check('CI 的分层检查使用阻断模式（--check）',
+              all('--check' in line for line in invocations) and bool(invocations),
+              True)
+
     # 1. 路径过滤：tests 目录、*_tests.rs、tests.rs。
     check('tests 目录被排除',
           is_excluded_source('src/features/card_games/tests/rules.rs'), True)

@@ -1,40 +1,13 @@
-//! 千星奇域地图色调判据与 F2 大厅多人面板的冻结描述子。
+//! F2 大厅多人面板的冻结描述子。
+//!
+//! 千星地图的**判据**在 `classifier.rs` 里用右下角锚点模板做（见那里的注释）；
+//! 这里原先还有一层「整屏暗青占比」后备判据（`qianxing_map_tone` /
+//! `is_qianxing_map` / `is_bright_qianxing_map` 及 7 个阈值常量），已移除。
 
 use image::DynamicImage;
 
 use super::sampling::{FULL_FRAME_MIN_HEIGHT, FULL_FRAME_MIN_WIDTH, RgbSampler};
 
-/// 千星奇域地图判据的采样起点与步长。
-///
-/// 与定阈值时的量法**必须一致**：第 59 节量的是 120x68 粗网格（每格 16x16 像素）
-/// 的**格心**，等价于从 8 开始、每 16 像素取样一次。改步长要重新量阈值。
-pub(super) const QIANXING_MAP_SAMPLE_OFFSET: u32 = 8;
-pub(super) const QIANXING_MAP_SAMPLE_STEP: u32 = 16;
-/// 记一个"暗点"的灰度上限（与 `screen_tone` 同一口径）。
-pub(super) const QIANXING_MAP_DARK_MAX: f32 = 40.0;
-/// 记一个"暗青点"的灰度上限：够暗之后再看偏青还是偏紫。
-pub(super) const QIANXING_MAP_DARK_TEAL_LUMA_MAX: f32 = 100.0;
-/// 判定"偏青"的通道差下限：B 比 R 高这么多。
-pub(super) const QIANXING_MAP_TEAL_DIFF: i32 = 10;
-/// 判为千星奇域地图的**暗占比下限**。
-///
-/// 来源（实测空档中点，不是凑的）：第 59 节用 4 帧千星地图与 25 帧其他界面量得——
-/// 千星地图暗占比 **37.50 ~ 47.02 %**，其余最高 **26.57 %**（活动一览）
-/// ⇒ 空档 26.57~37.50，取中点 **32 %**。
-pub(super) const QIANXING_MAP_DARK_MIN: f32 = 0.32;
-/// 判为千星奇域地图的**暗青占比下限**。
-///
-/// 来源：千星地图 **74.41 ~ 76.31 %**，其余最高 **52.57 %**（提瓦特地图）
-/// ⇒ 空档 52.57~74.41，取中点 **64 %**。
-///
-/// **为什么要两个量一起用**：单看暗占比只有 1.41 倍空档、单看暗青只有 1.42 倍，
-/// 都偏窄；但千星地图是**唯一两项同时最高**的界面——整屏是一层深青虚空，
-/// 而同样偏暗的「活动一览」是**深紫底**（R 比 B 高），暗青占比明显不够。
-/// 两项同时成立才判千星，等于把两个弱条件叠成一个强条件。
-pub(super) const QIANXING_MAP_DARK_TEAL_MIN: f32 = 0.64;
-
-/// 全屏"深青虚空"统计，返回 `(暗占比, 暗青占比)`；画面太小（不是整帧）返回 `None` 拒判。
-///
 /// 千星奇域「大厅多人面板」（F2）的冻结参考。
 ///
 /// 生成脚本 `dist/qianxingdata/mkf2ref.py`，格式：
@@ -233,59 +206,4 @@ pub(super) fn qianxing_panel_distance_at(
         total += (*value - f32::from(raw) / QIANXING_PANEL_REF_SCALE).abs();
     }
     Some(total / sample.len() as f32)
-}
-
-/// 与 `screen_tone` 一样是**整屏标量统计**而不是模板匹配，所以对位移不敏感。
-pub(super) fn qianxing_map_tone(image: &DynamicImage) -> Option<(f32, f32)> {
-    if image.width() < FULL_FRAME_MIN_WIDTH || image.height() < FULL_FRAME_MIN_HEIGHT {
-        return None;
-    }
-    let sampler = RgbSampler::new(image);
-    let (width, height) = sampler.dimensions();
-    let mut total = 0_u32;
-    let mut dark = 0_u32;
-    let mut dark_teal = 0_u32;
-    let mut y = QIANXING_MAP_SAMPLE_OFFSET;
-    while y < height {
-        let mut x = QIANXING_MAP_SAMPLE_OFFSET;
-        while x < width {
-            let pixel = sampler.pixel(x, y);
-            let red = f32::from(pixel[0]);
-            let green = f32::from(pixel[1]);
-            let blue = f32::from(pixel[2]);
-            let luma = 0.299 * red + 0.587 * green + 0.114 * blue;
-            if luma < QIANXING_MAP_DARK_MAX {
-                dark += 1;
-            }
-            if luma < QIANXING_MAP_DARK_TEAL_LUMA_MAX
-                && i32::from(pixel[2]) - i32::from(pixel[0]) > QIANXING_MAP_TEAL_DIFF
-            {
-                dark_teal += 1;
-            }
-            total += 1;
-            x += QIANXING_MAP_SAMPLE_STEP;
-        }
-        y += QIANXING_MAP_SAMPLE_STEP;
-    }
-    if total == 0 {
-        return None;
-    }
-    Some((dark as f32 / total as f32, dark_teal as f32 / total as f32))
-}
-
-/// 是不是千星奇域地图：两个条件必须**同时**成立；量不了就拒判。
-pub(super) fn is_qianxing_map(image: &DynamicImage) -> bool {
-    qianxing_map_tone(image).is_some_and(|(dark, dark_teal)| {
-        dark >= QIANXING_MAP_DARK_MIN && dark_teal >= QIANXING_MAP_DARK_TEAL_MIN
-    })
-}
-
-/// **亮底千星地图变体**（`map-screen.png`：地图画面本身较亮，暗占比只有 ~10%，
-/// 但暗青占比仍有 ~66%）。严格判据（暗≥0.32）要求暗青虚空型；这个变体是
-/// 千星地图的亮色版。为了不把提瓦特／千星大厅误判，只在**不是提瓦特大世界**时使用，
-/// 且暗占比必须落在窄带 `[0.06, 0.16]`（实测 0.080–0.103），比提瓦特地图/大厅都特异。
-pub(super) fn is_bright_qianxing_map(image: &DynamicImage) -> bool {
-    qianxing_map_tone(image).is_some_and(|(dark, dark_teal)| {
-        (0.06..=0.16).contains(&dark) && dark_teal >= QIANXING_MAP_DARK_TEAL_MIN
-    })
 }

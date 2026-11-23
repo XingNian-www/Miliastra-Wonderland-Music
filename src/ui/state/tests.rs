@@ -127,7 +127,6 @@ fn dump_ui_state_evidence_for_gallery() {
         let (dark, white, dominant) = screen_tone(image);
         let (center160, center480) = loading_center_dark_ratios(image);
         let grid = paimon_menu_grid_structure(image);
-        let map_tone = qianxing_map_tone(image);
         let panel_distance = qianxing_player_panel_distance(image);
         let close_ratios = gallery_overlay_close_ratios(image);
         let surface = crate::ui::routines::test_surface_of(
@@ -175,11 +174,6 @@ fn dump_ui_state_evidence_for_gallery() {
                 "loading_center": {"center160_dark": center160, "center480_dark": center480},
                 "loading_rule": loading_rule(image),
                 "qianxing_map_anchor": gallery_qianxing_map_anchor(image, &templates),
-                "qianxing_map_tone": map_tone.map(|(dark, dark_teal)| serde_json::json!({
-                    "dark": dark, "dark_teal": dark_teal,
-                    "dark_min": QIANXING_MAP_DARK_MIN,
-                    "dark_teal_min": QIANXING_MAP_DARK_TEAL_MIN,
-                })),
                 "qianxing_panel_distance": panel_distance,
                 "qianxing_panel_max": QIANXING_PANEL_MAX,
                 "overlay_close": close_ratios.map(|(blue, white)| serde_json::json!({
@@ -1367,100 +1361,6 @@ fn hud_presence_is_separated_by_reference_distance() {
 /// 与 `loading_screens_are_classified_as_loading` 同样的纪律：不只看结论，
 /// 而是把正负两侧的实测区间算出来，断言**两个轴都不重叠**。
 ///
-/// 第 59 节把正样本从 1 帧补到 4 帧之后才写这条判据——
-/// 第 58 节就是因为拿 n=1 的候选直接上线，才在菜单上自信判错。
-#[test]
-fn qianxing_map_is_separated_by_dark_and_dark_teal_ratios() {
-    if crate::test_support::corpus::skip_without_corpus(
-        "qianxing_map_is_separated_by_dark_and_dark_teal_ratios",
-    ) {
-        return;
-    }
-    let tone_of = |path: &str| {
-        let image = image::open(path).unwrap_or_else(|e| panic!("打不开 {path}: {e}"));
-        qianxing_map_tone(&image).unwrap_or_else(|| panic!("{path} 应能算出统计量"))
-    };
-
-    // 正样本：4 帧千星奇域地图（第 56 节 1 帧 + 第 59 节 3 帧不同缩放）
-    let mut dark_floor = f32::MAX;
-    let mut teal_floor = f32::MAX;
-    for name in [
-        "qianxing-entry-56/07-qianxing-map.jpg",
-        "qianxing-ui-59/qxmap-a.jpg",
-        "qianxing-ui-59/qxmap-b.jpg",
-        "qianxing-ui-59/qxmap-c.jpg",
-    ] {
-        let path = format!("technical-docs/ui-state-evidence/{name}");
-        let (dark, teal) = tone_of(&path);
-        assert!(
-            is_qianxing_map(&image::open(&path).unwrap()),
-            "{path} 是千星地图，必须判为千星（暗 {dark:.4} / 暗青 {teal:.4}）"
-        );
-        dark_floor = dark_floor.min(dark);
-        teal_floor = teal_floor.min(teal);
-    }
-
-    // 负样本：25 帧其他界面（含同样偏暗的活动一览，与偏青的提瓦特地图）
-    let mut dark_ceiling = 0.0_f32;
-    let mut teal_ceiling = 0.0_f32;
-    for name in [
-        "sweep-49/02-map.jpg",
-        "loading-screens/teyvat-map-full-55.jpg",
-        "loading-screens/01-map.jpg",
-        "loading-screens/before-teleport-map.jpg",
-        "sweep-49/01-paimon-menu.jpg",
-        "sweep-50/01-map.jpg",
-        "sweep-49/03-inventory.jpg",
-        "sweep-49/04-character.jpg",
-        "sweep-49/05-adventure-handbook.jpg",
-        "sweep-49/10-F2.jpg",
-        "sweep-49/10-F2b.jpg",
-        "sweep-50/03-after-F2.jpg",
-        "sweep-50/06-F2-real.jpg",
-        "sweep-49/11-activity.jpg",
-        "sweep-49/11-activity-b.jpg",
-        "sweep-49/06-wish.jpg",
-        "sweep-49/07-friends.jpg",
-        "qianxing-entry-56/05-hub-menu.jpg",
-        "exit-to-teyvat-56/01-hub-menu.jpg",
-        "transition-to-overworld/02-hub-menu.jpg",
-        "qianxing-halls-58/hall3-01.jpg",
-        "qianxing-halls-58/hall2-01.jpg",
-        "qianxing-ui-59/start-hall.jpg",
-        "teyvat-regions-58/snow-01.jpg",
-        "teyvat-regions-58/desert-01.jpg",
-    ] {
-        let path = format!("technical-docs/ui-state-evidence/{name}");
-        let (dark, teal) = tone_of(&path);
-        dark_ceiling = dark_ceiling.max(dark);
-        teal_ceiling = teal_ceiling.max(teal);
-    }
-
-    // 两个轴各自都必须不重叠——这是"两项同时成立"能挡住负样本的根本原因。
-    assert!(
-        dark_floor > dark_ceiling,
-        "暗占比两侧必须不重叠：千星最低 {dark_floor:.4} vs 其余最高 {dark_ceiling:.4}"
-    );
-    assert!(
-        teal_floor > teal_ceiling,
-        "暗青占比两侧必须不重叠：千星最低 {teal_floor:.4} vs 其余最高 {teal_ceiling:.4}"
-    );
-    assert!(
-        QIANXING_MAP_DARK_MIN > dark_ceiling && QIANXING_MAP_DARK_MIN <= dark_floor,
-        "暗占比阈值 {} 必须严格落在空档 ({dark_ceiling:.4}, {dark_floor:.4}] 内",
-        QIANXING_MAP_DARK_MIN
-    );
-    assert!(
-        QIANXING_MAP_DARK_TEAL_MIN > teal_ceiling && QIANXING_MAP_DARK_TEAL_MIN <= teal_floor,
-        "暗青阈值 {} 必须严格落在空档 ({teal_ceiling:.4}, {teal_floor:.4}] 内",
-        QIANXING_MAP_DARK_TEAL_MIN
-    );
-
-    // 小裁剪图必须拒判，而不是拿一小块去猜界面。
-    let tiny = DynamicImage::new_rgb8(120, 68);
-    assert_eq!(qianxing_map_tone(&tiny), None);
-    assert!(!is_qianxing_map(&tiny));
-}
 
 /// 千星地图**右下角锚点**：正负两侧必须不重叠，阈值落在空档内。
 ///
@@ -4096,7 +3996,6 @@ fn dump_ui_detect_report() {
     let (dark, white, dominant) = screen_tone(image);
     let (center160, center480) = loading_center_dark_ratios(image);
     let grid = paimon_menu_grid_structure(image);
-    let map_tone = qianxing_map_tone(image);
     let panel_distance = qianxing_player_panel_distance(image);
     let close_ratios = gallery_overlay_close_ratios(image);
     let paimon_region = Rect {
@@ -4200,11 +4099,6 @@ fn dump_ui_detect_report() {
             "loading_center": {"center160_dark": center160, "center480_dark": center480},
             "loading_rule": loading_rule(image),
             "qianxing_map_anchor": gallery_qianxing_map_anchor(image, &templates),
-            "qianxing_map_tone": map_tone.map(|(dark, dark_teal)| serde_json::json!({
-                "dark": dark, "dark_teal": dark_teal,
-                "dark_min": QIANXING_MAP_DARK_MIN,
-                "dark_teal_min": QIANXING_MAP_DARK_TEAL_MIN,
-            })),
             "qianxing_panel_distance": panel_distance,
             "qianxing_panel_max": QIANXING_PANEL_MAX,
             "overlay_close": close_ratios.map(|(blue, white)| serde_json::json!({

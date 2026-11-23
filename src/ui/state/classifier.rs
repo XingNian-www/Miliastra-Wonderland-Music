@@ -23,7 +23,7 @@ use super::args::ResolvedUiTemplateArgs;
 use super::classify::detect_ui_state_with_evidence;
 use super::diagnostic::template_probe;
 use super::fallback::{GameEntryDetection, GameFallbackState, probe_game_state};
-use super::qianxing::{is_bright_qianxing_map, is_qianxing_map, is_qianxing_player_panel};
+use super::qianxing::is_qianxing_player_panel;
 use super::regions::PanelRegions;
 use super::sampling::is_qianxing_overlay_close;
 use super::world::{world_is_teyvat_in, world_probe_evidence};
@@ -162,10 +162,16 @@ impl TemplateUiStateClassifier {
         //   - 它在 `Unknown` 之后才判，所以不会抢走 primary/chat/main_menu 等已有状态；
         //   - 它在回退之前判，所以不会再被回退探针误认成大世界。
         if state.kind == UiStateKind::Unknown {
-            // **首选：右下角锚点模板匹配**（第 74 节）。整屏暗青比例只是后备：
-            // 它判的是"整屏偏暗青"，对亮底地图变体、对其它深色页都不够特异；
-            // 而右下角「千星奇域·大厅」+ 庙宇图标是这一页独有的措辞 + 图形。
+            // 千星地图判据：**只看右下角锚点模板**（第 74 节）——「千星奇域·大厅」
+            // 文字 + 庙宇图标，是这一页独有的措辞 + 图形，对亮底/暗底两个变体都命中。
             // 放在 Unknown 分支最前面：它比 F2 面板（底栏描述子）、提瓦特世界判据都更具体。
+            //
+            // 这里**曾经**还有一层整屏暗青占比后备（见本文件下方注释）。已移除：
+            // 它对亮底变体无效、还要靠窄带阈值与提瓦特地图/大厅区分，唯一作用是
+            // 给"整屏恰好偏暗青但没有那块标签"的页面制造误判。
+            // ⚠️ 代价：锚点判据**依赖 `qianxing_map_label` 模板文件**，而色调判据不依赖。
+            // 模板缺失时千星地图不再被这条判据认领，会落到回退探针。若将来出现
+            // 「千星地图读成 Unknown/大世界」的报告，先查这个模板是否随发行版打包。
             // 证据沿用检测链（保留世界判据/标记探针），只追加本锚点探针并换 final_rule。
             if let Some(matched) =
                 qianxing_map_anchor_measure(image, &self.templates.qianxing_map_label_template)?
@@ -233,23 +239,12 @@ impl TemplateUiStateClassifier {
                     evidence,
                 ));
             }
-            if is_qianxing_map(image) {
-                self.game_fallback.reset();
-                return Ok(UiStateClassification::with_evidence(
-                    UiStateKind::Secondary,
-                    "secondary:qianxing_map",
-                    evidence,
-                ));
-            }
-            // 亮底千星地图变体：必须在提瓦特世界判据之后（提瓦特地图/传送帧归 Overworld）。
-            if is_bright_qianxing_map(image) {
-                self.game_fallback.reset();
-                return Ok(UiStateClassification::with_evidence(
-                    UiStateKind::Secondary,
-                    "secondary:qianxing_map",
-                    evidence,
-                ));
-            }
+            // 这里**曾经**还有一层「整屏暗青占比」后备判据（`is_qianxing_map` +
+            // 亮底变体 `is_bright_qianxing_map`），现已移除：真正的判据是上面那个
+            // 右下角锚点模板（「千星奇域·大厅」文字 + 庙宇图标），它对亮底/暗底
+            // 两个变体都命中，而整屏色调只对暗底虚空版有效、还要靠窄带阈值区分
+            // 提瓦特地图与大厅——两个判据叠在一起时，色调那层唯一的作用是给
+            // 「整屏恰好偏暗青但没有那块标签」的页面制造误判。
         }
         let mut base =
             UiStateClassification::with_evidence(state.kind, state.to_string(), evidence);

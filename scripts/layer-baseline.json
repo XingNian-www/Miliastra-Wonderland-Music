@@ -2160,7 +2160,7 @@
       "pub_items": 5
     },
     "src/config/schema/games.rs": {
-      "lines": 330,
+      "lines": 326,
       "pub_items": 5
     },
     "src/config/schema/general.rs": {
@@ -2224,8 +2224,8 @@
       "pub_items": 14
     },
     "src/config/types/mod.rs": {
-      "lines": 38,
-      "pub_items": 8
+      "lines": 48,
+      "pub_items": 9
     },
     "src/config/types/paths.rs": {
       "lines": 183,
@@ -2300,7 +2300,7 @@
       "pub_items": 2
     },
     "src/features/command.rs": {
-      "lines": 557,
+      "lines": 556,
       "pub_items": 36
     },
     "src/features/command_access.rs": {
@@ -2484,7 +2484,7 @@
       "pub_items": 1
     },
     "src/features/playback/mod.rs": {
-      "lines": 1847,
+      "lines": 1837,
       "pub_items": 65
     },
     "src/features/playback/queue.rs": {
@@ -2956,7 +2956,7 @@
       "pub_items": 3
     },
     "src/ui/state/classifier.rs": {
-      "lines": 361,
+      "lines": 356,
       "pub_items": 5
     },
     "src/ui/state/classify.rs": {
@@ -2992,8 +2992,8 @@
       "pub_items": 16
     },
     "src/ui/state/qianxing.rs": {
-      "lines": 291,
-      "pub_items": 26
+      "lines": 209,
+      "pub_items": 16
     },
     "src/ui/state/regions.rs": {
       "lines": 20,

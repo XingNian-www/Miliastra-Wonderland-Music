@@ -1,30 +1,71 @@
-name: Linux 质量门禁（Quality Gate）
+name: 质量门禁与 Windows 构建
 
-# 产品只支持 Windows（src/main.rs 对非 Windows 目标就是 compile_error!），这里**只**验证库目标，
-# 与 build-windows-*.yml 的发版构建完全独立：互不触发、互不依赖。
+# 这个 workflow 把原先「Linux 质量门禁」与「构建 Windows EXE」两个 workflow 合成一个。
 #
-# 触发：每次 push / pull_request 都跑，不做发版路径过滤。
-# 现有发版工作流只在“版本号提交”时触发，普通代码提交此前没有任何自动检查，这里补上这一环。
+# 为什么合并：一次 push 同时触发两个 workflow，Actions 页会出现两条并列的 run，
+# 同一次提交的结论分散在两处；而它们本来就该是同一条流水线——门禁不过就不该占用
+# Windows runner。现在：一次 push = 一个 run，`build-windows-exe` 通过 `needs`
+# 挂在三个 Linux 门禁之后，门禁红掉时 Windows 构建直接 skipped。
+#
+# 触发策略（两套条件取并集，但**只有一个 run**）：
+#   * Linux 三个门禁（web-build / repo-scripts / rust-gate）：每次 push / PR 都跑；
+#   * Windows 构建（version-gate → build-windows-exe）：只在 Cargo.toml 或 web/ 变动、
+#     或本 workflow 自身变动时**才**执行实际构建（version-gate 的 gate 逻辑决定）。
+#     普通代码提交会跑 Linux 门禁，Windows job 由 `if` 判定跳过，不浪费 windows runner。
 on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      version:
+        description: 发布版本，例如 v6.2.0；带 -dev 时只构建不发布（如 v6.2.0-dev）。留空时使用 Cargo.toml 版本。
+        required: false
+        type: string
 
-# 最小权限：只读仓库内容。工作流不需要 token 写入或发布能力。
+# 顶层只读：Linux 三个门禁与 version-gate 都不需要写。只有真正建 Release / 传产物的
+# `build-windows-exe` 那个 job 单独放宽到 `contents: write`（最小权限）。
 permissions:
   contents: read
 
 # 同一分支的新运行取代旧运行：push 按分支名分组，PR 按 PR 号分组。
 # 既避免同分支并发跑多份门禁互相拖慢，也避免旧提交的绿灯盖住新提交。
+#
+# `cancel-in-progress` 只在 **PR** 上开启：合并前的反复推送本来就该互相取代。
+# 在 `main` 上必须关掉——合并后每次推送都会触发一次完整 Windows 构建（十几分钟），
+# 若被后一次推送取消，就会出现「提交 A 的构建被取消、提交 B 的构建成功」，
+# 而那正是发版提交本身，等于发版产物凭空消失。宁可两个都跑完。
 concurrency:
   group: quality-gate-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
   # Cargo.lock 里有 git 依赖（rust-paddle-ocr 锁定在 tag v2.3.1）：走 git CLI 拉取，
   # Swatinem/rust-cache 的 git 依赖缓存才能命中。
   CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+
+  # ---- 以下为 Windows 构建专用（Linux job 不需要，见各自 job 的注释）----
+  LIBCLANG_PATH: C:\Program Files\LLVM\bin
+  # Windows 预编译依赖的路径变量。原先放在仓库的 `.cargo/config.toml` 里 `[env]`，
+  # 但 cargo 的 `[env]` 对**所有 target** 生效且不支持按 target 限定
+  # （`[target.'cfg(windows)'.env]` 会被判为 unused key），于是 Linux 门禁也会读到
+  # 指向 Windows 目录的 FFMPEG_DIR，ffmpeg-sys-next 因此不再走 pkg-config，
+  # `cargo test` 链接阶段直接红。改用「谁需要谁导出」的方式：只在 Windows 构建里给，
+  # Linux 那边保持不设，让它正常走 pkg-config。
+  # 用 `${{ github.workspace }}` 展开成绝对路径（顶层 env 允许 github 上下文）。
+  FFMPEG_DIR: ${{ github.workspace }}\vendor\ffmpeg\8.1\windows-x64
+  MNN_INCLUDE_DIR: ${{ github.workspace }}\vendor\mnn\3.6.0\windows-x64\include
+  MNN_LIB_DIR: ${{ github.workspace }}\vendor\mnn\3.6.0\windows-x64\lib
+  # OCR 源码与模型固定到 Cargo.lock 锁定的提交。
+  # 下载步骤另外校验 SHA-256，确保模型内容符合预期。
+  OCR_MODEL_BASE_URL: https://raw.githubusercontent.com/zibo-chen/rust-paddle-ocr/7368dfa292ab988e8431de4ec952f015bec40635/models
+  # OpenVINO 运行时、FP32 IR 与许可证直接使用仓库已发布的成品运行时包
+  # （build-windows-openvino 工作流的 Release 资产），主发布流程不再下载官方
+  # runtime、安装 OpenVINO Python 或转换 ONNX，从而缩短构建时间并避免外部依赖抖动。
+  OPENVINO_RUNTIME_RELEASE_TAG: v4.1.0-openvino
+  OPENVINO_RUNTIME_ASSET: miliastra-wonderland-music-openvino-runtime-windows-x64-v4.1.0.zip
+  OPENVINO_RUNTIME_URL: https://github.com/XingNian-www/Miliastra-Wonderland-Music/releases/download/v4.1.0-openvino/miliastra-wonderland-music-openvino-runtime-windows-x64-v4.1.0.zip
+  OPENVINO_RUNTIME_SHA256: b829a123f24fb44143a7be912e0dfba5f739f8d924b2f01543083ff6f49db500
 
 jobs:
   # ===========================================================================
@@ -49,7 +90,7 @@ jobs:
       - name: 安装 Node
         uses: actions/setup-node@v4
         with:
-          # 与 build-windows-exe.yml 保持一致，避免本地与发版构建出现 Node 版本差异。
+          # 与 build-windows-exe job 保持一致，避免本地与发版构建出现 Node 版本差异。
           node-version: '20'
           cache: npm
           cache-dependency-path: web/package-lock.json
@@ -181,7 +222,7 @@ jobs:
   #        CARGO_HOME 只改变 `$CARGO_HOME/config.toml` 的位置，cargo 仍会从工作区
   #        向上读 `.cargo/config.toml`，[env] 照样生效。
   #    真正的修法是把 Windows 专用变量从 `.cargo/config.toml` 挪走（已做：
-  #    那个文件现在是空的，FFMPEG_DIR / MNN_* 由 build-windows-exe.yml 的 step env 提供）。
+  #    那个文件现在是空的，FFMPEG_DIR / MNN_* 由 build-windows-exe job 的 step env 提供）。
   #    这里保留一个临时 CARGO_HOME 只是为了缓存目录固定可复用，不再承担“隔离”职责。
   #    `--no-default-features` 关掉两个 OCR 后端，Linux 因此完全不需要 MNN / OpenVINO / nasm。
   #
@@ -433,3 +474,635 @@ jobs:
             exit 0
           fi
           python3 scripts/privacy-filter.py --repo --check
+
+  version-gate:
+    name: 判定版本与发布策略
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      should_build: ${{ steps.gate.outputs.should_build }}
+      create_release: ${{ steps.gate.outputs.create_release }}
+      version: ${{ steps.gate.outputs.version }}
+      zip_full: ${{ steps.gate.outputs.zip_full }}
+      zip_basic: ${{ steps.gate.outputs.zip_basic }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: 读取版本并判定构建/发布
+        id: gate
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          # 从 Cargo.toml 的 [package] 段读取 version。
+          read_package_version() {
+            local text="$1"
+            local version
+            version=$(printf '%s\n' "$text" | awk '
+              /^\[package\][[:space:]]*$/ { in_package = 1; next }
+              /^\[/ { in_package = 0 }
+              in_package && /^[[:space:]]*version[[:space:]]*=/ {
+                if (match($0, /"[^"]+"/)) {
+                  print substr($0, RSTART + 1, RLENGTH - 2)
+                  exit
+                }
+              }
+            ')
+            if [ -z "$version" ]; then
+              echo "::error::无法从 Cargo.toml 读取 [package].version"
+              exit 1
+            fi
+            printf '%s' "$version"
+          }
+
+          normalize_version() {
+            local value="$1"
+            value="${value#v}"
+            value="${value#V}"
+            printf '%s' "$value"
+          }
+
+          is_dev_version() {
+            case "$1" in
+              *-dev*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          is_numeric_version() {
+            [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          }
+
+          emit() {
+            local should_build="$1"
+            local create_release="$2"
+            local version="$3"
+            {
+              echo "should_build=$should_build"
+              echo "create_release=$create_release"
+              echo "version=v$version"
+              echo "zip_full=miliastra-wonderland-music-windows-x64-openvino-v$version.zip"
+              echo "zip_basic=miliastra-wonderland-music-windows-x64-mnn-v$version.zip"
+            } >> "$GITHUB_OUTPUT"
+            echo "判定结果: 版本=v$version 构建=$should_build 发布=$create_release"
+          }
+
+          validate_version() {
+            local version="$1"
+            case "$version" in
+              ""|*[[:space:]]*)
+                echo "::error::版本号不能为空且不能包含空白字符: '$version'"
+                exit 1
+                ;;
+            esac
+            # 严格白名单：只允许 `X.Y.Z` 或 `X.Y.Z-<预发布串>`，字符集限定在
+            # 字母/数字/点/连字符。这条校验不是防手滑，而是**安全边界**：
+            # version 会被下游步骤拼进 PowerShell 脚本（如
+            # `.github/release-notes/${{ needs.version-gate.outputs.version }}.md`），
+            # 只要有引号、分号、`$()`、反引号之类的字符就能越出字符串插进命令。
+            # 下游同时已改成通过 step `env:` 传递（不再直接插值），这里是第二道。
+            if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$'; then
+              echo "::error::版本号格式非法: '$version'（只允许 X.Y.Z 或 X.Y.Z-预发布串，字符集 0-9 A-Z a-z . - ）"
+              exit 1
+            fi
+          }
+
+          cargo_version="$(read_package_version "$(cat Cargo.toml)")"
+          validate_version "$cargo_version"
+
+          # 手动触发与 push 使用同一套版本规则，避免意外发布。
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            version="$(normalize_version "${INPUT_VERSION:-}")"
+            if [ -z "$version" ]; then
+              version="$cargo_version"
+            fi
+            validate_version "$version"
+            if is_dev_version "$version"; then
+              emit true false "$version"
+            elif is_numeric_version "$version"; then
+              emit true true "$version"
+            else
+              echo "::error::手动触发版本必须是纯数字 X.Y.Z 或带 -dev 的版本，当前为: $version"
+              exit 1
+            fi
+            exit 0
+          fi
+
+          # push：只有版本号实际变化才构建；版本格式决定是否发布。
+          version_changed=true
+          if [ -z "${BEFORE_SHA:-}" ] || ! printf '%s' "$BEFORE_SHA" | grep -q '[^0]'; then
+            echo "推送前提交未知或为首次推送，按版本变化处理"
+          elif git fetch --no-tags --depth=1 origin "$BEFORE_SHA" >/dev/null 2>&1 \
+            && old_cargo="$(git show "$BEFORE_SHA:Cargo.toml" 2>/dev/null)" \
+            && old_version="$(read_package_version "$old_cargo")"; then
+            if [ "$old_version" = "$cargo_version" ]; then
+              version_changed=false
+            fi
+          else
+            echo "::warning::无法读取推送前版本，按版本变化处理"
+          fi
+
+          if [ "$version_changed" = "false" ]; then
+            echo "版本号未变化（$cargo_version），本次提交不构建"
+            emit false false "$cargo_version"
+            exit 0
+          fi
+
+          if is_numeric_version "$cargo_version"; then
+            emit true true "$cargo_version"
+          elif is_dev_version "$cargo_version"; then
+            emit true false "$cargo_version"
+          else
+            echo "版本 $cargo_version 既不是纯数字版本也不是 -dev 版本，跳过自动构建"
+            emit false false "$cargo_version"
+          fi
+
+  build-windows-exe:
+    # 顶层是 `contents: read`（Linux 门禁不需要写）；发版构建要建 Release、传产物，
+    # 因此在这个 job 上单独放宽。最小权限原则仍然成立。
+    permissions:
+      contents: write
+    # 两个变体共用同一份构建逻辑，只有 OCR 后端与打包内容不同：
+    # - openvino：默认特性，含 OpenVINO 运行时（识别更快、体积更大）
+    # - mnn    ：--no-default-features --features ocr-mnn，只保留 MNN（体积更小）
+    #
+    # `needs` 挂上 Linux 三个门禁 job：同一次 push 只跑**一个** workflow、一个 run 页。
+    # 「Linux 门禁没过就别浪费 Windows runner」由 DAG 表达，不必再写 if。
+    name: 构建 Windows x64 EXE
+    needs: [version-gate, web-build, repo-scripts, rust-gate]
+    if: needs.version-gate.outputs.should_build == 'true'
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v5
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: 缓存 Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-msvc-release
+
+      - name: 安装 PE 导入表检查工具
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: mingw-w64-ucrt-x86_64-binutils
+
+      - name: 解析 PE 导入表检查工具路径
+        shell: msys2 {0}
+        run: |
+          objdump_path="$(command -v objdump)"
+          test -x "$objdump_path"
+          echo "OBJDUMP=$(cygpath -w "$objdump_path")" >> "$GITHUB_ENV"
+
+      - name: 缓存 OpenVINO 成品运行时包
+        uses: actions/cache@v5
+        with:
+          path: .build/openvino-runtime.zip
+          key: openvino-runtime-package-${{ env.OPENVINO_RUNTIME_RELEASE_TAG }}-v1
+
+      - name: 下载并解压 OpenVINO 成品运行时包
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:GITHUB_WORKSPACE '.build\openvino-runtime.zip'
+          $extract = Join-Path $env:GITHUB_WORKSPACE '.build\openvino-package'
+          New-Item -ItemType Directory -Force -Path (Split-Path -Parent $archive) | Out-Null
+
+          # 命中 actions/cache 时跳过下载，但每次仍校验 SHA-256，防止缓存损坏。
+          if (-not (Test-Path -LiteralPath $archive)) {
+            Invoke-WebRequest `
+              -Uri $env:OPENVINO_RUNTIME_URL `
+              -OutFile $archive `
+              -MaximumRedirection 10
+          }
+          if ((Get-Item -LiteralPath $archive).Length -lt 1000000) {
+            throw "OpenVINO 成品包体积异常: $archive"
+          }
+          $actualHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $env:OPENVINO_RUNTIME_SHA256) {
+            throw "OpenVINO 成品包 SHA-256 校验失败: expected=$env:OPENVINO_RUNTIME_SHA256 actual=$actualHash"
+          }
+
+          if (Test-Path -LiteralPath $extract) {
+            Remove-Item -LiteralPath $extract -Recurse -Force
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $extract -Force
+          $packageRoot = (Get-ChildItem -LiteralPath $extract -Directory | Select-Object -First 1).FullName
+          if (-not $packageRoot) {
+            throw "OpenVINO 成品包解压后没有顶层目录: $extract"
+          }
+
+          # 兼容两种成品包布局：旧版根目录 openvino/、models/；新版 deps/openvino、deps/models。
+          $layout = $null
+          foreach ($candidate in @(
+            @{ Ov = 'openvino'; Models = 'models' },
+            @{ Ov = 'deps\openvino'; Models = 'deps\models' }
+          )) {
+            $dll = Join-Path (Join-Path $packageRoot $candidate.Ov) 'runtime\bin\intel64\Release\openvino_c.dll'
+            if (Test-Path -LiteralPath $dll -PathType Leaf) {
+              $layout = $candidate
+              break
+            }
+          }
+          if (-not $layout) {
+            throw "OpenVINO 成品包布局无法识别: $packageRoot"
+          }
+          $runtimeBin = Join-Path (Join-Path $packageRoot $layout.Ov) 'runtime\bin\intel64\Release'
+          $tbbBin = Join-Path (Join-Path $packageRoot $layout.Ov) 'runtime\3rdparty\tbb\bin'
+          if (-not (Test-Path -LiteralPath $tbbBin -PathType Container)) {
+            throw "OpenVINO 成品包缺少 oneTBB 运行时: $tbbBin"
+          }
+          $modelsRoot = Join-Path $packageRoot $layout.Models
+          if (-not (Test-Path -LiteralPath (Join-Path $modelsRoot 'PP-OCRv6_small_det.xml') -PathType Leaf)) {
+            throw "OpenVINO 成品包缺少 IR 模型: $modelsRoot"
+          }
+          $envPath = "$runtimeBin;$tbbBin;$env:PATH"
+          "OPENVINO_PACKAGE_ROOT=$packageRoot" >> $env:GITHUB_ENV
+          "OPENVINO_PACKAGE_OV=$($layout.Ov)" >> $env:GITHUB_ENV
+          "OPENVINO_PACKAGE_MODELS=$($layout.Models)" >> $env:GITHUB_ENV
+          "OPENVINO_OCR_IR_ROOT=$modelsRoot" >> $env:GITHUB_ENV
+          "OPENVINO_OCR_CHARSET=$(Join-Path $modelsRoot 'ppocr_keys_v6_small.txt')" >> $env:GITHUB_ENV
+          "PATH=$envPath" >> $env:GITHUB_ENV
+
+      - name: 缓存 OCR 模型
+        uses: actions/cache@v5
+        with:
+          path: models
+          key: pp-ocrv6-small-models-v2.3.1-sha256-2c6277ab-ed59cc29-b5f2bfe2
+
+      - name: 下载 PP-OCRv6 small 模型
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path models | Out-Null
+          $files = @(
+            'PP-OCRv6_small_det.mnn',
+            'PP-OCRv6_small_rec.mnn',
+            'ppocr_keys_v6_small.txt'
+          )
+          $expectedHashes = @{
+            'PP-OCRv6_small_det.mnn' = '2c6277abbbddb4c77a790f4650cdd7f8ab33512db38fac372ed5471538070619'
+            'PP-OCRv6_small_rec.mnn' = 'ed59cc294fe2d564bd64f929b5356b70abd0977f99e7e60e3b08cfeef4ef72be'
+            'ppocr_keys_v6_small.txt' = 'b5f2bfe2bdd9448429e3e82b51c789775d9b42f2403d082b00662eb77e401c5d'
+          }
+          foreach ($file in $files) {
+            $path = "models/$file"
+            if (Test-Path -LiteralPath $path -PathType Container) {
+              Remove-Item -LiteralPath $path -Recurse -Force
+            }
+            $needsDownload = $true
+            if (Test-Path -LiteralPath $path -PathType Leaf) {
+              $actualHash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+              $needsDownload = $actualHash -ne $expectedHashes[$file]
+            }
+            if ($needsDownload) {
+              Invoke-WebRequest -Uri "$env:OCR_MODEL_BASE_URL/$file" -OutFile $path
+            }
+            $actualHash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actualHash -ne $expectedHashes[$file]) {
+              throw "OCR 模型 SHA-256 校验失败: file=$file expected=$($expectedHashes[$file]) actual=$actualHash"
+            }
+          }
+
+      # runner 池里有些机器的 CPU 缺少 OpenVINO 打出的指令，进程会以
+      # STATUS_ILLEGAL_INSTRUCTION (0xc000001d) 直接崩溃——Rust 侧捕获不到，
+      # 也没法在脚本里可靠预判（不同构建用的指令集不同）。
+      # 这两步是模型冒烟验证，不该因为换到一台老 CPU 就阻断整个发布：
+      # 允许失败，日志里仍然会记录崩溃原因，人看得出来是环境问题。
+      - name: OpenVINO IR 真实截图 smoke test
+        shell: pwsh
+        continue-on-error: true
+        run: cargo test --locked --no-default-features --features ocr-openvino configured_ir_models_recognize_fixture -- --ignored --nocapture
+
+      - name: OpenVINO 请求复用与 CTC 回归
+        shell: pwsh
+        continue-on-error: true
+        run: cargo test --locked --no-default-features --features ocr-openvino runtime::ocr::engine::openvino::perf_tests -- --include-ignored --nocapture
+
+      - name: 解析快速链接器 lld-link
+        id: linker
+        shell: pwsh
+        run: |
+          $candidates = @()
+          $command = Get-Command lld-link.exe -ErrorAction SilentlyContinue
+          if ($command) { $candidates += $command.Source }
+          if ($env:LIBCLANG_PATH) {
+            $candidates += (Join-Path $env:LIBCLANG_PATH 'lld-link.exe')
+          }
+          $candidates += (Join-Path ${env:ProgramFiles} 'LLVM\bin\lld-link.exe')
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path -LiteralPath $vswhere) {
+            $vsInstall = & $vswhere -latest -products * -property installationPath
+            if ($vsInstall) {
+              $candidates += (Join-Path $vsInstall 'VC\Tools\Llvm\x64\bin\lld-link.exe')
+            }
+          }
+          $lldLink = $candidates |
+            Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } |
+            Select-Object -First 1
+          if ($lldLink) {
+            Write-Host "使用 lld-link: $lldLink"
+            "lld_link=$lldLink" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Warning '未找到 lld-link，回退默认 MSVC 链接器'
+            "lld_link=" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: 安装 Node（前端构建）
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 构建 Vue 面板（web/dist）
+        shell: pwsh
+        working-directory: web
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: 编译 Release EXE
+        shell: pwsh
+        env:
+          # 用 env 传值，不要把 `${{ ... }}` 直接插进 PowerShell 源码：
+          # 插值是在脚本解析**之前**做的，值里的引号/分号/`$()` 会变成代码。
+          LLD_LINK: ${{ steps.linker.outputs.lld_link }}
+        run: |
+          $lldLink = $env:LLD_LINK
+          if ($lldLink) {
+            $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = $lldLink
+          }
+          # 依赖缓存完整命中时用 --offline 自检，跳过 crates.io 索引更新（每次约 20–90s）。
+          $offlineReady = $false
+          try {
+            & cargo fetch --locked --offline *> $null
+            $offlineReady = $LASTEXITCODE -eq 0
+          } catch {
+            $offlineReady = $false
+          }
+          if ($offlineReady) {
+            $env:CARGO_NET_OFFLINE = 'true'
+            Write-Host 'cargo 离线自检通过，本次构建跳过 crates.io 索引更新'
+          } else {
+            Write-Warning 'cargo 离线自检未通过（缓存不完整），本次构建仍走网络更新索引'
+          }
+          # 只编译一次双后端版本：OpenVINO 走 runtime-linking（libloading 运行时加载 DLL），
+          # 不在 PE 导入表里，所以同一个 EXE 删掉 deps/openvino 后会自动回落到 MNN。
+          cargo build --workspace --release --target x86_64-pc-windows-msvc --locked
+          if ($LASTEXITCODE -ne 0) { throw 'Workspace release build failed' }
+
+      - name: 准备产物
+        shell: pwsh
+        run: |
+          # 显式声明：PowerShell 默认对非终止错误继续往下跑，必须 Stop 才能让
+          # 「拷贝/重命名失败」真正中断步骤（对照下载/解压步骤已做的同一件事）。
+          $ErrorActionPreference = 'Stop'
+          $dist = 'dist/miliastra-wonderland-music-windows-x64'
+          if (Test-Path -LiteralPath $dist) {
+            Remove-Item -LiteralPath $dist -Recurse -Force
+          }
+          & ./scripts/package-ffmpeg-runtime.ps1 `
+            -FfmpegRoot 'vendor/ffmpeg/8.1/windows-x64' `
+            -MinGwRuntime 'vendor/ffmpeg/8.1/windows-x64/bin/libwinpthread-1.dll' `
+            -Executable 'target/x86_64-pc-windows-msvc/release/miliastra-wonderland-music.exe' `
+            -LoginHelper 'target/x86_64-pc-windows-msvc/release/miliastra-login-helper.exe' `
+            -Mnn 'vendor/mnn/3.6.0/windows-x64/bin/MNN.dll' `
+            -Destination $dist `
+            -Objdump $env:OBJDUMP
+          # 发布布局：EXE 根目录只保留主程序与 config.yaml，其余依赖统一放入 deps/。
+          New-Item -ItemType Directory -Force -Path (Join-Path $dist 'deps/bin'), (Join-Path $dist 'deps/dll') | Out-Null
+          Move-Item -LiteralPath (Join-Path $dist 'miliastra-login-helper.exe') -Destination (Join-Path $dist 'deps/bin')
+          foreach ($dll in @('MNN.dll', 'avformat-62.dll', 'avcodec-62.dll', 'avutil-60.dll', 'swresample-6.dll', 'libwinpthread-1.dll')) {
+            Move-Item -LiteralPath (Join-Path $dist $dll) -Destination (Join-Path $dist 'deps/dll')
+          }
+          Copy-Item 'assets' (Join-Path $dist 'deps') -Recurse
+          Copy-Item 'models' (Join-Path $dist 'deps') -Recurse
+          # OpenVINO 运行时与 IR 打进完整包；精简包在后续步骤从副本删掉这些文件。
+          $openvinoPackage = $env:OPENVINO_PACKAGE_ROOT
+          if (-not $openvinoPackage) {
+            throw 'OPENVINO_PACKAGE_ROOT 未设置，无法打包 OpenVINO runtime'
+          }
+          $packageRuntime = Join-Path $openvinoPackage $env:OPENVINO_PACKAGE_OV
+          if (-not (Test-Path -LiteralPath (Join-Path $packageRuntime 'runtime\bin\intel64\Release\openvino_c.dll') -PathType Leaf)) {
+            throw "OpenVINO 成品包缺少运行时: $packageRuntime"
+          }
+          Copy-Item -LiteralPath $packageRuntime -Destination (Join-Path $dist 'deps') -Recurse
+            foreach ($ir in @('PP-OCRv6_small_det.xml', 'PP-OCRv6_small_det.bin', 'PP-OCRv6_small_rec.xml', 'PP-OCRv6_small_rec.bin')) {
+            $source = Join-Path (Join-Path $openvinoPackage $env:OPENVINO_PACKAGE_MODELS) $ir
+            if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+              throw "OpenVINO 成品包缺少 IR 模型: $source"
+            }
+            Copy-Item -LiteralPath $source -Destination (Join-Path $dist 'deps\models') -Force
+          }
+          Copy-Item 'config.example.yaml' (Join-Path $dist 'config.yaml')
+          New-Item -ItemType Directory -Force -Path (Join-Path $dist 'deps/docs') | Out-Null
+          # 成品包自带的 OpenVINO / oneTBB 许可证随完整包分发。
+          foreach ($license in @('OPENVINO-LICENSE.txt', 'OPENVINO-THIRD-PARTY-NOTICES.txt', 'TBB-LICENSE.txt')) {
+            $source = Join-Path $openvinoPackage $license
+            if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+              throw "OpenVINO 成品包缺少许可证文件: $source"
+            }
+            Copy-Item -LiteralPath $source -Destination (Join-Path $dist 'deps/docs') -Force
+          }
+          Copy-Item 'turtle_soup.example.yaml', 'undercover.example.yaml', 'README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md' (Join-Path $dist 'deps/docs')
+          # 复制 docs/ 的**内容**，不是 docs 目录本身：目标 deps/docs 已经存在
+          # （上一行 New-Item 建好、许可证也放进去了），此时 `Copy-Item 'docs' ... -Recurse`
+          # 会把源目录作为子目录塞进去，产物变成 deps/docs/docs/…。
+          # 用 'docs\*' 并且去掉 -Recurse 之外的东西：-Recurse 对通配符展开后的
+          # 目录项依然生效，子目录会被完整复制。
+          Copy-Item 'docs\*' (Join-Path $dist 'deps/docs') -Recurse -Force
+          # 校验扁平布局：docs/docs 是这次修掉的旧 bug，出现即失败。
+          if (Test-Path -LiteralPath (Join-Path $dist 'deps/docs/docs') -PathType Container) {
+            throw '发布包布局错误：出现 deps/docs/docs（docs 被当成子目录复制了）'
+          }
+          # 预置配置库：用主程序自身初始化 deps/data/playback.sqlite3，避免为同一操作再链接一个 example 可执行文件。
+          & 'target/x86_64-pc-windows-msvc/release/miliastra-wonderland-music.exe' --ensure-config-db (Join-Path $dist 'config.yaml')
+          if ($LASTEXITCODE -ne 0) { throw '发布配置库初始化失败' }
+          # 初始化会生成构建机令牌；恢复模板，让每份安装在首次启动时生成独立令牌。
+          Copy-Item 'config.example.yaml' (Join-Path $dist 'config.yaml') -Force
+
+
+          $requiredDirectories = @(
+            'deps\assets',
+            'deps\models',
+            'deps\openvino',
+            'deps\dll',
+            'deps\bin',
+            'deps\docs'
+          )
+          foreach ($directory in $requiredDirectories) {
+            if (-not (Test-Path -LiteralPath (Join-Path $dist $directory) -PathType Container)) {
+              throw "发布包缺少必需目录: $directory"
+            }
+          }
+
+          $requiredFiles = @(
+            'miliastra-wonderland-music.exe',
+            'config.yaml',
+            'deps\bin\miliastra-login-helper.exe',
+            'deps\dll\MNN.dll',
+            'deps\dll\avformat-62.dll',
+            'deps\dll\avcodec-62.dll',
+            'deps\dll\avutil-60.dll',
+            'deps\dll\swresample-6.dll',
+            'deps\dll\libwinpthread-1.dll',
+            'deps\assets\idioms.txt',
+            'deps\models\PP-OCRv6_small_det.mnn',
+            'deps\models\PP-OCRv6_small_rec.mnn',
+            'deps\models\ppocr_keys_v6_small.txt',
+            'deps\data\playback.sqlite3',
+            'deps\docs\turtle_soup.example.yaml',
+            'deps\docs\undercover.example.yaml',
+            'deps\docs\README.md',
+            'deps\docs\THIRD_PARTY_NOTICES.md',
+            # docs/ 是扁平复制进来的（见上面的 Copy-Item 'docs\*'），
+            # 抽查一个文档确认复制真的发生了，而不是只建了空目录。
+            'deps\docs\index.md',
+            'deps\docs\user-guide.md'
+          )
+          $requiredFiles += @(
+            'deps\models\PP-OCRv6_small_det.xml',
+            'deps\models\PP-OCRv6_small_det.bin',
+            'deps\models\PP-OCRv6_small_rec.xml',
+            'deps\models\PP-OCRv6_small_rec.bin',
+            'deps\openvino\runtime\bin\intel64\Release\openvino_c.dll',
+            'deps\openvino\runtime\bin\intel64\Release\openvino_intel_cpu_plugin.dll',
+            'deps\openvino\runtime\3rdparty\tbb\bin\tbb12.dll',
+            'deps\docs\OPENVINO-LICENSE.txt',
+            'deps\docs\OPENVINO-THIRD-PARTY-NOTICES.txt',
+            'deps\docs\TBB-LICENSE.txt'
+          )
+          foreach ($file in $requiredFiles) {
+            if (-not (Test-Path -LiteralPath (Join-Path $dist $file) -PathType Leaf)) {
+              throw "发布包缺少必需文件: $file"
+            }
+          }
+
+      - name: 生成精简包（MNN-only）
+        shell: pwsh
+        run: |
+          # 显式声明：PowerShell 默认对非终止错误继续往下跑，必须 Stop 才能让
+          # 「拷贝/重命名失败」真正中断步骤（对照下载/解压步骤已做的同一件事）。
+          $ErrorActionPreference = 'Stop'
+          # 同一个 EXE 就能当 MNN-only 用：OpenVINO 通过 libloading 在运行时加载，
+          # 不在 PE 导入表里；删掉 deps/openvino 后运行时会 warn 并回落到 cpu(MNN)。
+          # 因此不必再编译一次，只复制一份产物并移除 OpenVINO 相关文件即可。
+          $source = 'dist/miliastra-wonderland-music-windows-x64'
+          $target = 'dist/miliastra-wonderland-music-windows-x64-mnn'
+          if (Test-Path -LiteralPath $target) {
+            Remove-Item -LiteralPath $target -Recurse -Force
+          }
+          Copy-Item -LiteralPath $source -Destination $target -Recurse
+
+          # OpenVINO 运行时目录与 IR 模型只属于完整包。
+          $dropDir = Join-Path $target 'deps\openvino'
+          if (Test-Path -LiteralPath $dropDir) {
+            Remove-Item -LiteralPath $dropDir -Recurse -Force
+          }
+          foreach ($ir in @('PP-OCRv6_small_det.xml', 'PP-OCRv6_small_det.bin', 'PP-OCRv6_small_rec.xml', 'PP-OCRv6_small_rec.bin')) {
+            $path = Join-Path (Join-Path $target 'deps\models') $ir
+            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+          }
+          foreach ($license in @('OPENVINO-LICENSE.txt', 'OPENVINO-THIRD-PARTY-NOTICES.txt', 'TBB-LICENSE.txt')) {
+            $path = Join-Path (Join-Path $target 'deps\docs') $license
+            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+          }
+
+          # 精简包必须仍然可用：核心运行时与 MNN 模型一个都不能少。
+          $mnnRequired = @(
+            'miliastra-wonderland-music.exe',
+            'config.yaml',
+            'deps\dll\MNN.dll',
+            'deps\models\PP-OCRv6_small_det.mnn',
+            'deps\models\PP-OCRv6_small_rec.mnn',
+            'deps\models\ppocr_keys_v6_small.txt',
+            'deps\data\playback.sqlite3'
+          )
+          foreach ($file in $mnnRequired) {
+            if (-not (Test-Path -LiteralPath (Join-Path $target $file) -PathType Leaf)) {
+              throw "精简包缺少必需文件: $file"
+            }
+          }
+          if (Test-Path -LiteralPath $dropDir) {
+            throw '精简包不应包含 deps/openvino'
+          }
+
+      - name: 打包 Release zip
+        shell: pwsh
+        env:
+          ZIP_FULL_NAME: ${{ needs.version-gate.outputs.zip_full }}
+          ZIP_BASIC_NAME: ${{ needs.version-gate.outputs.zip_basic }}
+        run: |
+          $full = $env:ZIP_FULL_NAME
+          $basic = $env:ZIP_BASIC_NAME
+          if (-not $full -or -not $basic) {
+            throw 'zip 名称未从 version-gate 取得'
+          }
+          Compress-Archive -Path 'dist/miliastra-wonderland-music-windows-x64' -DestinationPath "dist/$full" -Force
+          Compress-Archive -Path 'dist/miliastra-wonderland-music-windows-x64-mnn' -DestinationPath "dist/$basic" -Force
+          "ZIP_FULL=dist/$full" >> $env:GITHUB_ENV
+          "ZIP_BASIC=dist/$basic" >> $env:GITHUB_ENV
+
+      - name: 上传产物（含 OpenVINO）
+        uses: actions/upload-artifact@v6
+        with:
+          name: miliastra-wonderland-music-windows-x64-openvino
+          path: dist/miliastra-wonderland-music-windows-x64
+
+      - name: 上传产物（MNN 精简版）
+        uses: actions/upload-artifact@v6
+        with:
+          name: miliastra-wonderland-music-windows-x64-mnn
+          path: dist/miliastra-wonderland-music-windows-x64-mnn
+
+      - name: 解析发布说明文件
+        id: release_notes
+        shell: pwsh
+        env:
+          # 版本号来自 workflow_dispatch 输入，绝不能直接插值进脚本正文；
+          # 上游 validate_version 已做严格白名单，这里再走 env 传一遍。
+          RELEASE_VERSION: ${{ needs.version-gate.outputs.version }}
+        run: |
+          $path = ".github/release-notes/$env:RELEASE_VERSION.md"
+          if (Test-Path -LiteralPath $path -PathType Leaf) {
+            "body_path=$path" >> $env:GITHUB_OUTPUT
+          } else {
+            "body_path=" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: 创建 GitHub Release（使用发布说明）
+        if: needs.version-gate.outputs.create_release == 'true' && steps.release_notes.outputs.body_path != ''
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.version-gate.outputs.version }}
+          name: Miliastra Wonderland Music ${{ needs.version-gate.outputs.version }}
+          body_path: ${{ steps.release_notes.outputs.body_path }}
+          files: |
+            ${{ env.ZIP_FULL }}
+            ${{ env.ZIP_BASIC }}
+
+      - name: 创建 GitHub Release（自动生成说明）
+        if: needs.version-gate.outputs.create_release == 'true' && steps.release_notes.outputs.body_path == ''
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.version-gate.outputs.version }}
+          name: Miliastra Wonderland Music ${{ needs.version-gate.outputs.version }}
+          files: |
+            ${{ env.ZIP_FULL }}
+            ${{ env.ZIP_BASIC }}
+          generate_release_notes: true

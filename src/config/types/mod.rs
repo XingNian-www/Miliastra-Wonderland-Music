@@ -22,6 +22,16 @@ pub(crate) use aggregate::{AppConfig, BootstrapConfig, MAX_REPLY_OVERRIDE_CHARS}
 pub(crate) use general::{
     HotkeyConfig, OutputConfig, PointConfig, RectConfig, ScreenConfig, WindowConfig,
 };
+// 这两个符号只被 Windows-only 代码取用（`adapters/windows/window.rs`、
+// `interfaces/hotkeys.rs`），文件拆成 `types/general.rs` 时**漏在重导出清单外**，
+// 造成 `error[E0432]: no WindowCaptureMethod in config`（note: exists but is inaccessible）。
+//
+// 必须按 `cfg(windows)` 门控，两个方向都不能松：
+//   - 不导出 → Windows Release 构建红（Linux 侧那两个调用点整体被 cfg 排除，看不出来）；
+//   - 无条件导出 → Linux 侧零警告门禁红（`--lib --no-default-features` 下无人使用）。
+// 这与同文件下方 `OpenVinoConfig` 是按 feature 门控同一个道理。
+#[cfg(windows)]
+pub(crate) use general::{WindowCaptureMethod, parse_hotkey_virtual_code};
 pub(crate) use paths::normalize_native_path_string;
 pub(crate) use paths::validate_rect;
 #[cfg(test)]

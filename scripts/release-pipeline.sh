@@ -61,7 +61,7 @@ set -euo pipefail
 
 # 环境拓扑/账号/路径/密钥/端口只从环境变量或 CLI 取，绝不写死。
 REPO="${MILIASTRA_REPO:-}"
-WORKFLOW='build-windows-exe.yml'
+WORKFLOW='quality-gate.yml'
 BRANCH='main'
 PROXY_HOST="${MILIASTRA_PROXY_HOST:-}"
 PROXY_PORT="${MILIASTRA_PROXY_PORT:-}"

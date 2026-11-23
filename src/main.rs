@@ -119,6 +119,112 @@ fn latch_replacement_ready(latched: bool, path: &std::path::Path) -> bool {
     latched || replacement_is_ready(path)
 }
 
+/// `config migrate --dry-run --json <config.yaml>`：迁移预演（只读，不写库）。
+#[cfg(target_os = "windows")]
+fn run_config_cli(
+    mut arguments: impl Iterator<Item = std::ffi::OsString>,
+) -> anyhow::Result<std::process::ExitCode> {
+    use anyhow::bail;
+
+    let subcommand = arguments.next().ok_or_else(|| {
+        anyhow::anyhow!(
+            "用法: miliastra-wonderland-music config migrate [--dry-run] [--json] <config.yaml 路径>"
+        )
+    })?;
+    if subcommand.to_str() != Some("migrate") {
+        bail!("未知 config 子命令 {subcommand:?}（只支持 migrate）");
+    }
+    let mut dry_run = false;
+    let mut json = false;
+    let mut config_path = None;
+    for argument in arguments {
+        match argument.to_str() {
+            Some("--dry-run") => dry_run = true,
+            Some("--json") => json = true,
+            Some(flag) if flag.starts_with('-') => {
+                bail!("未知选项: {flag}（支持 --dry-run / --json）")
+            }
+            _ => {
+                if config_path.is_some() {
+                    bail!("只能指定一个 config.yaml 路径");
+                }
+                config_path = Some(std::path::PathBuf::from(argument));
+            }
+        }
+    }
+    if !dry_run {
+        // 实际迁移由程序启动时的 `ensure_schema` 完成（含备份与回滚）。
+        // CLI 不另开一条写库路径，避免绕过启动链的并发/事务约定。
+        bail!("config migrate 目前只支持 --dry-run：实际迁移由程序启动时自动完成");
+    }
+    let config_path = config_path.ok_or_else(|| {
+        anyhow::anyhow!(
+            "缺少参数: <config.yaml 路径>（用法: miliastra-wonderland-music config migrate --dry-run --json <路径>）"
+        )
+    })?;
+    let report = miliastra_wonderland_music::config_migration_dry_run(&config_path)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_config_migration_report(&report);
+    }
+    let outcome = report
+        .get("outcome")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    if matches!(
+        outcome,
+        "refused_newer_database" | "invalid_database" | "migration_would_fail" | "database_missing"
+    ) {
+        Ok(std::process::ExitCode::from(1))
+    } else {
+        Ok(std::process::ExitCode::SUCCESS)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn print_config_migration_report(report: &serde_json::Value) {
+    let outcome = report
+        .get("outcome")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    println!("配置迁移预演（dry-run，不写库）: {outcome}");
+    if let Some(path) = report
+        .get("database_path")
+        .and_then(serde_json::Value::as_str)
+    {
+        println!("  数据库: {path}");
+    }
+    if let (Some(stored), Some(current)) = (
+        report
+            .get("stored_version")
+            .and_then(serde_json::Value::as_i64),
+        report
+            .get("current_program_version")
+            .and_then(serde_json::Value::as_i64),
+    ) {
+        println!("  版本: v{stored} → v{current}");
+    }
+    if let Some(error) = report.get("error") {
+        println!("  错误: {error}");
+    }
+    if let Some(plan) = report.get("plan") {
+        for key in ["renames", "pruned", "filled", "updated", "content_sections"] {
+            if let Some(items) = plan.get(key).and_then(serde_json::Value::as_array)
+                && !items.is_empty()
+            {
+                println!("  {key}:");
+                for item in items {
+                    println!("    {item}");
+                }
+            }
+        }
+    }
+    if let Some(backup) = report.get("backup") {
+        println!("  备份: {backup}");
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn main() -> anyhow::Result<std::process::ExitCode> {
     use std::process::Command;
@@ -133,22 +239,27 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
     // 发布打包用主程序自身初始化/校验配置库，避免为同一操作再链接一个 example 可执行文件。
     let mut arguments = std::env::args_os();
     let _program = arguments.next();
-    if let Some(flag) = arguments.next()
-        && flag.to_str() == Some("--ensure-config-db")
-    {
-        let config_path = arguments.next().ok_or_else(|| {
-            anyhow::anyhow!(
-                "用法: miliastra-wonderland-music --ensure-config-db <config.yaml 路径>"
-            )
-        })?;
-        let config_path = std::path::PathBuf::from(config_path);
-        let _restart_ms = miliastra_wonderland_music::watchdog_restart_ms(&config_path)
-            .map_err(|error| anyhow::anyhow!("配置库初始化或完整加载失败: {error:#}"))?;
-        println!(
-            "OK: 配置库已初始化并通过完整校验: {}",
-            config_path.display()
-        );
-        return Ok(std::process::ExitCode::SUCCESS);
+    // `config migrate` 是只读预演子命令；与 `--ensure-config-db` 共用同一入口骨架，
+    // 解析到子命令后立即返回，不进入单实例互斥与看门狗逻辑。
+    if let Some(flag) = arguments.next() {
+        if flag.to_str() == Some("config") {
+            return run_config_cli(arguments);
+        }
+        if flag.to_str() == Some("--ensure-config-db") {
+            let config_path = arguments.next().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "用法: miliastra-wonderland-music --ensure-config-db <config.yaml 路径>"
+                )
+            })?;
+            let config_path = std::path::PathBuf::from(config_path);
+            let _restart_ms = miliastra_wonderland_music::watchdog_restart_ms(&config_path)
+                .map_err(|error| anyhow::anyhow!("配置库初始化或完整加载失败: {error:#}"))?;
+            println!(
+                "OK: 配置库已初始化并通过完整校验: {}",
+                config_path.display()
+            );
+            return Ok(std::process::ExitCode::SUCCESS);
+        }
     }
 
     let current_exe = std::env::current_exe().context("定位主程序 EXE 失败")?;

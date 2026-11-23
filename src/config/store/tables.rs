@@ -18,6 +18,46 @@ use rusqlite::OptionalExtension;
 /// 配置三表的名字，供 `ensure_schema` 做「全在 / 全不在 / 部分在」三态判定。
 pub(super) const CONFIG_TABLES: [&str; 3] = ["config_meta", "config_sections", "config_revisions"];
 
+/// 容错隔离表（W5/D7）：坏条目先记在这里再被忽略/删除，用户事后可找回。
+///
+/// **不升 [`super::sqlite::CONFIG_SCHEMA_VERSION`]**：本表只由
+/// `ConfigStore::open` 用 `CREATE TABLE IF NOT EXISTS` 补建，不参与配置三表的
+/// 三态判定（`CONFIG_TABLES` 仍只有三张），也不影响任何版本分支。
+pub(super) const QUARANTINE_TABLE: &str = "config_quarantine";
+
+/// 期望列：(列名, SQLite 声明类型, 是否要求 NOT NULL)。
+pub(super) const QUARANTINE_COLUMNS: [(&str, &str, bool); 6] = [
+    ("id", "INTEGER", false),
+    ("section", "TEXT", true),
+    ("element_ref", "TEXT", true),
+    ("reason", "TEXT", true),
+    ("original_json", "TEXT", true),
+    ("created_at_ms", "INTEGER", true),
+];
+
+/// 确保 `config_quarantine` 存在；表结构不符合期望时**只告警不阻断启动**。
+///
+/// 取舍：这是一张纯附加的“找回”表，坏掉它不应该让用户连程序都起不来；
+/// 写 quarantine 的调用点会把写入失败降级为 warn，原库数据与迁移 `.bak` 仍在。
+pub(super) fn ensure_quarantine_table(connection: &rusqlite::Connection) -> Result<()> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS config_quarantine (
+                id INTEGER PRIMARY KEY,
+                section TEXT NOT NULL,
+                element_ref TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                original_json TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL
+            );",
+    )?;
+    if !table_structure_matches(connection, QUARANTINE_TABLE, &QUARANTINE_COLUMNS)? {
+        log::warn!(
+            "容错隔离表 {QUARANTINE_TABLE} 的结构与当前版本不一致：本次启动的隔离记录可能无法写入，请检查该表（不会影响配置三表与启动）"
+        );
+    }
+    Ok(())
+}
+
 /// 期望列：(列名, SQLite 声明类型, 是否要求 NOT NULL)。
 ///
 /// 主键列（INTEGER/TEXT PRIMARY KEY）在 PRAGMA table_info 中 notnull 为 0，

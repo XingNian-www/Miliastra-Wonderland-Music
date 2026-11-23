@@ -46,6 +46,18 @@ nickname 与账号 UID，命中后统一替换成稳定代号（玩家A、玩家
     - 关掉备份用 `--no-backup`。
   这样与 release-pipeline.sh 的 `git add -A` 不冲突，也不需要改 `.gitignore`
   或那个脚本。注意：还原点里的原文仍在本地磁盘上，用完请自行删除。
+
+数据型文件与二进制扫描（2026-11-23 修，W5a-2 / 审查 §4.3-D2）：
+  旧实现只扫 15 种文本后缀（`CODE_SUFFIXES`），目录模式遇到 `.sqlite3` 直接跳过。
+  所以「把真实 v3 配置库当夹具提交」时 CI 会报 0 命中——而 Git 历史**不可回退**。
+  现在：
+    - **禁止入库的数据型文件**：`git ls-files` 里出现
+      `.sqlite3/.sqlite/.db/.db-wal/.db-shm/.bak/.log` 等后缀即失败并列出文件
+      （`--check` 与 `--write` 都失败：脱敏不能把已跟踪的数据文件变回没跟踪）；
+    - **二进制读法**：`--repo` 下对**全部已跟踪文件**按字节搜索 UTF-8 别名，
+      不再受 `CODE_SUFFIXES` 限制，避免把敏感值藏进不常见后缀；二进制文件无法
+      自动替换，只报告命中文件数，命中即让 `--check` 失败。
+  夹具的正确做法是程序化合成（见 `src/config/store/fixtures/README.md`）。
 """
 import argparse
 import hashlib
@@ -62,6 +74,26 @@ DEFAULT_SOURCE = os.environ.get("MILIASTRA_PANEL_URL", "http://192.168.31.119:18
 DEFAULT_TOKEN = os.environ.get("MILIASTRA_PANEL_TOKEN", "")
 REPO_CODE_ROOTS = ["src", "web/src", "scripts", "technical-docs"]
 CODE_SUFFIXES = {".rs", ".vue", ".js", ".ts", ".mjs", ".py", ".md", ".toml", ".json", ".html", ".css", ".yml", ".yaml", ".sh"}
+# 数据型文件：内容可能是真实配置库、日志或未脱敏备份，**一律禁止入库**。
+# 审查 §4.3-D2 确认旧版目录扫描对后缀不在 CODE_SUFFIXES 的文件直接 continue，
+# 于是带真实 UID/昵称的 .sqlite3 进 Git 也会报 0 命中；Git 历史不可回退，只能在
+# 入口处拦住。用 endswith 元组匹配，能覆盖 `.sqlite3-wal` 这类复合后缀。
+FORBIDDEN_TRACKED_SUFFIXES = (
+    ".sqlite3",
+    ".sqlite",
+    ".sqlite3-wal",
+    ".sqlite3-shm",
+    ".sqlite-wal",
+    ".sqlite-shm",
+    ".db",
+    ".db-wal",
+    ".db-shm",
+    ".db3",
+    ".mdb",
+    ".ldb",
+    ".bak",
+    ".log",
+)
 SKIP_PARTS = {"node_modules", "target", "dist", ".git", ".cargo", "__pycache__"}
 ROOT = Path(__file__).resolve().parent.parent
 # 备份默认落在仓库根下的 `.local/privacy-backups/`：`.gitignore` 里的 `/.local/`
@@ -281,6 +313,73 @@ def iter_targets(paths, repo=False):
             yield path
 
 
+def tracked_files():
+    """`git ls-files` 的仓库内相对路径；git 不可用或不是仓库时返回 None。"""
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "-z"],
+            cwd=str(ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    return [
+        Path(item)
+        for item in result.stdout.decode("utf-8", "surrogateescape").split("\0")
+        if item
+    ]
+
+
+def forbidden_tracked_files(tracked):
+    """已跟踪的数据型文件（后缀命中 FORBIDDEN_TRACKED_SUFFIXES）。"""
+    return [
+        path
+        for path in tracked
+        if str(path).lower().endswith(FORBIDDEN_TRACKED_SUFFIXES)
+    ]
+
+
+def binary_alias_hits(path, aliases):
+    """按字节在已跟踪文件里搜索 UTF-8 别名，返回命中的别名个数。
+
+    分块读取（1 MiB）+ 最大别名长度重叠，避免把大二进制整个读进内存；别名
+    跨块边界时仍能命中。`bytes.lower()` 只折叠 ASCII A-Z，非 ASCII 字节原样，
+    正好对应既有文本扫描「中文精确、拉丁忽略大小写」的口径。
+    """
+    needles = {}
+    for alias in aliases:
+        if not alias:
+            continue
+        raw = alias.encode("utf-8")
+        key = raw.lower() if alias.isascii() else raw
+        needles.setdefault(key, []).append(alias)
+    if not needles:
+        return 0
+    overlap = max(len(key) for key in needles) - 1
+    hit_keys = set()
+    tail = b""
+    try:
+        with (ROOT / path).open("rb") as handle:
+            while True:
+                chunk = handle.read(1 << 20)
+                if not chunk:
+                    break
+                window = tail + chunk
+                lowered = window.lower()
+                for key in needles:
+                    if key in lowered:
+                        hit_keys.add(key)
+                # 只保留可能跨块的上一个别名尾部，避免窗口无限增长。
+                tail = window[-overlap:] if overlap > 0 else b""
+    except OSError:
+        return 0
+    return sum(len(values) for key, values in needles.items() if key in hit_keys)
+
+
 def main():
     parser = argparse.ArgumentParser(description="按身份映射替换文本中的真实昵称/备注/UID")
     parser.add_argument("paths", nargs="*", help="文件/目录，- 表示 stdin；配合 --repo 可省略")
@@ -359,7 +458,39 @@ def main():
         elif not args.check and count:
             if str(path) != "<stdin>":
                 print(sanitized)
+    # 仓库级守卫（W5a-2 / 审查 D2）：数据型文件禁止入库 + 二进制读法兜底。
+    # 两者都基于 `git ls-files`，与目录扫描的 CODE_SUFFIXES 白名单无关。
+    tracked = tracked_files()
+    if tracked is None and (args.repo or args.check):
+        print(
+            "warning: 无法读取 git ls-files（不是仓库或 git 不可用），"
+            "跳过「数据型文件禁止入库」与二进制扫描",
+            file=sys.stderr,
+        )
+    forbidden = forbidden_tracked_files(tracked) if tracked is not None else []
+    binary_hit_files: list[Path] = []
+    if args.repo and tracked is not None:
+        aliases = [alias for alias, _label in alias_to_label]
+        for path in tracked:
+            # 文本后缀已在主循环里按 UTF-8 扫过；这里专治「不常见后缀」。
+            if path.suffix.lower() in CODE_SUFFIXES:
+                continue
+            hits = binary_alias_hits(path, aliases)
+            if hits:
+                binary_hit_files.append(path)
+                print(
+                    f"{path}: 二进制内容命中 {hits} 个身份别名"
+                    "（无法自动替换：必须移出仓库或改存占位符）",
+                    file=sys.stderr,
+                )
+
     print(f"共替换 {total} 处，涉及 {changed_files} 个文件；映射 {len(mappings)} 位玩家、{len(alias_to_label)} 个别名", file=sys.stderr)
+    if args.repo and tracked is not None:
+        print(
+            f"二进制扫描：{len(tracked)} 个已跟踪文件中 {len(binary_hit_files)} 个命中"
+            "（二进制内容不参与自动替换）",
+            file=sys.stderr,
+        )
     if written_backups:
         print(
             f"已把 {len(written_backups)} 份**含未脱敏原文**的还原点写到 {backup_dir}"
@@ -371,7 +502,24 @@ def main():
         print("确认无误后请自行删除这些还原点。", file=sys.stderr)
     elif args.write and changed_files:
         print("未保留还原点（--no-backup）。", file=sys.stderr)
-    if args.check and total:
+    if forbidden:
+        print(
+            "ERROR: 以下数据型文件已被 git 跟踪，禁止入库"
+            "（内容可能是真实配置库/日志/未脱敏备份，Git 历史不可回退）：",
+            file=sys.stderr,
+        )
+        for path in forbidden:
+            print(f"  {path}", file=sys.stderr)
+        print(
+            "处理方式：git rm --cached <文件>，并把后缀加入 .gitignore；"
+            "迁移夹具请改为程序化合成（见 src/config/store/fixtures/README.md）。",
+            file=sys.stderr,
+        )
+    if args.check and (total or binary_hit_files):
+        return 1
+    # 数据型文件是硬红线：即使 `--write` 已经完成脱敏，只要它还在 git 索引里就失败，
+    # 提醒调用方 `git rm --cached`（脱敏不能把「已跟踪」变回「没跟踪」）。
+    if forbidden:
         return 1
     return 0
 

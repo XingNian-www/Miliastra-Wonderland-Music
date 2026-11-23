@@ -1936,7 +1936,7 @@
       "pub_items": 4
     },
     "src/composition.rs": {
-      "lines": 117,
+      "lines": 142,
       "pub_items": 2
     },
     "src/geometry.rs": {
@@ -1948,11 +1948,11 @@
       "pub_items": 13
     },
     "src/lib.rs": {
-      "lines": 243,
-      "pub_items": 26
+      "lines": 255,
+      "pub_items": 27
     },
     "src/main.rs": {
-      "lines": 471,
+      "lines": 582,
       "pub_items": 0
     },
     "src/privacy.rs": {
@@ -2132,8 +2132,8 @@
       "pub_items": 11
     },
     "src/config/migrations.rs": {
-      "lines": 1204,
-      "pub_items": 6
+      "lines": 1321,
+      "pub_items": 10
     },
     "src/config/mod.rs": {
       "lines": 55,
@@ -2176,12 +2176,16 @@
       "pub_items": 8
     },
     "src/config/store/codec.rs": {
-      "lines": 381,
-      "pub_items": 17
+      "lines": 471,
+      "pub_items": 22
     },
     "src/config/store/mod.rs": {
-      "lines": 734,
-      "pub_items": 17
+      "lines": 844,
+      "pub_items": 20
+    },
+    "src/config/store/quarantine.rs": {
+      "lines": 365,
+      "pub_items": 6
     },
     "src/config/store/replies.rs": {
       "lines": 155,
@@ -2192,16 +2196,16 @@
       "pub_items": 11
     },
     "src/config/store/tables.rs": {
-      "lines": 425,
-      "pub_items": 12
+      "lines": 465,
+      "pub_items": 15
     },
     "src/config/store/types.rs": {
-      "lines": 198,
-      "pub_items": 11
+      "lines": 279,
+      "pub_items": 14
     },
     "src/config/store/upgrade.rs": {
-      "lines": 444,
-      "pub_items": 3
+      "lines": 888,
+      "pub_items": 5
     },
     "src/config/types/aggregate.rs": {
       "lines": 1143,

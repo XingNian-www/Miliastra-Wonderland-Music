@@ -16,18 +16,31 @@
 //! 两条路径都先整库备份再改库（`VACUUM INTO`，含 `-wal` 里已提交的数据），且都只
 //! 碰配置三表：歌曲缓存、`request_state`、命令回复表都不受影响。
 
-use std::path::{Path, PathBuf};
-use std::time::SystemTime;
-
-use anyhow::{Context, Result};
-use serde_json::{Map, Value};
-
 use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, Result, bail};
+use rusqlite::OptionalExtension;
+use serde_json::{Map, Value, json};
 
 use crate::config::migrations;
 
 use super::ConfigStore;
 use super::sqlite::{CONFIG_SCHEMA_VERSION, now_ms, read_sections_from, read_snapshot_rows};
+use super::tables::CONFIG_TABLES;
+
+/// 每个配置库最多保留的 `.bak` 还原点份数。
+///
+/// 迁移每次打开旧库都会用 `VACUUM INTO` 留一份备份，而备份里含**明文 secret**
+/// （`ai.api_key` 等）。旧实现只增不减，一次次的升级会把带密钥的副本无限铺在同一
+/// 目录里；这里只保留最近的 [`BACKUP_RETENTION`] 份，更旧的删除。
+///
+/// 删除失败只告警不中断：迁移本身已经成功，不能因为清不动一个旧备份就让用户
+/// 卡在「升级不了也回不去」的状态。备份排序按文件修改时间倒序，同一时间按
+/// 文件名倒序（`unique_backup_path` 的 `-N` 后缀保证同名不冲突）。
+const BACKUP_RETENTION: usize = 3;
 
 /// 一次 schema 平滑迁移的统计（只用于日志，不落库）。
 #[derive(Clone, Copy, Debug, Default)]
@@ -339,6 +352,357 @@ impl ConfigStore {
         );
         Ok(())
     }
+
+    /// `config migrate --dry-run --json`：只读打开配置库，报告**将要**做的
+    /// rename / prune / fill、以及备份保留清理，绝不写库、绝不创建备份。
+    ///
+    /// 返回 JSON（`Value`）而不是错误：CLI 需要在「库比程序新」这类拒绝场景
+    /// 照样输出结构化报告并以非零码退出，而不是只吐一行错误。
+    ///
+    /// 预演复用真实的迁移管线（[`migrations::migrate_sections`] /
+    /// [`migrations::normalize_content`]）在**内存副本**上跑一遍，因此不会出现
+    /// 「预演说能迁、真迁却失败」的两套逻辑。原始 sections 只读不改。
+    pub(crate) fn dry_run_migration_report(database_path: &Path) -> Result<Value> {
+        let current_version = CONFIG_SCHEMA_VERSION;
+        let mut report = json!({
+            "dry_run": true,
+            "database_path": database_path.display().to_string(),
+            "current_program_version": current_version,
+        });
+        if !database_path.is_file() {
+            report["outcome"] = json!("database_missing");
+            report["plan"] = empty_migration_plan();
+            report["error"] = json!({
+                "kind": "database_missing",
+                "message": format!("配置数据库不存在: {}", database_path.display()),
+            });
+            return Ok(report);
+        }
+        // 只读连接：dry-run 的任何分支都不写数据。不要调用
+        // `initialize_connection`——把连接切到 WAL 本身就会改库文件头。
+        let connection = rusqlite::Connection::open_with_flags(
+            database_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| {
+            format!(
+                "以只读方式打开配置数据库失败（预演不写库）: {}",
+                database_path.display()
+            )
+        })?;
+        connection.pragma_update(None, "busy_timeout", 5_000i64)?;
+
+        let mut missing_tables = Vec::new();
+        for table in CONFIG_TABLES {
+            let exists = connection
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1")?
+                .exists(rusqlite::params![table])?;
+            if !exists {
+                missing_tables.push(table);
+            }
+        }
+        if !missing_tables.is_empty() {
+            report["outcome"] = json!("invalid_database");
+            report["plan"] = empty_migration_plan();
+            report["error"] = json!({
+                "kind": "missing_tables",
+                "missing_tables": missing_tables,
+                "message": format!("配置数据库缺少配置表「{}」，无法预演迁移", missing_tables.join("」「")),
+            });
+            return Ok(report);
+        }
+        let stored_version: Option<i64> = connection
+            .query_row(
+                "SELECT schema_version FROM config_meta WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(stored_version) = stored_version else {
+            report["outcome"] = json!("invalid_database");
+            report["plan"] = empty_migration_plan();
+            report["error"] = json!({
+                "kind": "missing_meta",
+                "message": "config_meta 缺少初始化数据，无法预演迁移",
+            });
+            return Ok(report);
+        };
+        report["stored_version"] = json!(stored_version);
+        // 只有真要迁移/重置时才会新增备份并清理旧备份；已是最新或被拒绝时不碰备份。
+        report["backup"] = backup_plan(database_path, stored_version, false);
+
+        if stored_version > current_version {
+            report["outcome"] = json!("refused_newer_database");
+            report["plan"] = empty_migration_plan();
+            report["error"] = json!({
+                "kind": "newer_database",
+                "message": format!("配置数据库 schema 版本高于当前程序（{stored_version} > {current_version}）"),
+                "hint": "请升级程序或修复配置三表（不要删除含歌曲缓存的数据库）",
+                "stored_version": stored_version,
+                "current_program_version": current_version,
+            });
+            return Ok(report);
+        }
+        if stored_version == current_version {
+            report["outcome"] = json!("up_to_date");
+            report["plan"] = empty_migration_plan();
+            return Ok(report);
+        }
+        if !migrations::has_migration_path(stored_version) {
+            report["outcome"] = json!("would_reset");
+            report["plan"] = empty_migration_plan();
+            report["backup"] = backup_plan(database_path, stored_version, true);
+            report["note"] = json!(format!(
+                "v{stored_version} 没有字段映射表，打开时会断代重置为默认值（重置前会先备份整库）"
+            ));
+            return Ok(report);
+        }
+
+        let before = read_sections_from(&connection)?;
+        let mut migrated: BTreeMap<String, Value> = before.clone().into_iter().collect();
+        match migrations::migrate_sections(stored_version, &mut migrated) {
+            Ok(()) => {
+                let after: Map<String, Value> = migrated.into_iter().collect();
+                let mut plan = migration_plan(&before, &after);
+                // 内容阶段（旧文案改写）也会在 open 时跑；这里只报告会改哪些段。
+                let mut content: BTreeMap<String, Value> = after.into_iter().collect();
+                match migrations::normalize_content(&mut content) {
+                    Ok(content_report) => {
+                        plan["content_sections"] = json!(content_report.changed_sections);
+                    }
+                    Err(error) => {
+                        plan["content_error"] = json!(format!("{error:#}"));
+                    }
+                }
+                report["outcome"] = json!("would_migrate");
+                report["plan"] = plan;
+                report["backup"] = backup_plan(database_path, stored_version, true);
+            }
+            Err(error) => {
+                report["outcome"] = json!("migration_would_fail");
+                report["plan"] = empty_migration_plan();
+                // 备份在迁移事务之前完成：失败也会留下还原点。
+                report["backup"] = backup_plan(database_path, stored_version, true);
+                report["error"] = json!({
+                    "kind": "migration_would_fail",
+                    "message": format!("配置迁移 v{stored_version} → v{current_version} 会在事务内失败，数据库不会被改动"),
+                    "detail": format!("{error:#}"),
+                });
+            }
+        }
+        Ok(report)
+    }
+
+    /// `config migrate --dry-run --json` 的库侧入口：从 `config.yaml` 解析
+    /// `database_path`，再走 [`Self::dry_run_migration_report`]。
+    ///
+    /// **不调用** `BootstrapConfig::load`：那条路径在 `access_token` 为空时会生成
+    /// 令牌并**回写 config.yaml**，与「dry-run 不写任何东西」的约定冲突。这里只读
+    /// 出预演需要的 `database_path` 一个字段，其余引导段不解析。
+    pub(crate) fn dry_run_migration_report_from_config(config_path: &Path) -> Result<Value> {
+        #[derive(serde::Deserialize)]
+        struct DryRunBootstrap {
+            database_path: PathBuf,
+        }
+        let text = fs::read_to_string(config_path)
+            .with_context(|| format!("读取启动配置失败: {}", config_path.display()))?;
+        let bootstrap: DryRunBootstrap = serde_norway::from_str(&text).with_context(|| {
+            format!(
+                "解析启动配置失败: {}（预演只需要 database_path，且不会改写 config.yaml）",
+                config_path.display()
+            )
+        })?;
+        if bootstrap.database_path.as_os_str().is_empty() {
+            bail!(
+                "config.yaml 的 database_path 不能为空: {}",
+                config_path.display()
+            );
+        }
+        let executable_root = config_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("配置路径缺少父目录: {}", config_path.display()))?;
+        let database_path = if bootstrap.database_path.is_relative() {
+            executable_root.join(&bootstrap.database_path)
+        } else {
+            bootstrap.database_path
+        };
+        Self::dry_run_migration_report(&database_path)
+    }
+}
+
+/// 空迁移计划（已是最新/拒绝预演时也要给调用方稳定的 JSON 形状）。
+fn empty_migration_plan() -> Value {
+    json!({
+        "renames": [],
+        "pruned": [],
+        "filled": [],
+        "updated": [],
+    })
+}
+
+/// 比较迁移前后的 sections，产出 rename / prune / fill / updated 四类动作。
+///
+/// 只递归对象（配置迁移的改名/删除都发生在段内对象里）；数组与标量整体比较。
+/// rename 的判据是「同一父路径下，删掉的键与新增的键值完全相等」——这正是
+/// `migrations` 里按键搬运旧值的语义，不需要在这里再抄一份映射表。两边同时
+/// 存在时新键胜出、旧键被删，此时新增集合里没有它，旧键会如实归入 prune。
+fn migration_plan(before: &Map<String, Value>, after: &Map<String, Value>) -> Value {
+    let mut removed: Vec<(String, Value)> = Vec::new();
+    let mut added: Vec<(String, Value)> = Vec::new();
+    let mut updated: Vec<String> = Vec::new();
+    for (section, before_value) in before {
+        match after.get(section) {
+            Some(after_value) => diff_sections(
+                before_value,
+                after_value,
+                section,
+                &mut removed,
+                &mut added,
+                &mut updated,
+            ),
+            None => removed.push((section.clone(), before_value.clone())),
+        }
+    }
+    for (section, after_value) in after {
+        if !before.contains_key(section) {
+            added.push((section.clone(), after_value.clone()));
+        }
+    }
+    removed.sort_by(|left, right| left.0.cmp(&right.0));
+    added.sort_by(|left, right| left.0.cmp(&right.0));
+    updated.sort();
+
+    let mut used_added = vec![false; added.len()];
+    let mut renames = Vec::new();
+    let mut pruned = Vec::new();
+    for (path, value) in &removed {
+        let is_section = !path.contains('.');
+        let (parent, key) = split_section_path(path);
+        let mut renamed = false;
+        if !is_section {
+            for (index, (added_path, added_value)) in added.iter().enumerate() {
+                if used_added[index] || !added_path.contains('.') || added_value != value {
+                    continue;
+                }
+                let (added_parent, added_key) = split_section_path(added_path);
+                if added_parent != parent {
+                    continue;
+                }
+                used_added[index] = true;
+                renamed = true;
+                renames.push(json!({
+                    "section": parent,
+                    "from": key,
+                    "to": added_key,
+                }));
+                break;
+            }
+        }
+        if !renamed {
+            pruned.push(json!({
+                "section": if is_section { Value::Null } else { json!(parent) },
+                "key": key,
+                "value": value,
+                "kind": if is_section { "section" } else { "field" },
+            }));
+        }
+    }
+    let filled: Vec<Value> = added
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !used_added[*index])
+        .map(|(_, (path, value))| {
+            let is_section = !path.contains('.');
+            let (parent, key) = split_section_path(path);
+            json!({
+                "section": if is_section { Value::Null } else { json!(parent) },
+                "key": key,
+                "value": value,
+                "kind": if is_section { "section" } else { "field" },
+            })
+        })
+        .collect();
+    json!({
+        "renames": renames,
+        "pruned": pruned,
+        "filled": filled,
+        "updated": updated,
+    })
+}
+
+/// 递归比较同一段内的对象；路径用点号拼接（`templates.friend_confirm`）。
+fn diff_sections(
+    before: &Value,
+    after: &Value,
+    path: &str,
+    removed: &mut Vec<(String, Value)>,
+    added: &mut Vec<(String, Value)>,
+    updated: &mut Vec<String>,
+) {
+    match (before, after) {
+        (Value::Object(before), Value::Object(after)) => {
+            for (key, before_value) in before {
+                let child = format!("{path}.{key}");
+                match after.get(key) {
+                    Some(after_value) => {
+                        diff_sections(before_value, after_value, &child, removed, added, updated)
+                    }
+                    None => removed.push((child, before_value.clone())),
+                }
+            }
+            for (key, after_value) in after {
+                if !before.contains_key(key) {
+                    added.push((format!("{path}.{key}"), after_value.clone()));
+                }
+            }
+        }
+        (before, after) if before != after => updated.push(path.to_string()),
+        _ => {}
+    }
+}
+
+/// `templates.friend_confirm` → (`templates`, `friend_confirm`)；顶层段返回 `("", 段名)`。
+fn split_section_path(path: &str) -> (&str, &str) {
+    path.rsplit_once('.').unwrap_or(("", path))
+}
+
+/// 预演本库的备份保留结果：dry-run 会新增 1 份（最新），因此保留现有最新的
+/// `BACKUP_RETENTION - 1` 份，更旧的会被删除（这里只报告，不真删）。
+fn backup_plan(database_path: &Path, stale_version: i64, would_back_up: bool) -> Value {
+    let existing = matching_backups(database_path);
+    // 真要迁移时新备份会占一个名额，因此只保留现有最新的 `retention - 1` 份；
+    // 不迁移时打开不会碰备份，`would_create` / `would_remove` 都必须是空。
+    let keep_existing = if would_back_up {
+        BACKUP_RETENTION.saturating_sub(1)
+    } else {
+        BACKUP_RETENTION
+    };
+    let would_remove: Vec<String> = if would_back_up {
+        existing
+            .iter()
+            .skip(keep_existing)
+            .map(|(_, path)| backup_file_name(path))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    json!({
+        "retention": BACKUP_RETENTION,
+        "existing": existing.len(),
+        "would_create": if would_back_up {
+            json!(backup_file_name(&backup_path(database_path, stale_version)))
+        } else {
+            Value::Null
+        },
+        "would_remove": would_remove,
+    })
+}
+
+/// 备份文件的文件名（只用于报告；非 UTF-8 文件名按 lossy 呈现）。
+fn backup_file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// 改 schema 前把整库备份到同目录的 `.bak` 文件，返回备份路径。
@@ -367,7 +731,82 @@ fn backup_before_schema_change(
         "VACUUM INTO ?1",
         rusqlite::params![backup.display().to_string()],
     )?;
+    // 备份里含明文 secret：留够了就删掉更旧的，避免一次次的升级把带密钥的副本
+    // 无限铺在同一目录。删除失败只告警（见 prune_stale_backups）。
+    prune_stale_backups(path);
     Ok(Some(backup))
+}
+
+/// 清理同一配置库超过 [`BACKUP_RETENTION`] 份的旧 `.bak`，返回实际删除份数。
+///
+/// 只删**本库**的备份：文件名必须以 `<库名>.v` 开头、以 `.bak` 结尾，目录里
+/// 其它库或用户手工放的备份一律不碰。排序按修改时间倒序（新→旧），时间相同
+/// 时按文件名倒序；拿不到 mtime 的文件按最旧处理。
+///
+/// 单个文件删除失败（占用、权限、竞态消失）只 `log::warn!` 并继续删下一个：
+/// 迁移已经成功，清理是尽力而为的磁盘维护，不能反过来让升级失败。
+fn prune_stale_backups(database_path: &Path) -> usize {
+    let backups = matching_backups(database_path);
+    let mut removed = 0usize;
+    for (_, backup) in backups.into_iter().skip(BACKUP_RETENTION) {
+        match fs::remove_file(&backup) {
+            Ok(()) => removed += 1,
+            Err(error) => log::warn!(
+                "清理旧配置备份失败（步骤：删除超过保留上限 {BACKUP_RETENTION} 份的旧 .bak；本次升级继续）：{}: {error}",
+                backup.display()
+            ),
+        }
+    }
+    if removed > 0 {
+        log::info!(
+            "已清理 {removed} 份超过保留上限的旧配置备份（每个库最多保留最近 {BACKUP_RETENTION} 份，备份含明文密钥请妥善保管）"
+        );
+    }
+    removed
+}
+
+/// 列出同一配置库的 `.bak` 备份，按修改时间从新到旧排序。
+///
+/// 文件名匹配 `<库名>.v<旧版本>.<时间戳>.bak` / `<...>-N.bak`；`read_dir` 出错
+/// 或目录不可读时返回空列表（调用方把「没有备份」与「读不到目录」都当成无需清理）。
+fn matching_backups(database_path: &Path) -> Vec<(SystemTime, PathBuf)> {
+    let Some(directory) = database_path.parent() else {
+        return Vec::new();
+    };
+    let Some(stem) = database_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+    else {
+        return Vec::new();
+    };
+    let prefix = format!("{stem}.v");
+    let Ok(entries) = fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    let mut backups: Vec<(SystemTime, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        if !file_name.starts_with(&prefix) || !file_name.ends_with(".bak") {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+        backups.push((modified, entry.path()));
+    }
+    backups.sort_by(|(left_time, left_path), (right_time, right_path)| {
+        right_time
+            .cmp(left_time)
+            .then_with(|| right_path.cmp(left_path))
+    });
+    backups
 }
 
 /// 备份文件名：`<库名>.v<旧版本>.YYYYmmdd-HHMMSS.bak`。
@@ -442,3 +881,8 @@ fn changed_field_count(before: &Map<String, Value>, after: &Map<String, Value>) 
     }
     count
 }
+
+/// W5 迁移加固的回归测试：备份保留、v3 合成夹具、dry-run 与「库比程序新」。
+#[cfg(test)]
+#[path = "upgrade_tests.rs"]
+mod upgrade_tests;

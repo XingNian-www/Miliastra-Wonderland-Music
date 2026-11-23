@@ -202,6 +202,18 @@ pub fn watchdog_restart_ms(config_path: &std::path::Path) -> anyhow::Result<u64>
     Ok(config.timing.watchdog_restart_ms)
 }
 
+/// `config migrate --dry-run --json` 的库侧入口：只读预演，不写配置库、不写 config.yaml。
+///
+/// 实现放在 `config/store/upgrade`（迁移编排所在地）。二进制 crate（`main.rs`）
+/// 只能访问 `pub` API，而 `config` 模块是 crate 私有的，所以这里加一层薄导出；
+/// 返回结构化 JSON（`outcome` / `plan` / `backup` / `error`），由 CLI 决定退出码。
+#[cfg(target_os = "windows")]
+pub fn config_migration_dry_run(
+    config_path: &std::path::Path,
+) -> anyhow::Result<serde_json::Value> {
+    config::ConfigStore::dry_run_migration_report_from_config(config_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

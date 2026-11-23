@@ -17,7 +17,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::OnceLock;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use serde_json::{Map, Value};
 
 use crate::config::FieldKind;
@@ -27,6 +27,7 @@ use crate::config::normalize_native_path_string;
 use super::super::AppConfig;
 use super::super::BootstrapConfig;
 use super::super::schema::SECRET_PATHS;
+use super::types::{ConfigFieldError, ConfigFieldErrors};
 
 /// secret 字段脱敏展示时使用的掩码字符串（Web 页面显示与表单回传值）。
 /// 保存时提交值等于该掩码视为「未修改」，保留库中当前值，防止覆盖真实密钥。
@@ -35,6 +36,63 @@ pub const SECRET_MASK: &str = "••••••";
 /// secret 字段清除标记的键名：提交值等于 JSON 对象 `{"__clear__": true}` 时
 /// 表示**清除**该字段（写入空字符串，绕过保留规则）；Web 页面「清除」按钮使用。
 pub const SECRET_CLEAR_MARKER: &str = "__clear__";
+
+/// 配置库加载模式（W5 容错半，D7）。
+///
+/// - [`LoadMode::Strict`]：**默认**，任何反序列化/结构/业务校验失败都拒绝启动，
+///   与重构前逐字节一致（回退方式 = 保持默认，不设开关）。
+/// - [`LoadMode::Lenient`]：显式开启后，只隔离 4 类**用户容器**里的坏条目
+///   （重复 UID 的身份映射、未知命令覆盖、未知 workflow step、未知模板倍数），
+///   把它们写入 `config_quarantine` 并继续启动；结构错误与启动关键项
+///   （`database_path` / `executable_root`）在两种模式下都严格。
+///
+/// **这是待用户批准的行为变更**（Lead 裁决 3）：默认关闭，只有显式设置
+/// 环境变量 `MILIASTRA_CONFIG_LOAD_MODE=lenient` 才会生效；启动链仍然是
+/// 「先 Strict，失败且开关开启才降级重试」，不是一上来就用宽松模式。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LoadMode {
+    /// 严格（默认）：校验失败即拒绝启动。
+    #[default]
+    Strict,
+    /// 宽松（显式开关）：隔离 4 类用户容器的坏条目后继续启动。
+    Lenient,
+}
+
+impl LoadMode {
+    /// 显式开关的环境变量名：值为 `lenient` 时启用，其余（含未设置）都是 `strict`。
+    pub const ENV: &str = "MILIASTRA_CONFIG_LOAD_MODE";
+
+    /// 从进程环境读取加载模式；未设置或无法识别一律回落到 [`LoadMode::Strict`]。
+    pub fn from_env() -> Self {
+        let value = std::env::var(Self::ENV).ok();
+        Self::from_env_value(value.as_deref())
+    }
+
+    /// 纯解析（便于测试，不读进程环境）。
+    ///
+    /// 只认 `lenient`（大小写/首尾空白不敏感）；`strict`、空串、未设置都回落到
+    /// 严格；无法识别的值告警后同样回落到严格——宽松模式必须是**显式且拼对**的。
+    pub fn from_env_value(value: Option<&str>) -> Self {
+        match value.map(str::trim).filter(|value| !value.is_empty()) {
+            None => Self::Strict,
+            Some(value) if value.eq_ignore_ascii_case("lenient") => Self::Lenient,
+            Some(value) if value.eq_ignore_ascii_case("strict") => Self::Strict,
+            Some(other) => {
+                log::warn!(
+                    "环境变量 {} 的值「{other}」无法识别（只支持 strict/lenient），按默认的 strict 处理",
+                    Self::ENV
+                );
+                Self::Strict
+            }
+        }
+    }
+
+    /// 是否宽松模式（读起来比 `== LoadMode::Lenient` 更贴近调用点语义）。
+    pub const fn is_lenient(self) -> bool {
+        matches!(self, Self::Lenient)
+    }
+}
+
 impl AppConfig {
     /// 序列化为数据库存储值：删除 http/logging 段（由启动引导提供）与
     /// state.playback_state_path（由统一数据库路径注入）。
@@ -80,11 +138,32 @@ impl AppConfig {
 /// 必须让用户看见错误而不是悄悄丢失设置。
 ///
 /// 实际配置值重新序列化后保留自由 map、可空对象和数组条目的真实结构。
+///
+/// **分段收集**（W5/D9）：旧实现遇到第一个多余键就 `bail`，一份配置里同时有多处
+/// 字段被删/改名时用户只能一条一条改。现在整棵树遍历完再一次性返回，每条错误
+/// 都带 [`ConfigFieldError::element_ref`]（段名 + 数组下标/对象键），足以定位到
+/// 具体条目。注意这**不改变严格性**：只要有一条就仍然失败，只是错误更完整。
 pub(super) fn validate_persisted_shape(
     stored: &Value,
     canonical: &Value,
     path: &str,
 ) -> Result<()> {
+    let mut errors = Vec::new();
+    collect_persisted_shape_errors(stored, canonical, path, &mut errors);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(ConfigFieldErrors { errors }.into())
+    }
+}
+
+/// [`validate_persisted_shape`] 的递归收集实现：只记录错误，不提前返回。
+fn collect_persisted_shape_errors(
+    stored: &Value,
+    canonical: &Value,
+    path: &str,
+    errors: &mut Vec<ConfigFieldError>,
+) {
     match (stored, canonical) {
         (Value::Object(stored), Value::Object(canonical)) => {
             let field_name = |key: &String| {
@@ -95,27 +174,38 @@ pub(super) fn validate_persisted_shape(
                 }
             };
             // 存储里有、结构体里没有 = 字段被移除或改名。
-            // 取第一个不匹配的键就失败：报错文案与检查顺序都和逐项遍历一致，
-            // 但不必写一个迭代一次就 bail 的循环（clippy::never_loop）。
-            if let Some(key) = stored.keys().find(|key| !canonical.contains_key(*key)) {
-                bail!("配置字段 {} 已不存在（字段被删除或改名）", field_name(key));
+            for key in stored.keys().filter(|key| !canonical.contains_key(*key)) {
+                let field = field_name(key);
+                errors.push(ConfigFieldError::from_field(
+                    field.clone(),
+                    format!("配置字段 {field} 已不存在（字段被删除或改名）"),
+                ));
             }
             // 结构体里有、存储里没有 = 新增字段，默认值已生效，递归交给下层校验。
             for (key, canonical_value) in canonical {
                 let Some(stored_value) = stored.get(key) else {
                     continue;
                 };
-                validate_persisted_shape(stored_value, canonical_value, &field_name(key))?;
+                collect_persisted_shape_errors(
+                    stored_value,
+                    canonical_value,
+                    &field_name(key),
+                    errors,
+                );
             }
         }
         (Value::Array(stored), Value::Array(canonical)) => {
             for (index, (stored, canonical)) in stored.iter().zip(canonical).enumerate() {
-                validate_persisted_shape(stored, canonical, &format!("{path}[{index}]"))?;
+                collect_persisted_shape_errors(
+                    stored,
+                    canonical,
+                    &format!("{path}[{index}]"),
+                    errors,
+                );
             }
         }
         _ => {}
     }
-    Ok(())
 }
 /// 合并候选 sections：当前与提交的并集，提交段整体覆盖。
 /// 同时剔除由启动引导注入的 http/logging 段与 state.playback_state_path

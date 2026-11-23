@@ -41,6 +41,7 @@
 //! 4. 在两处测试里补用例：本模块的纯函数用例 + `store` 的「打开旧库 → 迁移」
 //!    集成用例。
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
@@ -67,6 +68,102 @@ pub(crate) const fn migration_start_version() -> i64 {
 /// 用 `BTreeMap` 而不是 `serde_json::Map`：段顺序稳定（与后者默认的键排序语义
 /// 一致），迁移前后的差异比对与日志都可复现。
 type Sections = BTreeMap<String, Value>;
+
+/// 迁移剪枝时被删掉的一条旧配置（W5/D7：先记下来，再删除）。
+///
+/// 值在**删除前**从内存 sections 里取出，所以即使 `prune_unknown_keys` 是纯函数、
+/// 不碰数据库，调用方（[`crate::config::store::ConfigStore::open`]）也能把它写进
+/// `config_quarantine`，用户事后可找回。
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PrunedEntry {
+    /// 顶层段名。
+    pub(crate) section: String,
+    /// 元素在段内的点路径（如 `window.legacy_key`、`templates.old_section`）。
+    pub(crate) element_ref: String,
+    /// 剪枝原因（中文，直接进 quarantine.reason）。
+    pub(crate) reason: String,
+    /// 被删除的原始值（原文，掩码由写库方负责）。
+    pub(crate) original_json: Value,
+}
+
+impl PrunedEntry {
+    fn new(section: &str, element_ref: String, reason: &str, original_json: Value) -> Self {
+        Self {
+            section: section.to_string(),
+            element_ref,
+            reason: reason.to_string(),
+            original_json,
+        }
+    }
+}
+
+// 本线程正在进行的剪枝收集器；`None` 表示不收集（普通迁移/单测调用）。
+//
+// 用 thread-local 而不是全局锁：`ConfigStore::open` 在**同一线程**里同步完成
+// 建库/迁移，收集窗口由 `capture_pruned_entries` 的 RAII 守卫圈定，
+// 并发打开另一个库的线程（或进程）不会互相串数据。
+thread_local! {
+    static PRUNE_CAPTURE: RefCell<Option<Vec<PrunedEntry>>> = const { RefCell::new(None) };
+}
+
+/// 开始收集本线程迁移剪枝掉的旧配置；守卫 drop 时停止（未取走的结果直接丢弃）。
+pub(crate) fn capture_pruned_entries() -> PruneCapture {
+    PRUNE_CAPTURE.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+    PruneCapture
+}
+
+/// 收集窗口的 RAII 守卫。
+pub(crate) struct PruneCapture;
+
+impl PruneCapture {
+    /// 结束收集并取走结果（按出现顺序、已按 `(section, element_ref)` 去重）。
+    pub(crate) fn finish(self) -> Vec<PrunedEntry> {
+        PRUNE_CAPTURE.with(|slot| slot.borrow_mut().take().unwrap_or_default())
+    }
+}
+
+impl Drop for PruneCapture {
+    fn drop(&mut self) {
+        PRUNE_CAPTURE.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
+}
+
+/// 单次打开允许保留的剪枝记录上限：历史快照会重复剪到同一批键，去重后通常很少；
+/// 上限只防「异常配置文件把内存/表灌爆」，超出部分只告警不再记录。
+const MAX_CAPTURED_PRUNES: usize = 256;
+
+/// 把本轮剪枝结果交给收集器（未开启收集时是空操作）。
+fn record_pruned(entries: Vec<PrunedEntry>) {
+    if entries.is_empty() {
+        return;
+    }
+    PRUNE_CAPTURE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(sink) = slot.as_mut() else {
+            return;
+        };
+        for entry in entries {
+            // 历史快照与当前段会剪到同一路径：只留第一条（当前段的值），
+            // 否则同一处坏数据会在 quarantine 里出现 N 次。
+            if sink
+                .iter()
+                .any(|existing| existing.section == entry.section
+                    && existing.element_ref == entry.element_ref)
+            {
+                continue;
+            }
+            if sink.len() >= MAX_CAPTURED_PRUNES {
+                log::warn!(
+                    "配置迁移：剪枝记录超过 {MAX_CAPTURED_PRUNES} 条，后续旧配置不再写入 quarantine（迁移本身不受影响）"
+                );
+                break;
+            }
+            sink.push(entry);
+        }
+    });
+}
 
 /// 迁移管线的**唯一**步骤清单：数组顺序就是执行顺序，新迁移只往这里加。
 const STEPS: &[MigrationStep] = &[
@@ -510,16 +607,27 @@ fn prune_unknown_keys(sections: &mut Sections) {
     let index = SchemaIndex::current();
     let mut removed = Vec::new();
     let mut removed_sections = Vec::new();
+    let mut pruned = Vec::new();
     for section in sections.keys().cloned().collect::<Vec<_>>() {
         if !index.sections.contains(&section) {
-            sections.remove(&section);
+            // 先取出旧值再删段：收集器要用它写 quarantine（可找回）。
+            if let Some(value) = sections.remove(&section) {
+                pruned.push(PrunedEntry::new(
+                    &section,
+                    section.clone(),
+                    "配置段已不再被当前程序声明，迁移时移除",
+                    value,
+                ));
+            }
             removed_sections.push(section);
             continue;
         }
         if let Some(object) = sections.get_mut(&section).and_then(Value::as_object_mut) {
-            prune_object(object, &section, index, &mut removed);
+            prune_object(object, &section, index, &mut removed, &mut pruned);
         }
     }
+    // 先把记录交给收集器，再由调用方写库；删除发生在本函数内，但值已在删除前取出。
+    record_pruned(pruned);
     if !removed_sections.is_empty() {
         log::warn!(
             "配置迁移：已忽略当前程序不再声明的配置段「{}」，段内旧值不再生效",
@@ -541,12 +649,13 @@ fn prune_object(
     prefix: &str,
     index: &SchemaIndex,
     removed: &mut Vec<String>,
+    pruned: &mut Vec<PrunedEntry>,
 ) {
     for key in object.keys().cloned().collect::<Vec<_>>() {
         let path = format!("{prefix}.{key}");
         if index.containers.contains(&path) {
             if let Some(child) = object.get_mut(&key).and_then(Value::as_object_mut) {
-                prune_object(child, &path, index, removed);
+                prune_object(child, &path, index, removed, pruned);
             }
             // 容器为 null / 数组 / 标量时保持原样，由迁移末尾的结构校验判定。
             continue;
@@ -554,7 +663,15 @@ fn prune_object(
         if index.paths.contains(&path) {
             continue;
         }
-        object.remove(&key);
+        // 先取出被删的值（写 quarantine），再从 sections 里删除。
+        if let Some(value) = object.remove(&key) {
+            pruned.push(PrunedEntry::new(
+                prefix.split('.').next().unwrap_or(prefix),
+                path.clone(),
+                "配置字段已不再被当前程序声明（键被删除或改名），迁移时移除",
+                value,
+            ));
+        }
         removed.push(path);
     }
 }

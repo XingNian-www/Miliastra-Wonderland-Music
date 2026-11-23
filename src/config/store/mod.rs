@@ -38,6 +38,7 @@
 //! 可见性口径：迁移只经 [`ConfigStore::open`] 这一个入口发生，迁移统计
 //! （`upgrade::MigrationOutcome`）收在 [`upgrade`] 内部，不外泄到其它子模块。
 mod codec;
+mod quarantine;
 mod replies;
 mod sqlite;
 mod tables;
@@ -51,7 +52,12 @@ mod tests;
 #[cfg(test)]
 mod subset_tests;
 
-pub(crate) use codec::{SECRET_MASK, mask_secrets};
+/// W5/D7：LoadMode / config_quarantine 的回归测试（Lenient 隔离与迁移剪枝找回）。
+#[cfg(test)]
+mod quarantine_tests;
+
+pub(crate) use codec::{LoadMode, SECRET_MASK, mask_secrets};
+pub(crate) use quarantine::QuarantineEntry;
 pub(crate) use sqlite::{CONFIG_SCHEMA_VERSION, SharedConfigStore};
 pub(crate) use types::{
     ConfigFieldError, ConfigRevisionInfo, ConfigSaveError, ConfigSaveOutcome, StoredReply,
@@ -76,7 +82,7 @@ use codec::{
     normalize_path_fields, normalize_section_path_fields, retain_secret_fields,
 };
 use sqlite::{now_ms, read_sections_from};
-use types::{field_errors_from_anyhow, field_errors_from_message};
+use types::{field_errors_from_anyhow, field_errors_from_error};
 
 /// 配置持久化存储：config_sections 按段保存，config_meta 记录当前版本，
 /// config_revisions 保存每次提交的完整快照（支持回滚）。
@@ -111,7 +117,18 @@ impl ConfigStore {
                 .with_context(|| format!("创建配置数据库目录失败: {}", parent.display()))?;
         }
         let mut connection = Self::open_connection_with_retries(database_path)?;
-        Self::ensure_schema(&mut connection, database_path)?;
+        // 结构迁移是 `open` 唯一的迁移入口，也是唯一会剪掉旧键的地方：用 RAII 守卫
+        // 在本线程收集被剪掉的原文，迁移事务提交后写入 quarantine。
+        // 取舍：值在删除前已取出，但落库发生在迁移提交之后；若进程恰好在这两步
+        // 之间崩溃，迁移留下的 `.bak` 仍可找回（不丢用户数据）。
+        let prune_capture = super::migrations::capture_pruned_entries();
+        let schema_result = Self::ensure_schema(&mut connection, database_path);
+        let pruned = prune_capture.finish();
+        schema_result?;
+        // quarantine 表是纯附加表：CREATE TABLE IF NOT EXISTS，不参与三表三态判定，
+        // 也不升 CONFIG_SCHEMA_VERSION（审查 §W5 已确认安全）。
+        Self::ensure_quarantine_schema(&connection)?;
+        Self::store_pruned_entries(&connection, pruned);
         Self::ensure_reply_schema(&connection)?;
         Self::apply_content_migrations(&mut connection)?;
         Ok(Self {
@@ -119,6 +136,39 @@ impl ConfigStore {
             executable_root: executable_root.to_path_buf(),
             bootstrap,
         })
+    }
+
+    /// 确保容错隔离表存在（不升 schema 版本）。
+    fn ensure_quarantine_schema(connection: &rusqlite::Connection) -> Result<()> {
+        tables::ensure_quarantine_table(connection)
+    }
+
+    /// 把迁移剪枝掉的旧配置写入 quarantine；写失败只告警，不阻断启动。
+    fn store_pruned_entries(
+        connection: &rusqlite::Connection,
+        pruned: Vec<crate::config::migrations::PrunedEntry>,
+    ) {
+        if pruned.is_empty() {
+            return;
+        }
+        let records = pruned
+            .into_iter()
+            .map(|entry| quarantine::QuarantineRecord {
+                section: entry.section,
+                element_ref: entry.element_ref,
+                reason: entry.reason,
+                original_json: entry.original_json,
+            })
+            .collect::<Vec<_>>();
+        let count = records.len();
+        match quarantine::store_records(connection, &records) {
+            Ok(written) => log::warn!(
+                "配置迁移：{written} 条被移除的旧配置已记入 config_quarantine（原文可找回，secret 字段已掩码），迁移本身共剪掉 {count} 条"
+            ),
+            Err(error) => log::warn!(
+                "配置迁移：{count} 条被移除的旧配置写入 config_quarantine 失败，原文只能在迁移备份 .bak 里找回：{error:#}"
+            ),
+        }
     }
 }
 
@@ -128,10 +178,26 @@ impl ConfigStore {
     ///
     /// **不做 schema 迁移**：迁移在 [`Self::open`] 的 `ensure_schema` 里已经完成，
     /// 这里再迁移会重复改库、也会让只读路径（如 HTTP 展示）产生写入。
+    ///
+    /// 等价于 [`Self::load_full_with_mode`]`(LoadMode::Strict)`：校验失败即返回错误，
+    /// 与重构前逐字节一致。
     pub fn load_full(&self) -> Result<AppConfig> {
+        self.load_full_with_mode(LoadMode::Strict)
+    }
+
+    /// 按 [`LoadMode`] 加载完整配置。
+    ///
+    /// - `Strict`（默认）：任何校验失败都返回错误，行为与重构前一致。
+    /// - `Lenient`（显式开关）：先完整校验；失败时只把 4 类用户容器里的坏条目
+    ///   隔离进 `config_quarantine`，再重新校验。结构错误、启动关键项与容器之外的
+    ///   校验错误仍然失败——Lenient 不是“什么都放行”。
+    ///
+    /// 隔离记录写库失败只告警：容错的目标是「坏数据别炸启动」，不能因为附加的
+    /// quarantine 表写不进去反而起不来。
+    pub fn load_full_with_mode(&self, mode: LoadMode) -> Result<AppConfig> {
         let sections = self.read_all_sections()?;
         let mut config = AppConfig::from_db_value(
-            Value::Object(sections),
+            Value::Object(sections.clone()),
             &self.bootstrap,
             &self.executable_root,
         )
@@ -139,8 +205,52 @@ impl ConfigStore {
         // 顺序不能反：先丢弃已废弃的面板条目（如 `@点歌`），再校验。
         // 反过来的话，老配置库里一条早就不生效的死条目会让整个程序启动失败。
         config.command_access.sanitize_deprecated_overrides();
-        config.validate().context("数据库中的配置未通过校验")?;
+        let Err(strict_error) = config.validate() else {
+            return Ok(config);
+        };
+        if !mode.is_lenient() {
+            return Err(strict_error).context("数据库中的配置未通过校验");
+        }
+
+        let records =
+            quarantine::isolate_user_container_errors(&mut config, &Value::Object(sections));
+        // 隔离后再校验：仍有错误说明不是 4 类用户容器（结构/启动关键项/其它段），
+        // Lenient 不应该把它们也吞掉。
+        config.validate().context(
+            "数据库中的配置未通过校验（Lenient 模式只隔离 4 类用户容器，其余错误仍拒绝启动）",
+        )?;
+        if records.is_empty() {
+            // 理论上不可达（Strict 失败且没有可隔离条目时，上面的 revalidate 会失败）；
+            // 防御性处理：绝不静默地把一个未解释的失败变成成功。
+            return Err(strict_error).context("数据库中的配置未通过校验");
+        }
+        // 先写 quarantine，再记录 warn：面板/维护页要能立刻看到「隔离了哪一条、原文是什么」。
+        let written = match quarantine::store_records(&self.connection, &records) {
+            Ok(written) => written,
+            Err(error) => {
+                log::warn!(
+                    "把 {} 条被隔离的配置条目写入 config_quarantine 失败（本次启动仍按隔离后的配置继续）：{error:#}",
+                    records.len()
+                );
+                0
+            }
+        };
+        log::warn!(
+            "配置加载已按 {} 降级为 Lenient（待用户批准的行为变更）：隔离 {} 条用户容器坏条目（{}），其中 {written} 条已写入 config_quarantine（original_json 中的 secret 字段已掩码）",
+            LoadMode::ENV,
+            records.len(),
+            records
+                .iter()
+                .map(|record| record.element_ref.as_str())
+                .collect::<Vec<_>>()
+                .join("、")
+        );
         Ok(config)
+    }
+
+    /// 只读：当前库里的容错隔离记录（按写入顺序）；供测试与「数据维护」面板使用。
+    pub fn quarantine_entries(&self) -> Result<Vec<QuarantineEntry>> {
+        quarantine::read_entries(&self.connection)
     }
 
     /// 返回脱敏后的配置 JSON（供 Web 显示）：section 合并后的 JSON，
@@ -201,7 +311,7 @@ impl ConfigStore {
         normalize_path_fields(&mut merged, &self.executable_root, false);
         let mut config = match self.build_config(&merged) {
             Ok(config) => config,
-            Err(error) => return Ok(field_errors_from_message(&error.to_string()).errors),
+            Err(error) => return Ok(field_errors_from_error(&error).errors),
         };
         // 与 load_full / LiveConfigs::apply 同一口径：预检阶段也先丢弃已废弃的
         // 面板条目，否则预检会比实际保存更严——用户什么都没改，点保存却报
@@ -328,7 +438,7 @@ impl ConfigStore {
             Ok(config) => config,
             Err(error) => {
                 return Err(ConfigSaveError::Other(
-                    field_errors_from_message(&error.to_string()).into(),
+                    field_errors_from_error(&error).into(),
                 ));
             }
         };
@@ -426,7 +536,7 @@ impl ConfigStore {
             Ok(config) => config,
             Err(error) => {
                 return Err(ConfigSaveError::Other(
-                    field_errors_from_message(&error.to_string()).into(),
+                    field_errors_from_error(&error).into(),
                 ));
             }
         };

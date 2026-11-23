@@ -27,6 +27,70 @@ pub struct ConfigSaveOutcome {
     pub changed_fields: Vec<String>,
 }
 
+/// 配置错误的元素级定位：段名 + 数组下标 / 对象键路径。
+///
+/// 与 [`ConfigFieldError::field`] 的区别：`field` 是给人看的完整点路径
+/// （如 `identity.mappings[2].uid`），本结构把「哪一段、哪一个元素」拆成字段，
+/// 供面板逐条高亮/跳到具体条目（D9：8 个 `Object` 字段只有裸 JSON 编辑，
+/// 单条字符串错误无法定位到第几个 workflow / 第几条身份映射）。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ElementRef {
+    /// 所属顶层段名（点路径首段）；路径没有点、推导不到时为 ""。
+    pub section: String,
+    /// 元素在段内的完整路径，如 `identity.mappings[2]`、
+    /// `command_access.overrides.@QQ点歌`。
+    pub path: String,
+    /// 路径里最后一个数组下标（如 `mappings[2]` → 2）；没有数组下标时为 None。
+    pub index: Option<usize>,
+    /// 路径末段的对象键（如 `window.bogus_field` → bogus_field）；
+    /// 路径以 `]` 结尾（数组元素本身）时为 None。
+    pub key: Option<String>,
+}
+
+impl ElementRef {
+    /// 从点路径推导元素定位；空路径返回 None。
+    ///
+    /// 只做**展示与定位**，不参与任何校验判定：推导不出来的形态（自由 map 的
+    /// 奇怪键名、带点的键）保持原样，宁可定位粗一点也不能猜错元素。
+    pub fn from_path(path: &str) -> Option<Self> {
+        if path.is_empty() {
+            return None;
+        }
+        // 段名 = 第一个 '.' 或 '[' 之前的部分；顶层字段（无分隔符）为空串，
+        // 与错误消息的字段路径提取口径一致（推导不到就是 ""）。
+        let section_end = path.find(['.', '[']).unwrap_or(0);
+        let section = path[..section_end].to_string();
+        // 数组下标：扫描所有 [n] 形态，取最后一个能解析成整数的。
+        let mut index = None;
+        let mut rest = path;
+        while let Some(open) = rest.find('[') {
+            let after = &rest[open + 1..];
+            let Some(close) = after.find(']') else {
+                break;
+            };
+            if let Ok(parsed) = after[..close].parse::<usize>() {
+                index = Some(parsed);
+            }
+            rest = &after[close + 1..];
+        }
+        // 对象键：末段（'.' 或 ']' 之后）；路径以 ']' 结尾时元素本身就是数组项。
+        let key = if path.ends_with(']') {
+            None
+        } else {
+            path.rsplit(['.', ']'])
+                .next()
+                .filter(|key| !key.is_empty())
+                .map(str::to_string)
+        };
+        Some(Self {
+            section,
+            path: path.to_string(),
+            index,
+            key,
+        })
+    }
+}
+
 /// 字段级配置错误（保存校验失败时逐字段报告）。
 #[derive(Clone, Debug)]
 pub struct ConfigFieldError {
@@ -36,6 +100,28 @@ pub struct ConfigFieldError {
     pub field: String,
     /// 错误消息原文。
     pub message: String,
+    /// 元素级定位（段名 + 数组下标/对象键）；无法定位时为 None。
+    pub element_ref: Option<ElementRef>,
+}
+
+impl ConfigFieldError {
+    /// 从字段路径构造，并同步推导 [`ElementRef`] 与段名。
+    ///
+    /// 段名口径与 [`ElementRef::from_path`] 完全一致：点路径首段，推导不到为 ""。
+    /// 只在这里推导一次，避免「section 与 element_ref.section 不一致」。
+    pub(super) fn from_field(field: String, message: String) -> Self {
+        let element_ref = ElementRef::from_path(&field);
+        let section = element_ref
+            .as_ref()
+            .map(|element| element.section.clone())
+            .unwrap_or_default();
+        Self {
+            section,
+            field,
+            message,
+            element_ref,
+        }
+    }
 }
 
 /// 字段级错误集合：save 校验失败时作为错误返回，可从 anyhow::Error 中 downcast。
@@ -160,16 +246,16 @@ pub(super) fn extract_backticked_field(message: &str) -> Option<String> {
     None
 }
 
-/// 把单个错误消息转成字段级错误集合。
-pub(super) fn field_errors_from_message(message: &str) -> ConfigFieldErrors {
-    let (field, section) = extract_field_path(message);
-    ConfigFieldErrors {
-        errors: vec![ConfigFieldError {
-            section,
-            field,
-            message: message.to_string(),
-        }],
+/// 优先复用错误链里已经结构化的 [`ConfigFieldErrors`]（`validate_persisted_shape`
+/// 分段收集的结果），避免把多个元素错误重新压平成一条字符串；
+/// 拿不到结构化错误时回退到消息启发式。
+pub(super) fn field_errors_from_error(error: &anyhow::Error) -> ConfigFieldErrors {
+    if let Some(structured) = error.downcast_ref::<ConfigFieldErrors>() {
+        return ConfigFieldErrors {
+            errors: structured.errors.clone(),
+        };
     }
+    field_errors_from_anyhow(error)
 }
 
 /// 遍历 anyhow 错误链，取第一层能提取出字段路径的消息作为 field；
@@ -177,22 +263,17 @@ pub(super) fn field_errors_from_message(message: &str) -> ConfigFieldErrors {
 pub(super) fn field_errors_from_anyhow(error: &anyhow::Error) -> ConfigFieldErrors {
     for cause in error.chain() {
         let message = cause.to_string();
-        let (field, section) = extract_field_path(&message);
+        let (field, _section) = extract_field_path(&message);
         if !field.is_empty() {
             return ConfigFieldErrors {
-                errors: vec![ConfigFieldError {
-                    section,
-                    field,
-                    message,
-                }],
+                errors: vec![ConfigFieldError::from_field(field, message)],
             };
         }
     }
     ConfigFieldErrors {
-        errors: vec![ConfigFieldError {
-            section: String::new(),
-            field: String::new(),
-            message: error.to_string(),
-        }],
+        errors: vec![ConfigFieldError::from_field(
+            String::new(),
+            error.to_string(),
+        )],
     }
 }

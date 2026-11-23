@@ -1494,7 +1494,6 @@ fn after_input_failure(stage: &'static str, error: impl std::fmt::Display) -> Ui
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
     use std::time::{Duration, Instant};
 
     use anyhow::Result;
@@ -2135,10 +2134,7 @@ mod conversation_substate_evidence {
     //! 输入 TSV：`surface_key<TAB>frame`。输出每帧一行 JSON；
     //! 本机没有 OCR 设备，`ocr_available` 恒为 false，判定只走离线分支。
 
-    use std::path::Path;
-
     use super::*;
-    use crate::config::AppConfig;
     use crate::geometry::Rect;
     use crate::ui::frame::{Canvas, resize_to_canvas};
     use crate::ui::routines::friend_delivery::{

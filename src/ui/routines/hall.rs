@@ -723,7 +723,6 @@ fn close_hall_page(context: &mut UiRoutineContext<'_>) -> Result<(), UiRoutineFa
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
     use std::sync::{Arc, Mutex};
 
     use anyhow::Result;

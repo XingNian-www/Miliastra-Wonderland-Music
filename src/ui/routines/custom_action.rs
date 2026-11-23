@@ -823,7 +823,6 @@ fn input_failure(stage: &'static str, error: anyhow::Error) -> UiRoutineFailure 
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
     use std::sync::Mutex;
 
     use anyhow::Result;
@@ -831,7 +830,6 @@ mod tests {
     use image::DynamicImage;
 
     use super::*;
-    use crate::config::AppConfig;
     use crate::runtime::ocr::{OcrDevice, OcrLine, OcrRuntime};
     use crate::runtime::ui::{UiDevice, UiRuntime};
     use crate::ui::routines::friend_delivery::FriendDeliveryRoutineConfig;

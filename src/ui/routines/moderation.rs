@@ -576,7 +576,6 @@ mod tests {
     };
     use crate::ui::routines::friend_delivery::FriendDeliveryRoutineConfig;
     use crate::ui::routines::transaction::{UiTask, UiTaskOutcome};
-    use std::path::Path;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum RecordedKey {

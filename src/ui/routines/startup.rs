@@ -1616,7 +1616,6 @@ fn capped_attempts(configured_retries: u32, timeout_ms: u64, interval_ms: u64) -
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
     use std::sync::{Arc, Mutex};
 
     use crate::config::AppConfig;

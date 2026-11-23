@@ -10,8 +10,6 @@ use windows::Win32::System::Registry::{
 };
 use windows::core::{PCWSTR, w};
 
-pub(crate) use crate::adapters::game_path::resolve_game_executable;
-
 pub(crate) fn registry_game_path() -> Option<PathBuf> {
     for (key, exe) in [
         (w!("Software\\miHoYo\\HYP\\1_1\\hk4e_cn"), "YuanShen.exe"),

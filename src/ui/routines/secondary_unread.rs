@@ -697,7 +697,6 @@ fn optional_fingerprint_changed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::AppConfig;
     use crate::geometry::Rect;
     use crate::runtime::ocr::{OcrDevice, OcrLine, OcrRuntime};
     use crate::runtime::recovery::{GameRecoveryCoordinator, RecoveryTrigger};

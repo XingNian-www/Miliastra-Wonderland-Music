@@ -232,8 +232,8 @@
           <label class="tools-field-label" for="tools-evidence-limit">证据条数</label>
           <div class="tools-row">
             <input id="tools-evidence-limit" v-model.number="evidenceLimit" inputmode="numeric" placeholder="20" style="max-width:120px" />
-            <button class="btn small" @click="loadEvidenceEntries">读取证据列表</button>
-            <button class="btn small ghost" @click="clearEvidence">清空</button>
+            <button class="btn" @click="loadEvidenceEntries">读取证据列表</button>
+            <button class="btn ghost" @click="clearEvidence">清空</button>
           </div>
         </div>
         <div class="tools-evidence">
@@ -569,8 +569,27 @@ onBeforeUnmount(() => {
    「高级控制页 · 方案 C」段末尾，二者都不改既有全局规则。 */
 .tools-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .tools-row input:not([type="checkbox"]):not([type="radio"]) { flex: 1 1 140px; min-width: 100px; }
-.tools-row input[type="checkbox"] { flex: 0 0 auto; width: 36px; min-width: 36px; }
-.tools-check { display: inline-flex; align-items: center; gap: 4px; font-size: var(--fs-tiny); }
+/* 复选框不能吃全局的 `height: var(--btn-h)`：那样它会是 36x20 的横条，
+ * 与同一行 32px 的输入框/按钮差 12px，视觉上像错位。这里显式钉成方框。
+ * 用 appearance:none 自绘，避免各浏览器原生尺寸不一致。 */
+
+/* 复选框是本项目设计好的 iOS 风格开关（components.css 里 36x20 的 pill），
+ * **不要**把它改成小方框——那是改设计，不是修布局。
+ *
+ * 它和 32px 输入框/按钮同排时天然矮 12px，靠 label 承担行高 + flex 居中
+ * 让文字基线与同行对齐即可；只看「方框高度相等」会得出错误结论。
+ */
+.tools-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: var(--btn-h);
+  font-size: var(--fs-tiny);
+  color: var(--text-2);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
 .tools-output { margin: 0; max-height: 320px; overflow: auto; white-space: pre-wrap; word-break: break-all; background: var(--bg-1); padding: 8px; border-radius: 8px; font-size: var(--fs-tiny); }
 .tools-task { display: flex; gap: 8px; width: 100%; text-align: left; background: var(--bg-1); border: 1px solid var(--sep-1); border-radius: 8px; padding: 6px 8px; cursor: pointer; font-size: var(--fs-tiny); }
 .tools-task.active { border-color: var(--accent); }

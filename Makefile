@@ -6,6 +6,7 @@
 #   make fmt        cargo fmt --all --check
 #   make check      cargo check --lib --no-default-features（0 warning 硬门禁）
 #   make test       cargo test --lib --no-default-features（根 crate；CI 另跑 --workspace）
+#   make windows    Windows 目标编译检查（mingw 交叉，补 Linux 门禁盲区）
 #   make layers     scripts/check-layers.py --check + --self-test
 #   make panel      面板 API 覆盖率（默认 report-only，PANEL_STRICT=1 才阻断）
 #   make web        web/dist 构建（build.rs 以 web/dist/index.html 为就绪判据）
@@ -37,6 +38,12 @@ help:
 
 fmt:
 	$(CARGO) fmt --all --check
+
+# Windows 目标的编译检查：`check` 跑的是 Linux 目标，Windows 专属代码在那边完全不可见
+# （2026-11-23 就因此把 error[E0432] 推到 Windows Release 构建才发现）。
+# 用 mingw 交叉到 x86_64-pc-windows-gnu，不需要 MSVC 工具链；详见脚本头部的能力边界。
+windows:
+	bash scripts/check-windows.sh
 
 check:
 	# `--locked`：CI 的 Windows Release 构建用 `cargo build --locked`。改了

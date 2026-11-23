@@ -39,7 +39,22 @@ fmt:
 	$(CARGO) fmt --all --check
 
 check:
-	RUSTFLAGS="-D warnings" $(CARGO) check --lib --no-default-features
+	# `--locked`：CI 的 Windows Release 构建用 `cargo build --locked`。改了
+	# Cargo.toml 的版本号却没同步 Cargo.lock 时，本地 check 会**静默自动改写**
+	# Cargo.lock 并照样通过，而 CI 直接报
+	# 「cannot update the lock file because --locked was passed」。2026-11-23 就是这样
+	# 让 7.7.0-dev.1 的 Windows 构建挂掉的。这里带上 --locked，本地立刻暴露。
+	RUSTFLAGS="-D warnings" $(CARGO) check --lib --no-default-features --locked
+
+# 显式检查 Cargo.lock 与 Cargo.toml 一致：`cargo metadata` 会按需改写锁文件，
+# 一旦它产生 diff 就说明有人改了版本号/依赖却没提交锁文件。
+lock:
+	$(CARGO) metadata --no-deps --format-version 1 > /dev/null
+	@git diff --quiet -- Cargo.lock Cargo.toml || { \
+		echo "Cargo.lock 与 Cargo.toml 不一致（cargo 已改写锁文件），请提交 Cargo.lock"; \
+		git diff --stat -- Cargo.lock Cargo.toml; \
+		exit 1; \
+	}
 
 # 本地默认只跑根 crate：本开发容器的 `miliastra-playback` ffmpeg 单测在
 # `engine::ffmpeg::tests::resampler_flush_...` 上 SIGSEGV（容器 ffmpeg/内存问题，

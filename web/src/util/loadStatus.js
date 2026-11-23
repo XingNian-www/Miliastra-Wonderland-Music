@@ -17,13 +17,19 @@ export function describeLoadStatus(config) {
   const count =
     typeof payload.quarantinedCount === 'number' ? payload.quarantinedCount : entries.length
   const hasQuarantine = count > 0
-  const refs = entries
-    .map((entry) => (entry && (entry.elementRef || entry.element_ref)) || '')
+  // 面板详情要"是哪一条 + 为什么"，所以保留结构化条目而不是只拼字符串。
+  const rows = entries
+    .map((entry) => {
+      if (!entry || typeof entry !== 'object') return null
+      const ref = entry.elementRef || entry.element_ref
+      if (!ref) return null
+      return { ref: String(ref), reason: String(entry.reason ?? '') }
+    })
     .filter(Boolean)
   const title = hasQuarantine
-    ? refs.length
-      ? `已被隔离的条目：\n${refs.join('\n')}`
+    ? rows.length
+      ? `已被隔离的条目：\n${rows.map((row) => row.ref).join('\n')}`
       : '库里有坏条目已被隔离，程序照常启动'
     : ''
-  return { modeLabel, count, hasQuarantine, title }
+  return { modeLabel, count, hasQuarantine, title, entries: rows }
 }

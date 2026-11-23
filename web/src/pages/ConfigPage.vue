@@ -30,6 +30,29 @@
         </span>
       </div>
 
+      <!-- 隔离详情：条数徽标只回答「有几条」，用户还需要知道「是哪一条、为什么、怎么修」。
+           数据全是只读的，来源是 GET /config 的 quarantined[]（W5 的 config_quarantine 表）；
+           面板不提供删除，修好数据后下次启动不再隔离。 -->
+      <details v-if="loadStatus.hasQuarantine" class="config-message warn">
+        <summary>
+          有 {{ loadStatus.count }} 条配置条目被隔离（程序已按其余配置正常启动）
+        </summary>
+        <table class="config-quarantine">
+          <thead>
+            <tr><th>条目</th><th>原因</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="(entry, index) in loadStatus.entries" :key="index">
+              <td><code>{{ entry.ref }}</code></td>
+              <td>{{ entry.reason }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="config-field-hint">
+          修好对应数据后重启，这些条目就不会再被隔离。被隔离的条目不会生效，也不会影响其余配置。
+        </p>
+      </details>
+
       <div
         v-if="showVisualHint"
         class="config-message"

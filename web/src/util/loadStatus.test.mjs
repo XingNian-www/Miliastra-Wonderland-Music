@@ -50,3 +50,21 @@ test('count 缺失时用条目数兜底，两者都缺则为 0', () => {
   assert.equal(describeLoadStatus({ quarantined: [{ elementRef: 'a' }] }).count, 1)
   assert.equal(describeLoadStatus({ quarantinedCount: 5 }).count, 5)
 })
+
+test('隔离详情带出「是哪一条 + 为什么」，供面板表格直接渲染', () => {
+  const view = describeLoadStatus({
+    quarantinedCount: 1,
+    quarantined: [{ elementRef: 'identity.mappings[1]', reason: '账号重复' }],
+  })
+  assert.deepEqual(view.entries, [{ ref: 'identity.mappings[1]', reason: '账号重复' }])
+})
+
+test('隔离条目缺 elementRef 时被跳过，reason 缺失降级为空串', () => {
+  const view = describeLoadStatus({
+    quarantinedCount: 2,
+    quarantined: [{ reason: '没有 ref' }, { elementRef: 'a.b' }],
+  })
+  assert.deepEqual(view.entries, [{ ref: 'a.b', reason: '' }])
+  // 计数仍以服务端为准：徽标不该因为前端跳过了一条就变小
+  assert.equal(view.count, 2)
+})

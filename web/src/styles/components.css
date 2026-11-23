@@ -3143,6 +3143,38 @@ input[type="range"] {
   align-items: center;
 }
 
+/* 行内控件等高。
+ *
+ * `align-items: center` 只做垂直居中，不统一高度：同一行里 input 走全局
+ * `height: var(--btn-h)` 是 32px，而 `.btn.small` 是硬编码的 25px，
+ * 于是「输入框 + 读取配置区域」这类行会出现 7px 的高差，肉眼就是按钮比
+ * 输入框矮一截。
+ *
+ * 只在**行容器内部**统一，不去改 `.btn.small` 本身：全站有 49 处 small
+ * 按钮是单独出现的（面板头、工具条），它们就该是紧凑的 25px；
+ * 全局抬高会把那些地方一起撑开。
+ */
+.tools-grid-row > *,
+.tools-xyz > *,
+.tools-ai-row > * {
+  height: var(--btn-h);
+  min-height: var(--btn-h);
+  /* 按钮自带 padding 上下 6px，拉到 32px 后文字靠 line-height 居中即可，
+     这里显式置 1 防止小屏（--btn-h: 38px）时文字偏上。 */
+  line-height: 1;
+}
+
+/* `.btn.small` 是 (0,2,0)，比上面那条 (0,1,0) 高，光写子选择器压不住它。
+ * 这里用同特异度的「行容器 + 两段」形式覆盖，只作用于行内按钮。 */
+.tools-grid-row > .btn.small,
+.tools-xyz > .btn.small,
+.tools-ai-row > .btn.small {
+  height: var(--btn-h);
+  min-height: var(--btn-h);
+  padding-top: 0;
+  padding-bottom: 0;
+}
+
 .overview-quick-grid {
   display: grid !important;
   grid-template-columns: repeat(2, minmax(0, 1fr));

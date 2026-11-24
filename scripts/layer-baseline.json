@@ -2716,7 +2716,7 @@
       "pub_items": 11
     },
     "src/observation/chat/passive.rs": {
-      "lines": 648,
+      "lines": 667,
       "pub_items": 15
     },
     "src/observation/chat/scan.rs": {

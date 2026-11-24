@@ -338,10 +338,13 @@ fn conversation_name_from_lines<'a>(lines: impl IntoIterator<Item = &'a str>) ->
 /// 空集合与「列表里确实没人」在语义上等价，而后者只会让持有人更少，不会更危险：
 /// 回调路径是「未登记 → User」，不是「未登记 → 放行」。
 ///
-/// 匹配用 [`crate::text::normalize_comparison_text`]（折全角 + 丢空白 + 小写），
-/// 只用于**提高下界**，不参与授权档位的正向判定，因此不会复活「改昵称冒充」：
-/// 冒充者要拿到 Friend，只需把自己的昵称改成好友列表里已有的名字——但那本来就是
-/// 「显示名」层面的信息，且 Friend 下界之下仍受映射 role 与既有策略约束。
+/// 匹配用 [`crate::text::fold_wide`]：**只折全角，保留空白与大小写**。
+///
+/// 与 `identity::resolve`（#4）同一比较口径。**刻意不用
+/// `normalize_comparison_text`**：它会丢空白，于是 `A B` 与 `AB` 会撞成同一个键，
+/// 陌生人可能因为撞名拿到 Friend 下界。虽然那只是下界（拿不到 Admin/Owner），
+/// 但身份相关的匹配一律宁严勿宽——宁可「OCR 多读一个空格 → 匹配失败 → 退回 User」
+/// 这种**少给**，也不要「少读一个空格 → 撞上别人」这种**多给**。
 fn sidebar_name_set(
     ocr: &OcrRuntimeHandle,
     image: &DynamicImage,
@@ -357,7 +360,7 @@ fn sidebar_name_set(
     };
     let names = lines
         .iter()
-        .map(|line| crate::text::normalize_comparison_text(line.text.trim()))
+        .map(|line| crate::text::fold_wide(line.text.trim()))
         .filter(|name| !name.is_empty())
         .collect::<std::collections::BTreeSet<_>>();
     if names.is_empty() {
@@ -425,11 +428,12 @@ pub(crate) fn recognize_passive_secondary(
     for message in &mut messages {
         message.message_type = message_type.into();
         // 「左侧列表里的名字 = 好友」：只有大厅帧才有意义（私聊已是 Friend）。
-        // 匹配走 normalize_comparison_text（折全角/丢空白），与侧栏 OCR 同一口径。
+        // 匹配走 fold_wide（只折全角、保留空白），与侧栏 OCR 同一口径。
         message.sender_in_friend_list = !friend_list.is_empty()
-            && message.sender.as_deref().is_some_and(|sender| {
-                friend_list.contains(&crate::text::normalize_comparison_text(sender))
-            });
+            && message
+                .sender
+                .as_deref()
+                .is_some_and(|sender| friend_list.contains(&crate::text::fold_wide(sender)));
     }
     if messages.is_empty() && !hall {
         if let Some(block) = latest {
@@ -594,31 +598,46 @@ mod tests {
         assert_eq!(identity.effective_name(), "大厅备注");
     }
 
-    /// 「左侧列表里的名字 = 好友」的匹配口径：与侧栏 OCR 同一归一化，且失败时为空集。
+    /// 「左侧列表里的名字 = 好友」的匹配口径：与 `identity::resolve` 同为
+    /// **fold_wide**（只折全角、保留空白与大小写），且失败时为空集。
     ///
     /// 这里只验证**判定函数**的语义（纯逻辑），真实列表 OCR 在整帧识别里做。
     #[test]
-    fn friend_list_membership_uses_the_shared_comparison_normalization() {
+    fn friend_list_membership_folds_width_but_keeps_whitespace() {
         let sidebar = ["PlayerB", "昵称D", "昵称E°"]
             .into_iter()
-            .map(crate::text::normalize_comparison_text)
+            .map(crate::text::fold_wide)
             .collect::<std::collections::BTreeSet<_>>();
         assert!(!sidebar.is_empty());
-        // 全角/半角与空白差异都归一到同一个键。
-        for sender in ["PlayerB", "ＰｌａｙｅｒＢ", " PlayerB "] {
+
+        // 全角/半角差异被折平 → 同一个键（OCR 常见抖动，必须命中）。
+        for sender in ["PlayerB", "ＰｌａｙｅｒＢ"] {
             assert!(
-                sidebar.contains(&crate::text::normalize_comparison_text(sender)),
-                "sender={sender} 应判为左侧列表成员"
+                sidebar.contains(&crate::text::fold_wide(sender)),
+                "sender={sender} 应判为左侧列表成员（全角折半角）"
             );
         }
+        // 首尾空白由调用方 trim 掉，不构成差异。
+        assert!(sidebar.contains(&crate::text::fold_wide(" PlayerB ".trim())));
+
+        // **但内部空白不被抹平**：`A B` 与 `AB` 是两个人。
+        // 宁可变「少给」（匹配不上 → 退回 User），也不能「多给」（撞名拿到 Friend）。
+        let spaced = ["A B"]
+            .into_iter()
+            .map(crate::text::fold_wide)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(!spaced.contains(&crate::text::fold_wide("AB")));
+        assert!(!spaced.contains(&crate::text::fold_wide("A  B")));
+        assert!(spaced.contains(&crate::text::fold_wide("A B")));
+
         // 不在列表里的人不能误判（未登记 → 仍走 User 下界）。
-        for sender in ["昵称C", "2#BOT|勿加", ""] {
+        for sender in ["昵称C", "2#BOT|勿加"] {
             assert!(
-                !sidebar.contains(&crate::text::normalize_comparison_text(sender))
-                    || crate::text::normalize_comparison_text(sender).is_empty(),
+                !sidebar.contains(&crate::text::fold_wide(sender)),
                 "sender={sender} 不应判为左侧列表成员"
             );
         }
+
         // 列表读空（OCR 失败）→ 空集合 → 谁都不算好友，退回原下界。
         let empty: std::collections::BTreeSet<String> = Default::default();
         assert!(empty.is_empty());

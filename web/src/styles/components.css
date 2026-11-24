@@ -71,9 +71,17 @@ button, input, select, textarea {
   margin-right: auto;
 }
 
+/* 播放模式的选中项也是「侧栏选中」语言：蓝色胶囊 + 白字。
+   原先只有 1px 蓝边 + 蓝字，在暗色面板上几乎看不出哪一项是当前模式。 */
 .play-mode-row .btn.active {
-  border-color: var(--accent);
-  color: var(--accent);
+  background: var(--accent);
+  border-color: transparent;
+  color: var(--on-accent);
+}
+
+.play-mode-row .btn.active:hover {
+  background: var(--accent-strong);
+  color: var(--on-accent);
 }
 
 .playback-progress .progress-row {
@@ -646,13 +654,21 @@ input:hover, select:hover, textarea:hover {
   border-color: var(--text-3);
 }
 
+/* macOS 下拉：不要原生粗箭头，用两条 1px 对角线画一个「细 chevron」。
+   实测过的几何：6px 方块、两侧各留 1px 线宽，比实心三角更像原生控件。
+   这里只设 background-image，颜色取 --text-3，明暗两套自动跟随。 */
 select {
   appearance: none;
   -webkit-appearance: none;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238d8d8d' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-image:
+    linear-gradient(45deg, transparent calc(50% - 1px), var(--text-3) calc(50% - 1px), var(--text-3) calc(50% + 1px), transparent calc(50% + 1px)),
+    linear-gradient(135deg, transparent calc(50% - 1px), var(--text-3) calc(50% - 1px), var(--text-3) calc(50% + 1px), transparent calc(50% + 1px));
+  background-position:
+    calc(100% - 15px) calc(50% + 2px),
+    calc(100% - 9px) calc(50% + 2px);
+  background-size: 6px 6px, 6px 6px;
   background-repeat: no-repeat;
-  background-position: right var(--sp-2) center;
-  padding-right: 30px;
+  padding-right: 28px;
   cursor: pointer;
 }
 
@@ -668,7 +684,7 @@ input[type=checkbox] {
   background: var(--fill-2);
   cursor: pointer;
   position: relative;
-  transition: border-color .2s ease,background-color .2s ease,box-shadow .2s ease;
+  transition: border-color .16s ease,background-color .16s ease,box-shadow .16s ease;
 }
 
 input[type=checkbox]::after {
@@ -681,7 +697,7 @@ input[type=checkbox]::after {
   border-radius: 50%;
   background: var(--text-2);
   box-shadow: var(--shadow);
-  transition: transform .2s ease,background-color .2s ease;
+  transition: transform .16s ease,background-color .16s ease;
 }
 
 input[type=checkbox]:hover {
@@ -1044,9 +1060,11 @@ input[type=range]::-moz-range-track {
 
 /* ========== 收尾：焦点环 ========== */
 
+/* macOS 键盘焦点环：3px 半透明系统蓝，绕在控件外 1px 处。
+   文本输入不走 outline（见文件末尾 3682 行那条），否则会和 focus 光晕叠成双环。 */
 .btn:focus-visible, .nav-link:focus-visible, .tab:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
+  outline: 3px solid var(--focus-ring);
+  outline-offset: 1px;
 }
 
 /* ========== 总览页 ========== */
@@ -1091,7 +1109,7 @@ input[type=range]::-moz-range-track {
   border-radius: var(--radius-l);
   background: var(--bg-card);
   padding: 0 var(--sp-3) var(--sp-4);
-  box-shadow: var(--shadow);
+  box-shadow: var(--shadow-1);
 }
 
 .playback-player-panel .current-song {
@@ -1392,11 +1410,16 @@ input[type=range]::-moz-range-track {
 .command-reply-nav button {
   text-align: left;
   justify-content: flex-start;
+  border-radius: 8px;
 }
 
+/* 命令面板的分类列表也是「侧栏选中」：蓝色胶囊 + 白字，与全局导航同一套。
+   原来只有 1px 蓝边 + 蓝字（Web 侧栏的写法），在暗色下几乎看不出选中。 */
 .command-reply-nav button.active {
-  border-color: var(--accent);
-  color: var(--accent);
+  background: var(--accent);
+  border-color: transparent;
+  color: var(--on-accent);
+  font-weight: 500;
 }
 
 .command-groups {
@@ -1541,7 +1564,7 @@ input[type=range]::-moz-range-track {
   background: var(--bg-card);
   border: 1px solid var(--sep-2);
   border-radius: var(--radius-l);
-  box-shadow: var(--shadow);
+  box-shadow: var(--shadow-1);
   min-width: 0;
   overflow: hidden;
 }
@@ -2374,7 +2397,7 @@ input[type=range]::-moz-range-track {
 /* ========== 配置中心：粘滞工具栏与分组卡片 ========== */
 
 .config-group-card {
-  box-shadow: var(--shadow);
+  box-shadow: var(--shadow-1);
   margin-top: var(--sp-3);
 }
 
@@ -2755,7 +2778,7 @@ code, pre {
 
 .history-item, .cache-track-item, .tools-task {
   border-radius: 10px;
-  transition: background 0.12s ease, border-color 0.12s ease;
+  transition: background 0.16s ease, border-color 0.16s ease;
 }
 
 .history-item:hover, .cache-track-item:hover {
@@ -2839,12 +2862,20 @@ code, pre {
 }
 
 .config-section-item {
-  border-radius: 9px;
+  border-radius: 8px;
 }
 
+/* 配置中心的二级侧栏和左侧全局导航是同一套控件语言：整块系统蓝胶囊 + 白字。
+   原来是 accent-soft 的半透明蓝，在浅色下几乎看不出选中，和主侧栏也不一致。 */
 .config-section-item.active {
-  background: var(--accent-soft);
-  color: var(--text-1);
+  background: var(--accent);
+  color: var(--on-accent);
+  font-weight: 500;
+}
+
+.config-section-item.active .section-name {
+  color: var(--on-accent);
+  opacity: 0.85;
 }
 
 .config-group-card {
@@ -3417,7 +3448,7 @@ input[type="range"] {
 }
 
 .tools-side .panel {
-  box-shadow: var(--shadow);
+  box-shadow: var(--shadow-1);
 }
 
 .tools-side .tools-output {
@@ -3452,9 +3483,11 @@ input[type="range"] {
   color: var(--text-3);
 }
 
+/* macOS 卡片：不透明底 + 极淡 1px 线 + 极浅阴影。
+   不用粗边界也不用大色块对比——层次靠「底色差一点点 + 一条 6% 的线」。 */
 .panel {
   background: var(--panel-bg);
-  border: 1px solid var(--sep-1);
+  border: 1px solid var(--sep-2);
   border-radius: var(--radius-l);
   box-shadow: var(--shadow-1);
 }
@@ -3464,33 +3497,50 @@ input[type="range"] {
   border-bottom: 1px solid var(--sep-2);
 }
 
+/* macOS 文本控件：浅填充、无边框（描边只在 hover 时若隐若现），
+   聚焦靠 3px 系统蓝光晕而不是换边框色——这是 macOS 最有辨识度的一条。 */
 input, select, textarea {
   background: var(--input-bg);
-  border: 1px solid var(--sep-1);
+  border: 1px solid transparent;
   border-radius: var(--radius-s);
   color: var(--text-1);
+  transition: background 0.16s ease, border-color 0.16s ease, box-shadow 0.16s ease;
+}
+
+input:hover:not(:disabled), select:hover:not(:disabled), textarea:hover:not(:disabled) {
+  border-color: var(--sep-2);
 }
 
 input:focus, select:focus, textarea:focus {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-soft);
+  border-color: transparent;
+  box-shadow: 0 0 0 3px var(--focus-ring);
+}
+
+/* 显式描边的控件（搜索框这类需要「一眼看出是输入框」的）保留 1px 极淡线。 */
+.input-bordered,
+.command-toolbar input[type=text],
+.config-toolbar input[type=text] {
+  border-color: var(--sep-2);
 }
 
 /* ========== 收尾：平面按钮 ========== */
 
+/* 默认按钮 = macOS secondary：浅灰填充、无描边。
+   以前这里是 var(--bg-2) 实心块 + 1px 边，放在不透明面板上会形成「深色方块」，
+   正是「网页感」的主要来源。 */
 .btn, .top-actions .btn, .command-savebar .btn {
   height: 30px;
   min-height: 30px;
-  padding: 0 11px;
-  border-radius: var(--radius-s);
-  border: 1px solid var(--sep-1);
-  background: var(--bg-2);
+  padding: 0 12px;
+  border-radius: 7px;
+  border: 1px solid transparent;
+  background: var(--btn-fill);
   color: var(--text-1);
   font-size: 12.5px;
   font-weight: 500;
   box-shadow: none;
   overflow: visible;
-  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+  transition: background 0.16s ease, border-color 0.16s ease, color 0.16s ease;
 }
 
 .btn::before {
@@ -3499,42 +3549,72 @@ input:focus, select:focus, textarea:focus {
 }
 
 .btn:hover {
-  background: var(--bg-3);
-  border-color: var(--sep-1);
+  background: var(--btn-fill-hover);
+  border-color: transparent;
 }
 
+/* macOS 按下是「变深」，不是「往下位移 1px」。 */
 .btn:active {
-  transform: translateY(1px);
+  transform: none;
+  background: var(--btn-fill-active);
 }
 
+/* primary 只由 `.primary` 触发：系统蓝实底 + 白字，无描边。 */
 .btn.primary {
   background: var(--accent);
-  border-color: var(--accent);
+  border-color: transparent;
   color: var(--on-accent);
-  box-shadow: none;
+  font-weight: 500;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.16);
 }
 
 .btn.primary:hover {
   background: var(--accent-strong);
-  border-color: var(--accent-strong);
+  border-color: transparent;
 }
 
+.btn.primary:active {
+  background: var(--accent-strong);
+}
+
+/* 需要明确边界时才用 1px 描边（macOS 的 bordered 按钮）。 */
+.btn.bordered,
+.btn.ghost.bordered {
+  background: transparent;
+  border-color: var(--sep-1);
+}
+
+.btn.bordered:hover {
+  background: var(--btn-fill);
+  border-color: var(--sep-1);
+}
+
+/* warn / danger 是「带语义的 secondary」：浅色底 + 语义色文字，
+   不描 1px 亮橙边（那圈橙边会把按钮变成警报块，不是 macOS 的语言）。
+   需要强调危险动作时应该用实底 --danger，而不是把描边调亮。 */
 .btn.warn {
   background: var(--warn-soft);
-  border-color: var(--warn);
+  border-color: transparent;
   color: var(--warn);
 }
 
 .btn.warn:hover {
   background: var(--warn-soft);
-  border-color: var(--warn);
+  border-color: transparent;
   color: var(--warn);
+  filter: brightness(1.12);
 }
 
 .btn.danger {
   background: var(--danger-soft);
-  border-color: var(--danger);
+  border-color: transparent;
   color: var(--danger);
+}
+
+.btn.danger:hover {
+  background: var(--danger-soft);
+  border-color: transparent;
+  filter: brightness(1.12);
 }
 
 .btn.ghost {
@@ -3556,32 +3636,34 @@ input:focus, select:focus, textarea:focus {
   opacity: 0.4;
 }
 
+/* macOS 分段控件：浅灰凹槽 + 选中项是白色凸起小块（不是蓝色实底）。
+   蓝色实底在这个位置会和「选中侧栏项」抢强调色，原生 macOS 选段其实是白片。 */
 .tabs {
-  background: var(--bg-2);
-  border: 1px solid var(--sep-1);
-  border-radius: var(--radius-m);
-  padding: 3px;
+  background: var(--fill-1);
+  border: 0;
+  border-radius: 9px;
+  padding: 2px;
 }
 
 .tab {
   color: var(--text-2);
   border-radius: 7px;
+  font-weight: 500;
 }
 
 .tab:hover {
-  background: var(--bg-3);
   color: var(--text-1);
 }
 
 .tab.active {
-  background: var(--accent);
-  color: var(--on-accent);
-  box-shadow: none;
+  background: var(--seg-thumb);
+  color: var(--text-1);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.18);
 }
 
 .chip {
-  background: var(--bg-2);
-  border-color: var(--sep-1);
+  background: var(--fill-1);
+  border-color: var(--sep-2);
 }
 
 .config-status {
@@ -3608,18 +3690,32 @@ input:focus, select:focus, textarea:focus {
   background: var(--overlay);
 }
 
+/* macOS 的「无边框文本按钮」：透明底、无描边，只有悬停时浮出一层浅填充。 */
 .btn.ghost {
-  border-color: var(--sep-1);
+  border-color: transparent;
   background: transparent;
+  color: var(--text-2);
 }
 
 .btn.ghost:hover {
-  background: var(--bg-2);
+  background: var(--btn-fill);
+  border-color: transparent;
+  color: var(--text-1);
 }
 
-.btn:focus-visible, .tab:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
-  outline: 2px solid var(--accent);
+/* macOS 键盘焦点：3px 半透明系统蓝描边，贴边（offset 1px），不加外扩实线环。
+   实线 2px + offset 2px 是浏览器默认观感，不是 macOS。 */
+.btn:focus-visible, .tab:focus-visible, .nav-link:focus-visible {
+  outline: 3px solid var(--focus-ring);
   outline-offset: 1px;
+  border-radius: 7px;
+}
+
+/* 输入类控件的焦点已经由 3px 光晕表达（box-shadow），这里**不再叠 outline**。
+   实测叠上后会在输入框外面套一圈深蓝实线（outline 画的），像 Web 1.0 的
+   焦点框，而且颜色比光晕深一档。macOS 的原生输入框只有柔光，没有实心环。 */
+input:focus-visible:not([type="checkbox"]):not([type="range"]), select:focus-visible, textarea:focus-visible {
+  outline: none;
 }
 
 input[type="checkbox"] {
@@ -3644,9 +3740,10 @@ input[type="checkbox"]::after {
   box-shadow: var(--switch-thumb-shadow);
 }
 
+/* macOS 开关是绿色（系统绿），不是系统蓝；蓝色留给选中与焦点。 */
 input[type="checkbox"]:checked {
-  background: var(--accent);
-  border-color: var(--accent);
+  background: var(--ok);
+  border-color: transparent;
   box-shadow: none;
 }
 

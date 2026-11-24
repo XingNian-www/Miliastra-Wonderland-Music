@@ -518,25 +518,27 @@ body {
   color: var(--text-3);
 }
 
+/* macOS 侧边栏行：30px 高、8px 圆角胶囊、选中是整块系统蓝而不是左侧竖条。 */
 .nav-link {
   position: relative;
   width: 100%;
+  height: 30px;
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 9px 12px;
-  border-radius: 10px;
-  border: 1px solid transparent;
+  gap: 9px;
+  padding: 0 9px;
+  border-radius: 8px;
+  border: 0;
   background: transparent;
   color: var(--text-2);
   font-size: 13px;
-  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+  transition: background 0.16s ease, color 0.16s ease;
 }
 
 .nav-link svg {
-  width: 17px;
-  height: 17px;
-  opacity: 0.85;
+  width: 16px;
+  height: 16px;
+  opacity: 0.8;
   flex: none;
 }
 
@@ -549,14 +551,9 @@ body {
   opacity: 1;
 }
 
+/* 竖条是旧的「网页侧栏」语言；macOS 用整块胶囊选中，这里彻底去掉。 */
 .nav-link.active::before {
-  content: "";
-  position: absolute;
-  left: -12px;
-  top: 9px;
-  bottom: 9px;
-  width: 3px;
-  border-radius: 0 3px 3px 0;
+  content: none;
 }
 
 .shell {
@@ -631,24 +628,33 @@ body {
   color: var(--text-3);
 }
 
+/* macOS 覆盖式滚动条：滑轨透明、滑块是 6px 的圆角胶囊，悬停才加深。
+   9px 的轨道会把内容挤窄、也让滑条看起来像 Windows。 */
 * {
   scrollbar-width: thin;
   scrollbar-color: var(--scrollbar-thumb) transparent;
 }
 
 *::-webkit-scrollbar {
-  width: 9px;
-  height: 9px;
+  width: 10px;
+  height: 10px;
 }
 
 *::-webkit-scrollbar-thumb {
   background: var(--scrollbar-thumb);
   border-radius: 999px;
+  /* 2px 透明边 + content-box：滑块视觉宽度落到 6px，贴近 macOS 的细滑条，
+     命中区仍是 10px，不牺牲可点性。 */
   border: 2px solid transparent;
   background-clip: content-box;
 }
 
 *::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+  background-clip: content-box;
+}
+
+*::-webkit-scrollbar-thumb:active {
   background: var(--scrollbar-thumb-hover);
   background-clip: content-box;
 }
@@ -696,7 +702,6 @@ body {
   .nav-link.active::before {
     display: none;
   }
-
   .shell {
     margin-left: 0;
   }
@@ -836,32 +841,47 @@ body {
   white-space: nowrap;
 }
 
+/* 内容区是 macOS 的不透明窗口底色：不加径向光斑。
+   网络风的「页头渐变光」会让它一眼仍是网页，而不是窗口。 */
 body {
-  background: radial-gradient(1100px 500px at 20% -10%, var(--page-glow), transparent 60%), var(--bg-0);
+  background: var(--bg-ground);
 }
 
 .app-nav {
-  background: var(--nav-bg);
-  border-right: 1px solid var(--sep-1);
+  background: var(--chrome-material);
+  /* macOS 侧边栏：半透明底 + 毛玻璃。底色 alpha 已给到 0.6+，
+     不支持 backdrop-filter 时仍是一层足够厚的半透明，不会塌成「看不见」。 */
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  backdrop-filter: blur(20px) saturate(180%);
+  border-right: 1px solid var(--sep-2);
 }
 
+/* 选中是系统蓝实底 + 白字（macOS Big Sur 起的侧边栏强调色），
+   半透明蓝会让文字对比度不足，也不像原生控件。 */
 .nav-link.active {
-  background: var(--accent-soft);
-  border-color: var(--accent-outline);
-  color: var(--text-1);
+  background: var(--accent);
+  border-color: transparent;
+  color: var(--on-accent);
+  font-weight: 500;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.18);
 }
 
 .nav-link.active svg {
-  color: var(--accent);
+  color: var(--on-accent);
+  opacity: 0.95;
 }
 
-.nav-link.active::before {
-  background: var(--accent);
+.nav-link.active:hover {
+  background: var(--accent-strong);
+  color: var(--on-accent);
 }
 
 .topbar {
-  background: var(--topbar-bg);
-  border-bottom: 1px solid var(--sep-1);
+  background: var(--chrome-material);
+  /* 顶栏与侧边栏同一套材质：毛玻璃 + 极淡分隔线，而不是实心色块压一条线。 */
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  backdrop-filter: blur(20px) saturate(180%);
+  border-bottom: 1px solid var(--sep-2);
 }
 
 .config-sidebar {

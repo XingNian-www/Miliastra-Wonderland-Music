@@ -3998,3 +3998,321 @@ input[type="checkbox"]:checked::after {
     display: none;
   }
 }
+
+/* =============================================================================
+ * 命令面板（macOS 数据密集）——页面专属前缀 `.commands-mac-*`
+ *
+ * 为什么写在这里而不是 CommandsPage.vue 的 <style scoped>：命令面板的模板几乎都在
+ * components/commands/ 的子组件里，scoped 样式只带父页面自己的 data-v 属性，压不到
+ * 子组件内部。页面根节点已加 `commands-mac-page`，下面每条规则都以它开头，因此
+ * 不会外溢到其它页面，也没有改到上面的通用 `.btn` / `.panel` / `.tab` 规则。
+ * ========================================================================== */
+
+/* ---------- 分组：收进一个圆角容器（grouped），不再是每组一张浮起卡片 ---------- */
+
+.commands-mac-page .command-group {
+  background: var(--bg-input);
+  border: 1px solid var(--sep-2);
+  border-radius: var(--radius-m);
+  box-shadow: none;
+}
+
+.commands-mac-page .command-group-head {
+  height: 34px;
+  padding: 0 var(--sp-3);
+  background: transparent;
+}
+
+.commands-mac-page .command-group-head:hover {
+  background: var(--fill-1);
+}
+
+/* 分组标题：小号灰色大写式标签，不是粗黑标题。 */
+.commands-mac-page .command-group-name {
+  font-size: var(--fs-tiny);
+  line-height: var(--lh-tiny);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--text-2);
+}
+
+.commands-mac-page .command-group-name::before {
+  display: none;
+}
+
+.commands-mac-page .command-group-name::after {
+  font-size: 10px;
+  color: var(--text-3);
+}
+
+.commands-mac-page .command-group-count {
+  color: var(--text-3);
+  font-size: var(--fs-tiny);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 组内条目：无边框、行间 1px 淡线，hover 才是极淡填充。 */
+.commands-mac-page .command-group-body {
+  gap: 0;
+  padding: 0;
+  border-top: 1px solid var(--sep-2);
+}
+
+.commands-mac-page .command-item {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  padding: var(--sp-2) var(--sp-3);
+}
+
+.commands-mac-page .command-item + .command-item {
+  border-top: 1px solid var(--sep-2);
+}
+
+.commands-mac-page .command-item:hover {
+  background: var(--fill-1);
+}
+
+.commands-mac-page .command-item.hidden-command {
+  border-style: solid;
+  background: transparent;
+}
+
+/* 选中命令：内嵌圆角胶囊蓝底 + 白字（radius 6px），不是整块铺满。 */
+.commands-mac-page .command-item.selected {
+  border-radius: var(--radius-s);
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px var(--select-border);
+}
+
+.commands-mac-page .command-item.selected .command-name,
+.commands-mac-page .command-item.selected .command-select.active {
+  color: var(--accent);
+}
+
+.commands-mac-page .command-name {
+  font-size: var(--fs-item);
+  font-weight: 600;
+}
+
+.commands-mac-page .command-summary {
+  color: var(--text-2);
+  font-size: var(--fs-meta);
+  margin-top: 2px;
+}
+
+/* 徽标：macOS 是「小号、无描边、低对比」的胶囊，不是彩色小票。 */
+.commands-mac-page .command-badge {
+  background: var(--fill-1);
+  border: 0;
+  color: var(--text-3);
+  font-size: var(--fs-tiny);
+  padding: 1px 7px;
+}
+
+.commands-mac-page .command-badge.prefix {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-family: var(--font-mono);
+}
+
+.commands-mac-page .command-badge.open {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+.commands-mac-page .command-badge.disabled-mark {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.commands-mac-page .command-alias {
+  background: transparent;
+  border: 0;
+  color: var(--text-3);
+  padding: 0;
+}
+
+.commands-mac-page .command-alias + .command-alias::before {
+  content: "·";
+  margin-right: var(--sp-1);
+  color: var(--text-3);
+}
+
+/* 用法与示例：深色圆角等宽块。 */
+.commands-mac-page .command-detail {
+  border-top: 1px solid var(--sep-2);
+  margin-top: var(--sp-2);
+  padding-top: var(--sp-2);
+}
+
+.commands-mac-page .command-detail-lines code {
+  background: var(--bg-0);
+  border: 1px solid var(--sep-2);
+  border-radius: var(--radius-s);
+  padding: 3px 8px;
+  color: var(--text-2);
+  font-size: var(--fs-tiny);
+  line-height: 1.6;
+}
+
+.commands-mac-page .command-detail-label {
+  color: var(--text-3);
+  font-size: var(--fs-tiny);
+  letter-spacing: 0.04em;
+}
+
+/* ---------- 左侧分类导航：类似 Finder 侧栏的选中胶囊 ---------- */
+
+.commands-mac-page .command-reply-nav button {
+  height: 28px;
+  min-height: 28px;
+  justify-content: space-between;
+  padding: 0 var(--sp-2);
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-2);
+  font-size: var(--fs-meta);
+}
+
+.commands-mac-page .command-reply-nav button:hover {
+  background: var(--fill-1);
+  color: var(--text-1);
+}
+
+.commands-mac-page .command-reply-nav button.active {
+  background: var(--accent);
+  border-color: transparent;
+  color: var(--on-accent);
+  font-weight: 500;
+}
+
+/* ---------- 回复编辑器：分组容器 + 行分隔线，不再逐行虚线 ---------- */
+
+.commands-mac-page .command-reply-editor {
+  background: var(--bg-card);
+  border: 1px solid var(--sep-2);
+  border-radius: var(--radius-m);
+  padding: var(--sp-3);
+}
+
+.commands-mac-page .command-reply-editor h3 {
+  font-size: var(--fs-title);
+  font-weight: 600;
+}
+
+.commands-mac-page .command-reply-list {
+  gap: 0;
+  border: 1px solid var(--sep-2);
+  border-radius: var(--radius-m);
+  background: var(--bg-input);
+  overflow: hidden;
+}
+
+.commands-mac-page .command-reply-row {
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  border: 0;
+  border-bottom: 1px solid var(--sep-2);
+}
+
+.commands-mac-page .command-reply-row:last-child {
+  border-bottom: 0;
+}
+
+.commands-mac-page .command-reply-head {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+.commands-mac-page .command-reply-head strong {
+  font-size: var(--fs-meta);
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+.commands-mac-page .command-reply-key {
+  color: var(--text-3);
+  font-size: var(--fs-tiny);
+}
+
+.commands-mac-page .command-reply-row textarea {
+  background: var(--bg-0);
+  border: 1px solid var(--sep-2);
+  border-radius: var(--radius-s);
+  font-family: var(--font-mono);
+  font-size: var(--fs-meta);
+  line-height: 1.6;
+  padding: 8px 10px;
+}
+
+.commands-mac-page .command-reply-row textarea:focus {
+  border-color: var(--accent);
+  background: var(--bg-input);
+}
+
+/* 行工具条：平时收起，hover / 聚焦才出现（macOS 的「按需显形」）。 */
+.commands-mac-page .command-reply-tools {
+  border-top: 0;
+  margin-top: 0;
+  padding-top: 0;
+  justify-content: flex-start;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.commands-mac-page .command-reply-row:hover .command-reply-tools,
+.commands-mac-page .command-reply-row:focus-within .command-reply-tools {
+  opacity: 1;
+}
+
+@media (hover: none) {
+  .commands-mac-page .command-reply-tools {
+    opacity: 1;
+  }
+}
+
+.commands-mac-page .command-reply-vars .btn {
+  font-family: var(--font-mono);
+  font-size: var(--fs-tiny);
+  color: var(--text-3);
+}
+
+/* ---------- 状态条与工具条：小号灰色标签 ---------- */
+
+.commands-mac-page .command-status {
+  background: var(--bg-input);
+  border-color: var(--sep-2);
+  border-radius: var(--radius-m);
+  padding: var(--sp-2) var(--sp-3);
+}
+
+.commands-mac-page .command-status .chip {
+  background: transparent;
+  border-color: var(--sep-2);
+  font-size: var(--fs-tiny);
+}
+
+.commands-mac-page .command-toolbar-meta {
+  color: var(--text-3);
+  font-size: var(--fs-tiny);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 空状态：居中、灰色、小字。 */
+.commands-mac-page .command-empty {
+  padding: var(--sp-5) var(--sp-3);
+  color: var(--text-3);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-meta);
+  text-align: center;
+  background: var(--bg-input);
+  border: 1px solid var(--sep-2);
+  border-radius: var(--radius-m);
+}
+
+/* 保存栏：贴底、圆角、玻璃感（沿用 --savebar-bg，不新建颜色）。 */
+.commands-mac-page .command-savebar {
+  border-radius: var(--radius-m);
+  border-color: var(--sep-1);
+}

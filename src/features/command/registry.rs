@@ -719,6 +719,16 @@ pub(crate) const REPLY_GROUPS: &[ReplyGroupSpec] = &[
         category: "大厅",
         keys: &["hall.microphone.toggled"],
     },
+    // 程序自动播报（没有对应的玩家命令）：分组是为了让面板能改这些文案。
+    // 这些文案由运行时事件触发（例如自动重启游戏前后），玩家不会主动调用，
+    // 因此 command_id 用描述性标识而不是 @/# 命令。
+    ReplyGroupSpec {
+        owner: ChatCommandModule::Hall,
+        command_id: "自动重启游戏",
+        name: "自动重启游戏",
+        category: "大厅",
+        keys: &["hall.game_restart.notice", "hall.game_restart.restored"],
+    },
     ReplyGroupSpec {
         owner: ChatCommandModule::Tarot,
         command_id: "#塔罗牌",

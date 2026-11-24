@@ -455,6 +455,11 @@ pub(crate) const REPLY_VARIABLES: &[ReplyVariable] = &[
         label: "播放器音量",
         example: "80",
     },
+    ReplyVariable {
+        name: "原因",
+        label: "自动重启游戏的原因",
+        example: "聊天源失联",
+    },
 ];
 
 /// 命令回复目录项；由 `ownership::REPLY_GROUPS` 派生，不再手写维护。

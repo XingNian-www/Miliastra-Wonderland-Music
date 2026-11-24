@@ -336,6 +336,10 @@
           "count": 1
         },
         {
+          "path": "src/composition/application/tasks.rs",
+          "count": 6
+        },
+        {
           "path": "src/composition/application/workers.rs",
           "count": 22
         }
@@ -2112,8 +2116,8 @@
       "pub_items": 0
     },
     "src/composition/application/tasks.rs": {
-      "lines": 1342,
-      "pub_items": 24
+      "lines": 1400,
+      "pub_items": 25
     },
     "src/composition/application/workers.rs": {
       "lines": 1648,
@@ -2136,7 +2140,7 @@
       "pub_items": 2
     },
     "src/composition/application/listener/recovery_guard.rs": {
-      "lines": 519,
+      "lines": 522,
       "pub_items": 27
     },
     "src/config/ai.rs": {
@@ -2460,11 +2464,11 @@
       "pub_items": 58
     },
     "src/features/command/registry.rs": {
-      "lines": 1080,
+      "lines": 1090,
       "pub_items": 15
     },
     "src/features/command/registry_fixtures.rs": {
-      "lines": 623,
+      "lines": 629,
       "pub_items": 9
     },
     "src/features/hall/state.rs": {
@@ -2512,15 +2516,15 @@
       "pub_items": 15
     },
     "src/features/reply_template/hall.rs": {
-      "lines": 175,
-      "pub_items": 10
+      "lines": 220,
+      "pub_items": 12
     },
     "src/features/reply_template/idiom_chain.rs": {
       "lines": 401,
       "pub_items": 27
     },
     "src/features/reply_template/mod.rs": {
-      "lines": 1688,
+      "lines": 1693,
       "pub_items": 46
     },
     "src/features/reply_template/moderation.rs": {

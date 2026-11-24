@@ -75,6 +75,26 @@ pub(crate) const EXPIRING_WARNING: ReplyTemplate = ReplyTemplate {
     group: "大厅",
 };
 
+/// 自动重启游戏前的预告：必须**先**发出去再关窗口，否则玩家只会看到突然掉线。
+///
+/// 文案里带原因，让玩家知道是程序在维护而不是自己被踢了。
+pub(crate) const GAME_RESTART_NOTICE: ReplyTemplate = ReplyTemplate {
+    key: "hall.game_restart.notice",
+    default: "游戏因{原因}需要重启，稍后自动恢复",
+    summary: "自动重启游戏前的预告",
+    group: "大厅",
+};
+
+/// 游戏重新拉起成功后的播报。
+///
+/// 游戏重启后语音（麦克风）与音乐播放都是关闭状态，不提醒玩家会以为功能坏了。
+pub(crate) const GAME_RESTARTED_RESUME_HINT: ReplyTemplate = ReplyTemplate {
+    key: "hall.game_restart.restored",
+    default: "游戏已重启，请重新开启麦克风与播放",
+    summary: "游戏重启成功后的提醒",
+    group: "大厅",
+};
+
 /// 大厅即将到期（带剩余分钟）。
 pub(crate) const EXPIRING_WARNING_MINUTES: ReplyTemplate = ReplyTemplate {
     key: "hall.expiring.warning_minutes",
@@ -94,6 +114,8 @@ pub(crate) const HALL: &[ReplyTemplate] = &[
     MICROPHONE_TOGGLED,
     EXPIRING_WARNING,
     EXPIRING_WARNING_MINUTES,
+    GAME_RESTART_NOTICE,
+    GAME_RESTARTED_RESUME_HINT,
 ];
 
 #[cfg(test)]
@@ -171,5 +193,28 @@ mod tests {
             render(&MICROPHONE_TOGGLED, None, &vars).text,
             "小明 执行了切换麦克风状态！"
         );
+    }
+    /// 重启预告必须把原因渲染进去：只说「需要重启」玩家仍不知道发生了什么，
+    /// 而把原因写死的旧做法又改不了（这条要能在配置中心覆盖）。
+    #[test]
+    fn game_restart_notice_renders_the_reason() {
+        let vars = ReplyVars::new().with("原因", "聊天源失联");
+        assert_eq!(
+            render(&GAME_RESTART_NOTICE, None, &vars).text,
+            "游戏因聊天源失联需要重启，稍后自动恢复"
+        );
+        // 变量缺省时不该 panic 或留下裸占位符以外的破坏性内容；
+        // 这里只钉住「有变量时渲染正确」，缺变量由 render 的 missing 机制报出。
+        assert!(GAME_RESTART_NOTICE.default.contains("{原因}"));
+    }
+
+    /// 重启后的提醒必须同时提到「麦克风」与「播放」：
+    /// 只提其中一项，另一项玩家就会以为坏了。
+    #[test]
+    fn game_restarted_hint_mentions_microphone_and_playback() {
+        let text = render(&GAME_RESTARTED_RESUME_HINT, None, &ReplyVars::new()).text;
+        assert_eq!(text, "游戏已重启，请重新开启麦克风与播放");
+        assert!(text.contains("麦克风"));
+        assert!(text.contains("播放"));
     }
 }

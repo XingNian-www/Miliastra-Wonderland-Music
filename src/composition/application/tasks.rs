@@ -200,6 +200,13 @@ fn apply_hall_expiry_pause(
     Ok(())
 }
 
+/// 发完「游戏因 XX 需要重启」的预告后，等多久再真的关窗口。
+///
+/// 预告只是进了延迟回复队列，真正送出还要经过聊天框输入与发送确认；
+/// 紧接着关窗口会把这条还没送出的消息一起毁掉，玩家就只看到毫无征兆地掉线。
+/// 3 秒足够走完一次「入队 → 送出」的常规路径。
+const GAME_RESTART_NOTICE_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
+
 impl AppServices {
     pub(super) fn reload_aware_wait(&self, requested: Duration) -> Duration {
         reload_poll_wait(requested, self.shared.live_configs.has_pending_reload())
@@ -268,6 +275,11 @@ impl AppServices {
         external_chat: &crate::composition::application::external_chat::ExternalChatState,
     ) {
         log::warn!("自动重启游戏第 1 步：关闭游戏（原因：{reason}），先暂停播放器");
+        // 先向大厅预告再关窗口：直接杀进程玩家只会看到毫无征兆地掉线，
+        // 不知道是程序在维护还是自己被踢了。
+        //
+        // 顺序不能反：这条消息要靠游戏里的聊天框发出去，窗口一关就没有发送通道了。
+        self.announce_game_restart_notice(reason);
         self.abort_entertainment_for_context_loss("自动重启游戏");
         if let Err(error) = self.playback.player.pause_for_auto_restart() {
             // 播放状态已置为「用户暂停」，自动推进不会再继续；
@@ -290,6 +302,52 @@ impl AppServices {
         self.invalidate_latest_frame();
         // 失联起点清零：重启后再从零计时，避免用旧起点立刻再次触发。
         external_chat.clear_loss();
+    }
+
+    /// 关窗口前向大厅预告「游戏因 XX 需要重启」。
+    ///
+    /// 只负责「把话交出去 + 等它真的送进游戏」；发送本身走既有的延迟回复队列，
+    /// 与其它大厅播报共用一条通道，不在这里另起发送逻辑。
+    ///
+    /// 等待是必需的：入队不等于已发送，紧接着关窗口会把还没发出去的预告一起毁掉。
+    fn announce_game_restart_notice(&self, reason: &str) {
+        let rendered = crate::features::reply_template::render(
+            &crate::features::reply_template::hall::GAME_RESTART_NOTICE,
+            None,
+            &crate::features::reply_template::ReplyVars::new().with("原因", reason),
+        );
+        if let Err(error) =
+            super::enqueue_current_hall_reply(&self.business.task_engine, &rendered.text)
+        {
+            // 预告失败不能阻止重启本身：能恢复运行比通知到更重要。
+            log::warn!(
+                "自动重启游戏：重启预告入队失败（继续执行重启，玩家将收不到预告）：{error:#}"
+            );
+            return;
+        }
+        log::info!(
+            "自动重启游戏：已排入重启预告「{}」，等待送达后关闭游戏",
+            rendered.text
+        );
+        std::thread::sleep(GAME_RESTART_NOTICE_SETTLE);
+    }
+
+    /// 游戏被重新拉起后向大厅播报「请重新开启麦克风与播放」。
+    ///
+    /// 重启后游戏里的语音与音乐播放都是关闭状态，不提醒玩家会以为功能坏了。
+    pub(super) fn announce_game_restarted(&self) {
+        let rendered = crate::features::reply_template::render(
+            &crate::features::reply_template::hall::GAME_RESTARTED_RESUME_HINT,
+            None,
+            &crate::features::reply_template::ReplyVars::new(),
+        );
+        if let Err(error) =
+            super::enqueue_current_hall_reply(&self.business.task_engine, &rendered.text)
+        {
+            log::warn!("游戏重启后播报入队失败（玩家将收不到重新开麦提示）：{error:#}");
+        } else {
+            log::info!("游戏重启后已排入播报「{}」", rendered.text);
+        }
     }
 
     /// 「重启游戏」的**第二步：请既有的自动拉起机制重新启动游戏**。

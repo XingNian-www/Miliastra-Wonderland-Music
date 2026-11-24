@@ -380,6 +380,9 @@ impl AppServices {
                             "自动重启游戏：已请 Miliastra-Wonderland-ChatBridge 重新拉起游戏并注入 DLL"
                         );
                         guard.auto_restart.awaiting_bridge_relaunch = None;
+                        // 游戏刚被拉起：此刻麦克风与音乐播放都还是关闭状态，
+                        // 不提醒玩家会以为功能坏了。播报走延迟队列，等界面就绪再发出。
+                        self.announce_game_restarted();
                     }
                     Ok(false) => {
                         // 桥仍在监听、或处于停止/退避闸门中。下一轮继续试：

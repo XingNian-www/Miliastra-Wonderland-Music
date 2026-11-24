@@ -255,6 +255,12 @@ pub(super) const REPLY_GROUPS: &[(&str, &str, &str, &[&str])] = &[
     ),
     ("@麦克风", "麦克风", "大厅", &["hall.microphone.toggled"]),
     (
+        "自动重启游戏",
+        "自动重启游戏",
+        "大厅",
+        &["hall.game_restart.notice", "hall.game_restart.restored"],
+    ),
+    (
         "#塔罗牌",
         "塔罗牌",
         "娱乐",

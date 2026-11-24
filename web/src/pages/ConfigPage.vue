@@ -1,5 +1,5 @@
 <template>
-  <div id="page-config">
+  <div id="page-config" class="form-mac-page">
     <div v-if="loading" class="loading-card">正在载入配置…</div>
     <div v-else-if="loadError" class="config-message err">{{ loadError }}</div>
     <template v-else>

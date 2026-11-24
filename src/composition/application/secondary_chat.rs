@@ -999,6 +999,7 @@ impl AppServices {
             text,
             sender: message_sender,
             account,
+            sender_in_friend_list,
         } in messages
         {
             log::debug!("开始处理一条二级观察消息");
@@ -1136,7 +1137,10 @@ impl AppServices {
                 command_text,
                 command_observation,
             )
-            .map(|envelope| envelope.with_account(account.clone())) else {
+            .map(|envelope| envelope.with_account(account.clone()))
+            .map(|envelope| {
+                apply_friend_list_floor(envelope, &message_type, sender_in_friend_list)
+            }) else {
                 if command::looks_like_command(&text) {
                     log::info!(
                         "命令未执行：二级消息无法解析为命令信封（缺发送者或前缀不成立）「{}」",
@@ -1166,6 +1170,36 @@ impl AppServices {
             outcome.command_dispatched |= self.submit_secondary_command(parsed)?;
         }
         Ok(outcome)
+    }
+}
+
+/// 用户规则：「只要是左侧列表中的都是好友」。
+///
+/// 大厅（`blue`）里发言人名字出现在**左侧好友列表** → 权限**下界**升到
+/// [`CommandAuthority::Friend`]，即便身份映射里没登记这个人。
+///
+/// ## 边界（三条都不能破）
+///
+/// 1. **只升下界，不做覆盖**：真正的档位仍由
+///    [`crate::features::command_access::actor_permission_with_floor`] 决定——
+///    映射命中时用映射 role（Admin/Owner 照样更高），未登记者最多到 Friend。
+/// 2. **只在 blue + 列表命中时升**：`pink`（好友私聊）本来就是 Friend，
+///    `unknown` 不派发业务，外部源恒 false，所以一级大厅/私聊/外部源三条既有
+///    路径完全不受影响。
+/// 3. **不碰 UID 口径**：`role_of_sender` 与 `resolve_hint` 原样不动，有 UID 时
+///    仍只认 UID。改昵称冒充最多拿到 Friend 下界，拿不到任何映射档位。
+///
+/// 列表 OCR 失败时 `sender_in_friend_list` 恒 false（调用方保证），于是这里原样
+/// 返回 HallMember——**绝不会因为列表读不到就让所有人失去权限**。
+fn apply_friend_list_floor(
+    envelope: CommandEnvelope,
+    message_type: &str,
+    sender_in_friend_list: bool,
+) -> CommandEnvelope {
+    if message_type == "blue" && sender_in_friend_list {
+        envelope.with_authority(CommandAuthority::Friend)
+    } else {
+        envelope
     }
 }
 
@@ -1200,6 +1234,99 @@ mod tests {
             CommandEnvelope::new(text, "玩家癸", "blue", command_text, Default::default())
                 .expect("提取出的 @状态 必须能构造命令信封");
         assert_eq!(format!("{:?}", envelope.prefix()), "At");
+    }
+
+    /// 用户规则「只要是左侧列表中的都是好友」的四条边界 + 一条兜底。
+    ///
+    /// 用合成单测验证（真实大厅帧手上没有）：权威提升是纯函数
+    /// [`super::apply_friend_list_floor`]，因此可以逐条钉死。
+    mod friend_list_floor {
+        use super::super::apply_friend_list_floor;
+        use crate::features::command::{CommandAuthority, CommandEnvelope, CommandObservation};
+        use crate::features::command_access::{CommandPermission, actor_permission_with_floor};
+        use crate::features::identity::IdentityRole;
+
+        fn envelope(message_type: &str) -> CommandEnvelope {
+            CommandEnvelope::new(
+                "@邀请465",
+                "昵称C",
+                message_type,
+                "@邀请465",
+                CommandObservation::default(),
+            )
+            .expect("command envelope")
+        }
+
+        /// blue + 左侧列表命中 → Friend 下界（未登记也不掉回 User）。
+        #[test]
+        fn hall_speaker_in_friend_list_gets_the_friend_floor() {
+            let promoted = apply_friend_list_floor(envelope("blue"), "blue", true);
+            assert_eq!(promoted.authority(), CommandAuthority::Friend);
+            assert_eq!(
+                actor_permission_with_floor(None, promoted.authority()),
+                CommandPermission::Friend,
+                "未登记但出现在左侧列表：至少是好友"
+            );
+        }
+
+        /// blue + 未命中 → 维持 HallMember，仍退回 User 下界。
+        #[test]
+        fn hall_speaker_not_in_friend_list_keeps_the_hall_member_floor() {
+            let unchanged = apply_friend_list_floor(envelope("blue"), "blue", false);
+            assert_eq!(unchanged.authority(), CommandAuthority::HallMember);
+            assert_eq!(
+                actor_permission_with_floor(None, unchanged.authority()),
+                CommandPermission::User
+            );
+        }
+
+        /// 列表 OCR 读空/失败（调用方传 false）→ 全员维持原下界，不能因此失去权限。
+        #[test]
+        fn failed_sidebar_ocr_never_grants_anything() {
+            for message_type in ["blue", "pink"] {
+                let unchanged =
+                    apply_friend_list_floor(envelope(message_type), message_type, false);
+                let expected = if message_type == "pink" {
+                    CommandAuthority::Friend
+                } else {
+                    CommandAuthority::HallMember
+                };
+                assert_eq!(unchanged.authority(), expected, "{message_type}");
+            }
+        }
+
+        /// blue + 命中 + 映射 role=Admin → **Admin**（下界不覆盖映射档位）。
+        #[test]
+        fn mapped_admin_keeps_admin_despite_the_friend_floor() {
+            let promoted = apply_friend_list_floor(envelope("blue"), "blue", true);
+            assert_eq!(
+                actor_permission_with_floor(Some(IdentityRole::Admin), promoted.authority()),
+                CommandPermission::Admin,
+                "身份命中时用映射 role，Friend 只是下界"
+            );
+            assert_eq!(
+                actor_permission_with_floor(Some(IdentityRole::Owner), promoted.authority()),
+                CommandPermission::Owner
+            );
+            // 未登记时也绝不会越过 Friend 下界拿到更高档。
+            assert_eq!(
+                actor_permission_with_floor(None, promoted.authority()),
+                CommandPermission::Friend
+            );
+        }
+
+        /// 好友私聊（pink）完全不受这条规则影响。
+        #[test]
+        fn private_friend_chat_is_unaffected() {
+            for flag in [true, false] {
+                let untouched = apply_friend_list_floor(envelope("pink"), "pink", flag);
+                assert_eq!(
+                    untouched.authority(),
+                    CommandAuthority::Friend,
+                    "flag={flag}"
+                );
+            }
+        }
     }
 
     use crate::features::entertainment::EntertainmentKind;

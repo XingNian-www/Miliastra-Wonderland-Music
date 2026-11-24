@@ -400,6 +400,7 @@ mod tests {
             raw_sender: None,
             message_type: "blue".to_string(),
             block: Rect::new(0, y, 400, 28),
+            sender_in_friend_list: false,
         }
     }
 

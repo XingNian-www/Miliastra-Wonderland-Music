@@ -412,12 +412,41 @@ pub(super) fn highlighted_row(image: &DynamicImage, region: Rect) -> Option<Rect
 
 /// Read-only counterpart of active friend confirmation: the current frame must
 /// contain exactly one selected sidebar row. No recipient or click point is assumed.
+///
+/// **这个严格版本保留给「决定点什么」的路径**（`residency`/恢复导航）：多高亮时
+/// 猜错会点到别人的会话，风险不可接受。
+///
+/// **只读观察**（二级聊天身份判定）请用 [`highlighted_conversation_row_candidates`]：
+/// 它允许 ≥1 条亮带，由调用方按 OCR/大厅模板挑最可能的那条。理由见该函数。
 pub(crate) fn highlighted_conversation_row(image: &DynamicImage, region: Rect) -> Option<Rect> {
     let rows = highlighted_rows(image, region);
     match rows.as_slice() {
         [row] => Some(*row),
         _ => None,
     }
+}
+
+/// 只读观察用：把所有高亮带按「最可能是选中会话行」排序返回（0 条返回空）。
+///
+/// 为什么不复用 [`highlighted_conversation_row`] 的「恰好一条」约束：二级聊天面板
+/// 里行数多、有红点行、头像亮时经常出现 ≥2 条亮带，旧实现直接返回 `None`，
+/// 于是 `ChatIdentity::Unknown` → 命令被身份闸丢弃、未读任务永远等不到
+/// `Friend(_)`。观察路径**不点击任何东西**，多给几个候选让调用方按证据挑，
+/// 比一无所知安全得多。
+///
+/// 排序（先验）：高者优先（选中行是整行色带，误报多是细带），再按 y 升序。
+pub(crate) fn highlighted_conversation_row_candidates(
+    image: &DynamicImage,
+    region: Rect,
+) -> Vec<Rect> {
+    let mut rows = highlighted_rows(image, region);
+    rows.sort_by(|left, right| {
+        right
+            .height
+            .cmp(&left.height)
+            .then_with(|| left.y.cmp(&right.y))
+    });
+    rows
 }
 
 pub(super) fn highlighted_rows(image: &DynamicImage, region: Rect) -> Vec<Rect> {

@@ -3201,6 +3201,7 @@ mod tests {
             RecognizedChatMessage {
                 message_type: "blue".to_string(),
                 block: crate::geometry::Rect::new(0, y, 100, 10),
+                sender_in_friend_list: false,
                 text: text.to_string(),
                 sender: None,
                 raw_sender: None,

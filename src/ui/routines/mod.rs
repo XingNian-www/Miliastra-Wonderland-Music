@@ -18,7 +18,7 @@ pub(crate) use friend_delivery::{
     EstablishResidency, FriendDelivery, FriendDeliveryMessageStatus, FriendDeliveryRoutineConfig,
     FriendDeliveryRoutineConfigSource, FriendDeliveryUi, HallBatchStatus, HallBatchUi, ResidencyUi,
     SendFriendDeliveries, SendHallBatch, UiResidencyOutcome, UiResidencyTarget,
-    highlighted_conversation_row,
+    highlighted_conversation_row, highlighted_conversation_row_candidates,
 };
 pub(crate) use hall::{
     DetectPublicHall, DetectPublicHallEffect, HallRoutineConfig, HallUi, ReadHallInfo,

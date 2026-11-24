@@ -376,6 +376,7 @@ fn replay_frame(
                         raw_sender: None,
                         message_type: m.message_type,
                         block: m.block,
+                        sender_in_friend_list: false,
                     }
                 })
                 .collect::<Vec<_>>();
@@ -413,10 +414,7 @@ fn replay_frame(
                 latest,
             )?;
             if !bubbles.is_empty() {
-                regions = bubbles
-                    .iter()
-                    .map(|b| (b.rect, Some(b.sender_rect())))
-                    .collect();
+                regions = bubbles.iter().map(|b| (b.rect, b.sender_rect())).collect();
             } else if let Some(rect) = latest {
                 if !messages.is_empty() {
                     regions.push((rect, selected));

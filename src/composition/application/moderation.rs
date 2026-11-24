@@ -1092,6 +1092,7 @@ mod tests {
             raw_sender: None,
             message_type: color.into(),
             block: crate::geometry::Rect::new(0, y, 100, 10),
+            sender_in_friend_list: false,
         }
     }
 

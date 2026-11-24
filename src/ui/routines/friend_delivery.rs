@@ -40,8 +40,8 @@ pub(crate) use delivery::send_current_chat_message;
 pub(crate) use emoji_panel::{EmojiCatalogScanOutcome, EmojiCatalogUi, EmojiTabScan};
 pub(crate) use navigation::{
     conversation_row_region, current_hall_restore_drag_points, friend_list_drag_points,
-    highlighted_conversation_row, matching_text_rows, ocr_friend_rows, open_friend_conversation,
-    point_in_rect,
+    highlighted_conversation_row, highlighted_conversation_row_candidates, matching_text_rows,
+    ocr_friend_rows, open_friend_conversation, point_in_rect,
 };
 
 use std::path::PathBuf;

@@ -47,6 +47,87 @@ pub(in crate::composition::application) fn lock_anchor_for(
     LockAnchor::Screen { y: screen_y }
 }
 
+/// 身份闸拦下一条二级大厅命令时，**具体是哪一类**原因。
+///
+/// 这三类在真实现场的表现完全不同，混成一句话（旧的「既没有 UID 也没有昵称」）
+/// 会让排查方向直接跑偏：
+///
+/// | 码 | 含义 | 现场 |
+/// |---|---|---|
+/// | `SENDER_MISSING` | 原始 sender 与 raw_sender 都空 | OCR 根本没读到发言人 |
+/// | `BRACKET_PARSE_EMPTY` | 有原始名字，但解析后**有效名为空** | 括号解析失败（症状1） |
+/// | `IDENTITY_UNRESOLVED` | 有效名有，但身份映射查不到 | 括号混用/改名导致键不匹配（症状1主现场） |
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SecondaryIdentityGateCause {
+    SenderMissing,
+    BracketParseEmpty,
+    IdentityUnresolved,
+}
+
+impl SecondaryIdentityGateCause {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::SenderMissing => "SENDER_MISSING",
+            Self::BracketParseEmpty => "BRACKET_PARSE_EMPTY",
+            Self::IdentityUnresolved => "IDENTITY_UNRESOLVED",
+        }
+    }
+
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::SenderMissing => {
+                "屏幕没有读到发言人名字（sender 与 raw_sender 均为空），无法授权"
+            }
+            Self::BracketParseEmpty => "发言人名字解析后有效名为空（括号配对失败），无法授权",
+            Self::IdentityUnresolved => {
+                "发言人名字查不到身份映射（备注键不匹配），本轮只按来源下界授权"
+            }
+        }
+    }
+}
+
+/// 判定身份闸的拦截类别。
+///
+/// `resolves` 只在「有效名存在」时被调用一次，避免为空名做无谓查询。
+/// 它必须是**授权口径**的解析（有 UID 只认 UID），不能放宽——这里只用于分类日志，
+/// 不参与授权决策。
+fn secondary_identity_gate_cause(
+    sender: Option<&str>,
+    raw_sender: Option<&str>,
+    effective: Option<&str>,
+    mut resolves: impl FnMut(&str) -> bool,
+) -> SecondaryIdentityGateCause {
+    let has_raw = raw_sender.is_some_and(|value| !value.trim().is_empty());
+    if !has_raw && sender.is_none_or(|value| value.trim().is_empty()) {
+        return SecondaryIdentityGateCause::SenderMissing;
+    }
+    match effective.filter(|value| !value.trim().is_empty()) {
+        // 有原始名字但解析不出有效名：括号配对失败的直接证据。
+        None => SecondaryIdentityGateCause::BracketParseEmpty,
+        Some(effective) if !resolves(effective) => SecondaryIdentityGateCause::IdentityUnresolved,
+        // 有效名可解析：这条消息其实拿到了角色，只是仍被判成无身份
+        // （理论上不可达；退化成 SenderMissing 以免分类函数返回 Option）。
+        Some(_) => SecondaryIdentityGateCause::SenderMissing,
+    }
+}
+
+/// 二级消息的**可授权发送者名**：优先从 `raw_sender` 解析出的 effective name
+/// （括号里的游戏内备注），否则退回 `sender`。
+///
+/// 抽成函数是为了让大厅分支与「未识别身份」分支**只有一份口径**：
+/// 两处各写一遍会造成漂移，一边认出备注、另一边把整串 `昵称A(备注A）`
+/// 当身份键（`resolve()` 必然落空）。
+///
+/// 返回 `None` 表示没有任何可用名字——调用方按「无身份」处理。
+fn secondary_authorizable_sender(raw_sender: Option<&str>, sender: Option<&str>) -> Option<String> {
+    raw_sender
+        .map(parse_secondary_sender_identity)
+        .filter(|identity| !identity.effective_name().trim().is_empty())
+        .map(|identity| identity.effective_name().to_string())
+        .or_else(|| sender.map(str::to_owned))
+        .filter(|sender| !sender.trim().is_empty())
+}
+
 /// 命令在**拦截点**被挡下的具体原因。
 ///
 /// 拦截点在入队/派发之前（[\`AppServices::command_gate\`]），
@@ -550,16 +631,10 @@ impl AppServices {
                         }
                         let revision_sender = message.sender.clone();
                         let revision_raw_sender = message.raw_sender.clone();
-                        let sender = message
-                            .raw_sender
-                            .as_deref()
-                            .map(parse_secondary_sender_identity)
-                            .filter(|identity| !identity.effective_name().trim().is_empty())
-                            .map(|identity| identity.effective_name().to_string())
-                            // clone 而不是 move：下面还要从 message 取 lock_anchor()
-                            // 与 text，部分移动会让它们不可用。
-                            .or_else(|| message.sender.clone())
-                            .filter(|sender| !sender.trim().is_empty());
+                        let sender = secondary_authorizable_sender(
+                            message.raw_sender.as_deref(),
+                            message.sender.as_deref(),
+                        );
                         if is_hall {
                             let classification = self.classify_secondary_business_message(
                                 &message.text,
@@ -582,13 +657,45 @@ impl AppServices {
                                     message.account.as_ref(),
                                 )
                             {
-                                if command::looks_like_command(&message.text)
-                                    && self.ui.chat_timeline.note_not_executed_log(&message.id)?
-                                {
-                                    log::info!(
-                                        "命令未执行：这条二级消息既没有 UID 也没有昵称，无法确认发送者，因此不授权「{}」",
-                                        compact_for_log(&message.text)
-                                    );
+                                // 这条闸**静默丢弃**命令，所以必须留下「为什么」。
+                                //
+                                // 原来只有一句 `info` 且仅当 `looks_like_command`：真实
+                                // 现场（括号解析失败 → effective 为空 → 权限掉回 User）
+                                // 在日志里既分不出类别，也看不出是谁。三分类各有独立
+                                // 文案与码，排查时能直接对上下面的成因：
+                                //
+                                //   NO_SENDER        连原始 sender 都空（OCR 没读到名字）
+                                //   EMPTY_EFFECTIVE  有原始名字，但解析后有效名为空
+                                //                    （**症状1 现场**：括号配对失败后整串
+                                //                    被 trim 掉/只剩括号）
+                                //   UNRESOLVED       有效名有，但身份映射 `resolve()` 查不到
+                                //                    （**症状1 主现场**：括号混用导致键不匹配）
+                                //
+                                // 只打日志、**不回执玩家**：大厅里每个未映射玩家都会触发，
+                                // 回执会刷屏。
+                                let cause = secondary_identity_gate_cause(
+                                    message.sender.as_deref(),
+                                    message.raw_sender.as_deref(),
+                                    sender.as_deref(),
+                                    |effective| {
+                                        self.shared
+                                            .live_configs
+                                            .identity
+                                            .resolve(effective)
+                                            .is_some()
+                                    },
+                                );
+                                log::warn!(
+                                    "二级大厅命令被身份闸拦下（{}）：{}，聊天区：{}，原文「{}」",
+                                    cause.code(),
+                                    cause.reason(),
+                                    chat_identity_label(chat),
+                                    compact_for_log(&message.text)
+                                );
+                                // 玩家可见的 info 仍只在「像命令」时打一次，避免刷屏；
+                                // 上面的 warn 是排查用，不受 looks_like_command 限制。
+                                if command::looks_like_command(&message.text) {
+                                    self.ui.chat_timeline.note_not_executed_log(&message.id)?;
                                 }
                                 continue;
                             }
@@ -648,6 +755,9 @@ impl AppServices {
                                         text: message.text,
                                         sender,
                                         account: message.account,
+                                        // 「左侧列表里的名字 = 好友」的权限下界信号，
+                                        // 只在二级大厅 OCR 路径由侧栏名单算出。
+                                        sender_in_friend_list: message.sender_in_friend_list,
                                     }],
                                 },
                             }],
@@ -679,20 +789,56 @@ impl AppServices {
                         }
                     }
                 }
-                ChatIdentity::Unknown
-                | ChatIdentity::PublicChannel
-                | ChatIdentity::StrangerMessages => {
-                    // 这些身份从不派发业务：Unknown 是身份没认出来，PublicChannel/
-                    // StrangerMessages 不是玩家大厅。大厅里「等待身份修订」的消息
-                    // 保持未确认，等 OCR 修订到达后再走大厅分支。
+                ChatIdentity::Unknown => {
+                    // **未识别身份不等于「这条消息不存在」**。
                     //
-                    // 但必须留痕：这里是**永久 ACK**，一旦确认同一 id 不再交付。
-                    // 二级面板昵称 OCR 失败时（高亮行读不出名字 → Unknown），屏上的
-                    // `@点歌晴天` 会被这样静默吞掉，用户和日志都看不到任何证据。
+                    // 旧实现与 PublicChannel/StrangerMessages 共用一条路径，末尾调
+                    // `acknowledge_business_at`——那是**永久 ACK**：它把 id 插进
+                    // `claimed` 并删掉围栏与修订历史，此后同一 id 的任何帧都
+                    // 既不 pending 也 claim 不到，**后续帧认出真实身份也救不回来**。
                     //
-                    // 确认必须带本帧 `captured_at`：这些身份虽然「从不派发业务」，
-                    // 但同一气泡在后续帧里可能被识别出真实身份而改走大厅分支，
-                    // 那次认出会推进修订围栏。无时间的永久 ACK 会把它永久吞掉。
+                    // 二级面板昵称 OCR 失败（高亮行读不出名字）就是 Unknown，屏上的
+                    // `@点歌晴天` 会被这样静默吞掉——这正是「好友私聊进去后命令完全不
+                    // 生效」的现场，且是**不可恢复的数据丢失**。
+                    //
+                    // 改用 `acknowledge_ignored`：只忽略**本次**空/未识别修订，同一 id
+                    // 的有效修订（OCR 补出身份、括号解析出备注、高亮行改名）到达时可
+                    // 重新投递。这也与上面注释原本承诺的「等后续帧认出真实身份再走大厅
+                    // 分支」一致——旧实现只有注释，没有跟上代码。
+                    for message in snapshot.messages {
+                        if command::looks_like_command(&message.text)
+                            && self.ui.chat_timeline.note_not_executed_log(&message.id)?
+                        {
+                            log::info!(
+                                "命令未执行：{}身份未识别，本轮不派发；该气泡保留待修订，后续帧认出身份仍可派发「{}」",
+                                snapshot
+                                    .chat
+                                    .as_ref()
+                                    .map(chat_identity_label)
+                                    .unwrap_or("未识别聊天区"),
+                                compact_for_log(&message.text)
+                            );
+                        }
+                        // 传入**原始** sender/raw_sender（不是解析后的 effective 名）：
+                        // `acknowledge_ignored` 要与后续帧的
+                        // `BusinessMessageRevision::from_message` 逐字段比较，后者用的
+                        // 就是原始字段。这里若传解析结果，两边的修订永远不相等，
+                        // 「有效修订重新交付」会立刻退回永久丢失。
+                        self.ui.chat_timeline.acknowledge_ignored(
+                            &message.id,
+                            snapshot.captured_at,
+                            &message.text,
+                            message.sender.as_deref(),
+                            message.raw_sender.as_deref(),
+                        )?;
+                    }
+                }
+                ChatIdentity::PublicChannel | ChatIdentity::StrangerMessages => {
+                    // 这两种身份**不会**变成玩家大厅：公共频道与陌生人消息永远不派发
+                    // 业务，因此可以安全地永久 ACK（一旦确认同一 id 不再交付）。
+                    //
+                    // 确认仍必须带本帧 `captured_at`：围栏核验能挡住上一轮的旧快照
+                    // 抢先消费更新修订（虽然这两种身份不派发，规则统一才不会漏）。
                     for message in snapshot.messages {
                         if command::looks_like_command(&message.text)
                             && self.ui.chat_timeline.note_not_executed_log(&message.id)?

@@ -719,4 +719,45 @@ mod tests {
             "默认配置应与自定义值不同，避免测试因默认值巧合通过"
         );
     }
+    /// 变化门控 ROI 必须跟随 layout：二级消息区与一级 `chat_rect` 完全不相交，
+    /// 沿用一级区域当指纹时，二级新消息**根本不改变**该指纹，只能靠 2s 兜底扫描
+    /// （实测：一级 ROI 恒 0.000，二级 ROI 27.8/0.51）。
+    /// 这里同时钉住「其余布局仍沿用配置的一级区域」，避免二级分支顺手改坏老行为。
+    #[test]
+    fn scan_roi_follows_layout_so_secondary_messages_trigger_scans() {
+        let primary: Rect = crate::geometry::Rect::new(39, 879, 416, 143);
+        let secondary = PassiveLayout::Secondary {
+            hall: false,
+            selected: None,
+            bubbles: Vec::new(),
+            latest: None,
+        };
+        assert_eq!(
+            scan_roi_for_layout(&secondary, primary),
+            crate::observation::chat::SECONDARY_MESSAGE_SCAN_RECT,
+            "二级布局必须用二级消息区做变化指纹，否则二级新消息不触发扫描"
+        );
+        // 两个区域只在一个小角落相交（实测 x 390..455、y 879..957），
+        // 重叠面积占比很小：真正的新消息变化落在二级区域的独有部分。
+        // 钉住这个比例，防止有人把二级区域改回一级区域（重叠会变成 100%）。
+        let s = crate::observation::chat::SECONDARY_MESSAGE_SCAN_RECT;
+        let overlap_w = (primary.x + primary.width as i32)
+            .min(s.x + s.width as i32)
+            .saturating_sub(primary.x.max(s.x));
+        let overlap_h = (primary.y + primary.height as i32)
+            .min(s.y + s.height as i32)
+            .saturating_sub(primary.y.max(s.y));
+        let overlap = overlap_w as f64 * overlap_h as f64;
+        let secondary_area = s.width as f64 * s.height as f64;
+        assert!(
+            overlap / secondary_area < 0.05,
+            "二级扫描区域与一级聊天区的重叠不应超过 5%（否则换 ROI 没意义）：\
+             overlap={overlap} secondary_area={secondary_area} primary={primary:?} secondary={s:?}"
+        );
+        assert_eq!(
+            scan_roi_for_layout(&PassiveLayout::NoChat, primary),
+            primary,
+            "没有可信二级几何时沿用配置的一级区域"
+        );
+    }
 }

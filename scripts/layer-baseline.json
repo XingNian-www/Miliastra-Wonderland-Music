@@ -2096,7 +2096,7 @@
       "pub_items": 16
     },
     "src/composition/application/shared_observer.rs": {
-      "lines": 722,
+      "lines": 763,
       "pub_items": 2
     },
     "src/composition/application/shutdown.rs": {
@@ -2716,7 +2716,7 @@
       "pub_items": 11
     },
     "src/observation/chat/passive.rs": {
-      "lines": 667,
+      "lines": 664,
       "pub_items": 15
     },
     "src/observation/chat/scan.rs": {

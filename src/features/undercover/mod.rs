@@ -1171,7 +1171,10 @@ impl UndercoverGame {
                 creator: Some(lobby.creator_display().to_string()),
                 alive_count: lobby.players.len(),
                 phase_hint: Some(if lobby.players.len() < self.config.min_players {
-                    format!("还差 {} 人才能开局", self.config.min_players - lobby.players.len())
+                    format!(
+                        "还差 {} 人才能开局",
+                        self.config.min_players - lobby.players.len()
+                    )
                 } else {
                     "人数已够，可由房主开局".to_string()
                 }),

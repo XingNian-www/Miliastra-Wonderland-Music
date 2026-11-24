@@ -130,6 +130,8 @@
   --overlay: rgba(0, 0, 0, 0.5);
   --switch-thumb: #f2f1ec;
   --switch-thumb-on: #fff;
+  /* 开关选中色：macOS 系统绿，与强调蓝分工明确（蓝=选中项/主按钮，绿=开关开启） */
+  --switch-on: #30d158;
   --switch-inset: inset 0 1px 2px rgba(0, 0, 0, 0.25);
   --switch-thumb-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
 }
@@ -205,6 +207,7 @@ html[data-theme="light"] {
   /* 浅色下开关轨道已足够深，滑块改用白色并保留 1px 描边。 */
   --switch-thumb: #ffffff;
   --switch-thumb-on: #ffffff;
+  --switch-on: #28cd41;
 
   /* 浅色下控件留一圈更明显的圆角（历史值即为 8px，保持不变以免视觉回归）。 */
   --radius-s: 6px;

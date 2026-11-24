@@ -481,32 +481,36 @@ onBeforeUnmount(() => {
   color: var(--text-3);
 }
 
-/* 选中：内嵌圆角胶囊蓝底 + 白字（Finder 侧栏式），不是整行铺满。 */
-.tasks-mac-list .task-item.selected,
-.tasks-mac-list .task-item.selected + .task-item.selected {
-  background: var(--accent);
-  border-color: transparent;
-  color: var(--on-accent);
+/* 选中：内嵌圆角胶囊 + **半透明蓝底**。
+ *
+ * 不用 `--accent` 实底铺满：那是 iOS 列表选中（UITableViewCell 高亮）的观感，
+ * 整块高饱和蓝在深色面板里像一段被选中的文本，很扎眼。macOS 桌面侧栏用
+ * 半透明着色（Finder/Mail 都是），文字保持原色只提亮，视觉重量轻得多。
+ */
+.tasks-mac-list .task-item.selected {
+  background: var(--accent-soft);
+  border-color: var(--select-border);
+  color: var(--text-1);
 }
 
-.tasks-mac-list .task-item.selected .queue-title,
+.tasks-mac-list .task-item.selected .queue-title {
+  color: var(--text-1);
+  font-weight: 600;
+}
+
 .tasks-mac-list .task-item.selected .queue-meta,
 .tasks-mac-list .task-item.selected .task-status,
 .tasks-mac-list .task-item.selected .task-result {
-  color: var(--on-accent);
+  color: var(--text-2);
+  opacity: 1;
 }
 
-.tasks-mac-list .task-item.selected .queue-meta,
-.tasks-mac-list .task-item.selected .task-result,
-.tasks-mac-list .task-item.selected .task-status {
-  opacity: 0.82;
-}
-
+/* 选中行里的操作按钮保持中性，不跟着底色变白（否则对比度反转太跳）。 */
 .tasks-mac-list .task-item.selected .btn.ghost {
-  color: var(--on-accent);
-  border-color: var(--on-accent);
+  color: var(--text-2);
+  border-color: var(--sep-1);
   background: transparent;
-  opacity: 0.9;
+  opacity: 1;
 }
 
 /* ---------- 任务详情：标签小、数值大 ---------- */

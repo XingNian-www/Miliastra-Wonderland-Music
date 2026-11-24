@@ -110,6 +110,10 @@ panel-mock:
 panel-visual:
 	bash scripts/panel-visual-check.sh --rebuild
 
+# 浅色主题单独截：panel-visual 只截默认（暗色）。浅色回归靠暗色图看不出来。
+panel-visual-light:
+	scripts/panel-fake-data/shot-theme.py target/panel-visual/web-mock config light target/panel-visual/light-config.png
+
 privacy:
 	@if [ -z "$${MILIASTRA_PANEL_URL:-}" ]; then \
 	  echo "privacy（optional）：未配置 MILIASTRA_PANEL_URL，无法取身份映射，跳过扫描"; \

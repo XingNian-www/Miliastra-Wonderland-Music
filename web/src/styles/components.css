@@ -689,8 +689,10 @@ input[type=checkbox]:hover {
 }
 
 input[type=checkbox]:checked {
-  background: var(--accent);
-  border-color: var(--accent);
+  /* macOS 的开关选中是**系统绿**（#30d158），不是强调蓝——这是它和 iOS 一致、
+   * 与「选中行/选中项用蓝」刻意区分的两套语义。用专令牌避免被主题改色影响。 */
+  background: var(--switch-on);
+  border-color: var(--switch-on);
 }
 
 input[type=checkbox]:checked::after {

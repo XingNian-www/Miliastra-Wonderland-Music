@@ -3998,3 +3998,950 @@ input[type="checkbox"]:checked::after {
     display: none;
   }
 }
+
+/* ============================================================================
+ * 表单 / 配置类页面 · macOS 风格层（form-mac-*）
+ *
+ * 作用范围**只有**五个页面的根类 `.form-mac-page`：
+ *   ConfigPage / AiConfigPage / SettingsPage / EntertainmentPage / GamePage
+ * 以及它们用到的 FieldControl / FieldError / AiModelPicker。
+ *
+ * 约定：
+ *   1. 这一层只**新增**规则。上面既有的通用 `.btn` / `.panel` / `.tab` / `input`
+ *      规则一行都不改（另一路在改它们）；所有覆盖都靠 `.form-mac-page` 前缀把
+ *      特异性抬到既有规则之上，因此不改别人、也不会被别页误伤。
+ *   2. 不写颜色字面量：颜色全部来自 tokens.css。只有 `rgba(0,0,0,…)` 的通用
+ *      阴影令牌用在 box-shadow 上（tokens.css 顶部已明确允许这种用法）。
+ *   3. 明暗两套都要能用：唯一一处主题分支是分段控件"选中块"取哪个令牌（见下方
+ *      注释），因为 `--bg-3` 与 `--panel-bg` 的相对明暗在明暗两套主题里是反的。
+ * ========================================================================== */
+
+.form-mac-page {
+  /* 字段行：标签列宽、组间距、控件最大宽度 */
+  --form-mac-label-col: 196px;
+  --form-mac-group-gap: 20px;
+  --form-mac-control-max: 420px;
+
+  /* 分段控件轨道：--fill-1 在暗色下是白色 8% 叠在页面上（≈#2e2e2e）、浅色下是
+     黑色 5% 叠在页面上（≈#e9e9eb），两套主题里都比页面底色更"实"，轨道边界
+     始终可见，又不会像 --fill-2 那样重到抢走内容注意力。 */
+  --form-mac-seg-track: var(--fill-1);
+  /* 选中块必须"比轨道更亮/更浮起"。--bg-3 在暗色下比轨道亮，--panel-bg 在
+     浅色下是纯白；两者相对明暗在明暗两套主题里刚好相反，所以只在选中块上做
+     一次主题映射。取值仍然全是 tokens.css 里的令牌，没有新增颜色字面量。 */
+  --form-mac-seg-thumb: var(--bg-3);
+  --form-mac-seg-thumb-border: var(--sep-2);
+}
+
+html[data-theme="light"] .form-mac-page {
+  --form-mac-seg-thumb: var(--panel-bg);
+  --form-mac-seg-thumb-border: var(--sep-1);
+}
+
+/* ---------- 1. 分段控件（Segmented Control） ---------------------------------
+ * macOS 最标志性的控件：一个圆角灰底容器，选中项是一块浮起的白/浅色圆角块，
+ * 不是一个一个独立按钮。这里复用页面里已有的 .tabs / .tab 结构（只加类、不动
+ * 绑定），把外观换成轨道 + 浮块。
+ * -------------------------------------------------------------------------- */
+
+.form-mac-page .tabs.form-mac-seg {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  width: max-content;
+  max-width: 100%;
+  margin: 0 0 var(--sp-4);
+  padding: 3px;
+  border: 1px solid var(--sep-1);
+  border-radius: 9px;
+  background: var(--form-mac-seg-track);
+  box-shadow: var(--switch-inset);
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.form-mac-page .tabs.form-mac-seg::-webkit-scrollbar {
+  height: 0;
+}
+
+.form-mac-page .form-mac-seg .tab {
+  height: 28px;
+  padding: 0 14px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: var(--fs-item);
+  font-weight: 500;
+  white-space: nowrap;
+  /* 不做过渡：macOS 的分段块是瞬间跟手的，而且过渡会让"选中态"在首帧截图
+   * （以及切页刚挂载时）停在插值中间，看起来像没选中。选中与未选中只差
+   * 底色/描边/字重，硬切换反而更像原生控件。 */
+  transition: none;
+}
+
+.form-mac-page .form-mac-seg .tab:hover {
+  background: var(--fill-1);
+  color: var(--text-1);
+}
+
+.form-mac-page .form-mac-seg .tab.active,
+.form-mac-page .form-mac-seg .tab.primary {
+  background: var(--form-mac-seg-thumb);
+  border-color: var(--form-mac-seg-thumb-border);
+  color: var(--text-1);
+  font-weight: 600;
+  box-shadow: var(--shadow-1);
+}
+
+.form-mac-page .form-mac-seg .tab.active:hover {
+  background: var(--form-mac-seg-thumb);
+  color: var(--text-1);
+}
+
+.form-mac-page .form-mac-seg .tab:disabled {
+  opacity: .42;
+  cursor: not-allowed;
+}
+
+.form-mac-page .form-mac-seg .tab:disabled:hover {
+  background: transparent;
+  color: var(--text-2);
+}
+
+/* 二级分段（AI 配置的「AI 服务商 / AI 聊天 / TTS」）：更矮一档，
+ * 与一级分段形成层级，而不是两条一样重的胶囊条。 */
+.form-mac-page .tabs.form-mac-seg-compact {
+  margin-bottom: var(--sp-3);
+  padding: 2px;
+  border-radius: 8px;
+  box-shadow: none;
+}
+
+.form-mac-page .form-mac-seg-compact .tab {
+  height: 24px;
+  padding: 0 12px;
+  border-radius: 6px;
+  font-size: var(--fs-meta);
+}
+
+.form-mac-page .form-mac-seg .dirty-dot,
+.form-mac-page .form-mac-seg .tab-meta {
+  vertical-align: middle;
+}
+
+/* ---------- 2. 分组表单容器（Grouped inset） -------------------------------- */
+
+.form-mac-page .config-group-card {
+  margin: 0;
+  padding: 0;
+  background: var(--fill-1);
+  border: 1px solid var(--sep-2);
+  border-radius: var(--radius-m);
+  box-shadow: none;
+  overflow: hidden;
+}
+
+/* 组间留 20px（macOS grouped 表单的组间距），组内字段行只留 1px 分隔线。 */
+.form-mac-page .config-form > .config-group-card + .config-group-card {
+  margin-top: var(--form-mac-group-gap);
+}
+
+.form-mac-page .config-group-head {
+  position: static;
+  padding: 9px 14px 7px;
+  background: transparent;
+  border-bottom: 1px solid var(--sep-2);
+  color: var(--text-2);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-meta);
+  font-weight: 600;
+  letter-spacing: .01em;
+}
+
+/* ---------- 3. 字段行：标签左、控件右、hint 在控件下方 ----------------------
+ * 复用既有 `#configForm .config-group-card .config-field` 的 grid 结构，只调整
+ * 列宽/间距/控件宽度上限，让控件不再横跨整行（macOS 设置面板的观感）。
+ * 前缀 `.form-mac-page` 让特异性与既有 `#configForm …` 规则持平、靠后生效。
+ * -------------------------------------------------------------------------- */
+
+.form-mac-page #configForm .config-field {
+  grid-template-columns: var(--form-mac-label-col) minmax(0, 1fr) auto;
+  padding: 9px 14px;
+  column-gap: var(--sp-3);
+  row-gap: 2px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  /* 保持既有基线：label / control / side 三列与整块控件居中对齐。
+   * 这里显式写回 center，是为了让"标签列宽一变就错位"这类回归能被
+   * scripts/panel-layout-audit.py 的 fieldMisalign（三列中心差 > 6px 即报）
+   * 继续守住；改成 start 会让多行控件那几行被该检查判为错位。 */
+  align-items: center;
+}
+
+.form-mac-page #configForm .config-field + .config-field {
+  border-top: 1px solid var(--sep-2);
+}
+
+.form-mac-page #configForm .config-field.err {
+  box-shadow: inset 3px 0 0 var(--danger);
+}
+
+.form-mac-page #configForm .config-field-label {
+  align-self: center;
+}
+
+.form-mac-page #configForm .config-field-label b {
+  font-size: var(--fs-item);
+  line-height: var(--lh-item);
+  font-weight: 500;
+  color: var(--text-1);
+}
+
+.form-mac-page #configForm .config-field-label code {
+  font-size: 10px;
+  line-height: 13px;
+  color: var(--text-3);
+}
+
+.form-mac-page #configForm .config-field-control {
+  width: 100%;
+  max-width: 100%;
+  justify-content: flex-start;
+  align-items: center;
+}
+
+/* 控件宽度上限：不再横跨整行。类型不同上限不同（数字/枚举窄、路径中等、
+ * 文本域宽一些），与 macOS「控件靠右、宽度有上限」的做法一致。
+ *
+ * 注意 `data-kind` 的取值口径在两个页面里不一样，选择器必须**两套都写**：
+ *   - ConfigPage 走 `kindClass()`（util/configSchema.js）：string/path → "path"、
+ *     int/float → "number"、modelName → "string"；
+ *   - AiConfigPage 直接写 `kindOf()`：string/path/modelName 各自成值。
+ * 只写其中一套的话，另一页的输入框仍然会横跨整行（实测过：AI 页 ai.endpoint
+ * 宽度 739px，因为它的 data-kind 是 "string" 而不是 "path"）。
+ *
+ * 另外**不能**用 `>` 直接选 control 的直系子元素：secret / array / rect 的控件被
+ * 包在 `.config-string-row` / `.config-array` / `.config-num-row` 里，直系选择器
+ * 选不到它们，那几类字段会保持满宽。这里改成「control 内的输入控件」并要求
+ * 它前面没有别的输入控件（`:first-of-type`），行内的第二列（如 secret 的
+ * 清除按钮、模型下拉）不受影响。 */
+.form-mac-page #configForm .config-field-control input[type="text"],
+.form-mac-page #configForm .config-field-control input[type="password"],
+.form-mac-page #configForm .config-field-control input[type="number"],
+.form-mac-page #configForm .config-field-control select,
+.form-mac-page #configForm .config-field-control textarea {
+  width: 100%;
+  max-width: var(--form-mac-control-max);
+}
+
+.form-mac-page #configForm .config-field-control .config-string-row > input,
+.form-mac-page #configForm .config-field-control .config-array input[type="text"]:not([type="password"]) {
+  max-width: var(--form-mac-control-max);
+}
+
+.form-mac-page #configForm .config-field[data-kind="number"] .config-field-control input[type="number"] {
+  max-width: 132px;
+}
+
+.form-mac-page #configForm .config-field[data-kind="enum"] .config-field-control select {
+  max-width: 260px;
+}
+
+.form-mac-page #configForm .config-field[data-kind="secret"] .config-field-control input[type="password"] {
+  max-width: 320px;
+}
+
+.form-mac-page #configForm .config-field[data-kind="string"] .config-field-control input[type="text"] {
+  max-width: 400px;
+}
+
+.form-mac-page #configForm .config-field[data-kind="path"] .config-field-control input[type="text"] {
+  max-width: 400px;
+}
+
+.form-mac-page #configForm .config-field[data-kind="text"] .config-field-control textarea {
+  max-width: 520px;
+  min-height: 72px;
+}
+
+.form-mac-page #configForm .config-field[data-kind="object"] .config-field-control textarea {
+  max-width: 520px;
+}
+
+.form-mac-page #configForm .config-field[data-kind="rect"] .config-num-row,
+.form-mac-page #configForm .config-field[data-kind="point"] .config-num-row {
+  width: 100%;
+  max-width: 360px;
+}
+
+.form-mac-page #configForm .config-field[data-kind="array"] .config-array {
+  width: 100%;
+  max-width: 520px;
+}
+
+/* 模型选择行（输入框 + 下拉 + 按钮）在 macOS 字段行里不该撑满整行：
+ * 让这一行只占控件上限宽度，而不是把「获取模型列表」顶到最右边。 */
+.form-mac-page #configForm .config-field-control .model-picker {
+  width: 100%;
+  max-width: 560px;
+  flex-wrap: nowrap;
+}
+
+.form-mac-page #configForm .config-field-control .model-picker input {
+  flex: 1 1 auto;
+  /* 不让它在窄列里被压成"gpt-"那种残条：低于 180px 就换行，而不是继续缩。 */
+  min-width: 180px;
+  max-width: none;
+}
+
+.form-mac-page #configForm .config-field-control .model-picker select {
+  flex: 0 0 auto;
+  width: auto;
+  min-width: 140px;
+  max-width: 180px;
+}
+
+@media (max-width: 1250px) {
+  .form-mac-page #configForm .config-field-control .model-picker {
+    flex-wrap: wrap;
+    max-width: 100%;
+  }
+
+  .form-mac-page #configForm .config-field-control .model-picker input {
+    min-width: 160px;
+  }
+
+  .form-mac-page #configForm .config-field-control .model-picker select {
+    max-width: none;
+  }
+}
+
+/* 布尔字段：开关落在控件列（右侧、垂直居中），与其它字段同一竖线。 */
+.form-mac-page #configForm .config-field[data-kind="bool"] .config-field-control {
+  justify-content: flex-start;
+}
+
+.form-mac-page #configForm .config-field[data-kind="bool"] .config-field-side {
+  order: 0;
+  justify-content: flex-end;
+}
+
+.form-mac-page #configForm .config-field[data-kind="bool"] .config-field-side .config-effect {
+  margin-right: 0;
+}
+
+/* hint / 默认值：跟在控件下方，与控件左边缘对齐。 */
+.form-mac-page #configForm .config-field-foot {
+  padding-left: calc(var(--form-mac-label-col) + var(--sp-3));
+  gap: 2px var(--sp-3);
+  align-items: baseline;
+}
+
+.form-mac-page #configForm .config-field-foot .config-field-hint {
+  color: var(--text-3);
+  font-size: var(--fs-tiny);
+  line-height: 1.5;
+}
+
+.form-mac-page #configForm .config-field-foot .config-field-default {
+  color: var(--text-3);
+  font-size: var(--fs-tiny);
+  line-height: var(--lh-tiny);
+}
+
+/* 生效方式徽标：macOS 用低饱和的小徽标，不抢字段名的注意力。 */
+.form-mac-page .config-effect {
+  padding: 1px 7px;
+  font-size: 10.5px;
+  line-height: 16px;
+  border-radius: 999px;
+  letter-spacing: .01em;
+}
+
+.form-mac-page #configForm .config-field-side {
+  gap: var(--sp-2);
+  padding-left: var(--sp-2);
+}
+
+/* ---------- 4. 输入控件：浅填充、无边框、focus 蓝 ring ---------------------- */
+
+.form-mac-page input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+.form-mac-page select,
+.form-mac-page textarea {
+  background: var(--fill-1);
+  border: 1px solid transparent;
+  border-radius: var(--radius-s);
+  box-shadow: none;
+}
+
+.form-mac-page input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):hover,
+.form-mac-page select:hover,
+.form-mac-page textarea:hover {
+  border-color: var(--sep-1);
+}
+
+.form-mac-page input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):focus,
+.form-mac-page select:focus,
+.form-mac-page textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+  outline: none;
+}
+
+.form-mac-page input:disabled,
+.form-mac-page select:disabled,
+.form-mac-page textarea:disabled {
+  opacity: .55;
+  cursor: not-allowed;
+}
+
+/* 开关：macOS 是绿色，不是蓝色。 */
+.form-mac-page input[type="checkbox"]:checked {
+  background: var(--ok);
+  border-color: var(--ok);
+  box-shadow: none;
+}
+
+.form-mac-page input[type="checkbox"]:hover {
+  border-color: var(--sep-1);
+}
+
+.form-mac-page input[type="checkbox"]:checked:hover {
+  border-color: var(--ok);
+}
+
+.form-mac-page .switch-line {
+  color: var(--text-2);
+  font-size: var(--fs-meta);
+  gap: var(--sp-2);
+}
+
+/* ---------- 5. 保存条：毛玻璃 + 右侧主按钮 --------------------------------- */
+
+.form-mac-page .config-savebar {
+  position: sticky;
+  bottom: var(--sp-3);
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-top: var(--form-mac-group-gap);
+  padding: 8px 12px;
+  border: 1px solid var(--sep-1);
+  border-radius: var(--radius-m);
+  background: var(--savebar-bg);
+  backdrop-filter: blur(20px) saturate(1.6);
+  -webkit-backdrop-filter: blur(20px) saturate(1.6);
+  box-shadow: var(--shadow-savebar);
+}
+
+.form-mac-page .config-savebar-hint {
+  margin-right: auto;
+  color: var(--text-2);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-meta);
+}
+
+.form-mac-page .config-savebar .btn.primary {
+  min-width: 96px;
+}
+
+/* ---------- 6. 状态条 / 工具栏 / 段标题 ------------------------------------ */
+
+.form-mac-page .config-status,
+.form-mac-page .form-mac-statusbar {
+  gap: var(--sp-2) var(--sp-3);
+  padding: 8px 12px;
+  margin-bottom: var(--sp-3);
+  background: var(--fill-1);
+  border: 1px solid var(--sep-2);
+  border-radius: var(--radius-m);
+}
+
+.form-mac-page .config-status .chip {
+  padding: 0;
+  background: transparent;
+  border: 0;
+}
+
+.form-mac-page .config-status .chip:last-of-type {
+  border-right: 0;
+}
+
+.form-mac-page .config-toolbar {
+  gap: var(--sp-2);
+  padding: var(--sp-2) 0;
+  border-bottom: 1px solid var(--sep-2);
+  background: var(--savebar-bg);
+  backdrop-filter: blur(20px) saturate(1.6);
+  -webkit-backdrop-filter: blur(20px) saturate(1.6);
+}
+
+.form-mac-page .config-section-head {
+  padding: 0 2px;
+  margin-bottom: var(--sp-3);
+}
+
+.form-mac-page .config-section-head h2 {
+  font-size: var(--fs-h1);
+  line-height: var(--lh-h1);
+  font-weight: 600;
+  letter-spacing: -.01em;
+}
+
+.form-mac-page .config-section-head code {
+  color: var(--text-3);
+}
+
+.form-mac-page #configForm .config-section-head {
+  border-bottom: 1px solid var(--sep-2);
+  padding-bottom: 10px;
+}
+
+/* ---------- 7. ConfigPage：左侧分组导航 ------------------------------------ */
+
+#page-config .config-sidebar {
+  padding: 10px;
+  background: var(--fill-1);
+  border: 1px solid var(--sep-2);
+  border-radius: var(--radius-m);
+  top: calc(var(--topbar-h, 76px) + 8px);
+}
+
+#page-config .config-sidebar > input[type="text"] {
+  width: 100%;
+  margin-bottom: var(--sp-2);
+}
+
+#page-config .config-domain {
+  border-bottom: 0;
+}
+
+#page-config .config-domain-head {
+  padding: 8px 8px 4px;
+  color: var(--text-3);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: .08em;
+  border-radius: var(--radius-s);
+}
+
+#page-config .config-section-item {
+  min-height: 28px;
+  padding: 5px 8px;
+  border-radius: 7px;
+  font-size: var(--fs-item);
+}
+
+#page-config .config-section-item:hover {
+  background: var(--fill-1);
+}
+
+#page-config .config-section-item.active {
+  background: var(--accent-soft);
+  color: var(--text-1);
+  font-weight: 600;
+}
+
+#page-config .config-section-item.active .section-name {
+  color: var(--accent);
+}
+
+#page-config .config-domain-body {
+  padding-left: 0;
+}
+
+#page-config .emoji-catalog {
+  margin-top: var(--form-mac-group-gap);
+  padding: var(--sp-3);
+  background: var(--fill-1);
+  border: 1px solid var(--sep-2);
+  border-radius: var(--radius-m);
+}
+
+/* 窄屏：左栏退化成一条可横向滑动的分段条（macOS 的分段条横向滚动的做法），
+ * 同时把 `config-layout` 真正压成一列 —— components.css 里的
+ * `grid-template-columns: 236px minmax(0,1fr)` 写在 base.css 的 1050px 媒体
+ * 查询之后，1024 宽度下会把 236px 的侧栏留在原地、内容被挤扁。 */
+@media (max-width: 1050px) {
+  .form-mac-page .config-layout {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--sp-3);
+  }
+
+  #page-config .config-sidebar {
+    position: static;
+    top: auto;
+    max-height: none;
+    flex-direction: row;
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: var(--sp-2);
+    padding: 8px;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+
+  #page-config .config-sidebar > input[type="text"] {
+    flex: 0 0 150px;
+    width: 150px;
+    margin-bottom: 0;
+  }
+
+  #page-config .config-domain {
+    display: contents;
+  }
+
+  #page-config .config-domain-head {
+    display: none;
+  }
+
+  #page-config .config-domain-body {
+    display: flex !important;
+    flex-direction: row;
+    gap: var(--sp-2);
+    padding: 0;
+  }
+
+  #page-config .config-section-item {
+    width: auto;
+    flex: 0 0 auto;
+    padding: 5px 10px;
+    white-space: nowrap;
+    background: var(--fill-1);
+    border: 1px solid transparent;
+  }
+
+  #page-config .config-section-item.active {
+    border-color: var(--select-border);
+  }
+
+  #page-config .config-section-item .section-name {
+    display: none;
+  }
+}
+
+@media (max-width: 1200px) {
+  .form-mac-page {
+    --form-mac-label-col: 160px;
+  }
+}
+
+@media (max-width: 900px) {
+  .form-mac-page {
+    --form-mac-label-col: 140px;
+  }
+
+  .form-mac-page #configForm .config-field {
+    grid-template-columns: var(--form-mac-label-col) minmax(0, 1fr) auto;
+  }
+}
+
+@media (max-width: 720px) {
+  .form-mac-page #configForm .config-field {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas: "label" "control" "side" "foot";
+    row-gap: 6px;
+    padding: 10px 12px;
+  }
+
+  .form-mac-page #configForm .config-field-foot {
+    padding-left: 0;
+  }
+
+  .form-mac-page #configForm .config-field-side {
+    justify-content: flex-start;
+    padding-left: 0;
+  }
+
+  .form-mac-page #configForm .config-field-control > input[type="text"],
+  .form-mac-page #configForm .config-field-control > input[type="password"],
+  .form-mac-page #configForm .config-field-control > input[type="number"],
+  .form-mac-page #configForm .config-field-control > select,
+  .form-mac-page #configForm .config-field-control > textarea {
+    max-width: 100%;
+  }
+
+  .form-mac-page .config-savebar {
+    position: static;
+    flex-wrap: wrap;
+    padding: 10px 12px;
+  }
+
+  .form-mac-page .config-savebar-hint {
+    flex: 1 1 100%;
+    margin-right: 0;
+  }
+
+  .form-mac-page .config-savebar .btn {
+    flex: 1 1 auto;
+  }
+}
+
+/* ---------- 8. 页面卡片（设置 / 娱乐 / 游戏）：grouped 容器 ---------------- */
+
+.form-mac-page .panel {
+  padding: 0;
+  background: var(--panel-bg);
+  border: 1px solid var(--sep-2);
+  border-radius: var(--radius-m);
+  box-shadow: none;
+}
+
+.form-mac-page .panel-head {
+  height: 42px;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--sep-2);
+}
+
+.form-mac-page .panel-head h2 {
+  font-size: var(--fs-title);
+  font-weight: 600;
+}
+
+.form-mac-page .panel-head small {
+  color: var(--text-3);
+  font-size: var(--fs-meta);
+}
+
+.form-mac-page .panel-body {
+  padding: 12px 14px;
+}
+
+/* 状态卡里的度量网格：一块浅填充的内嵌容器，而不是六条硬分隔线。 */
+.form-mac-page .turtle-stats {
+  gap: var(--sp-2) var(--sp-4);
+  margin-top: var(--sp-2);
+  padding: 10px 12px;
+  background: var(--fill-1);
+  border: 1px solid var(--sep-2);
+  border-radius: var(--radius-m);
+}
+
+.form-mac-page .turtle-stat {
+  border-top: 0;
+  padding-top: 0;
+  min-width: 0;
+}
+
+.form-mac-page .turtle-stat span {
+  color: var(--text-3);
+  font-size: var(--fs-tiny);
+  line-height: var(--lh-tiny);
+}
+
+.form-mac-page .turtle-stat strong {
+  margin-top: 2px;
+  font-size: var(--fs-item);
+  font-weight: 600;
+  color: var(--text-1);
+  font-variant-numeric: tabular-nums;
+}
+
+.form-mac-page .turtle-submit {
+  padding: var(--sp-3);
+  background: var(--fill-1);
+  border: 1px solid var(--sep-2);
+  border-radius: var(--radius-m);
+}
+
+.form-mac-page .result,
+.form-mac-page .scroll {
+  background: var(--fill-1);
+  border: 1px solid var(--sep-2);
+  border-radius: var(--radius-m);
+}
+
+.form-mac-page .history-item,
+.form-mac-page .undercover-player,
+.form-mac-page .queue-item,
+.form-mac-page .candidate-item,
+.form-mac-page .task-item {
+  background: var(--fill-1);
+  border: 1px solid var(--sep-2);
+  border-radius: var(--radius-m);
+}
+
+.form-mac-page .history-item {
+  border-left: 3px solid var(--ok);
+}
+
+.form-mac-page .history-item.err {
+  border-left-color: var(--danger);
+}
+
+.form-mac-page .undercover-player,
+.form-mac-page .queue-item,
+.form-mac-page .candidate-item,
+.form-mac-page .task-item {
+  border-left: 1px solid var(--sep-2);
+}
+
+.form-mac-page .undercover-player:hover,
+.form-mac-page .queue-item:hover,
+.form-mac-page .candidate-item:hover,
+.form-mac-page .task-item:hover,
+.form-mac-page .history-item:hover {
+  background: var(--fill-2);
+}
+
+.form-mac-page .screenshot-modal-body {
+  border-radius: var(--radius-l);
+}
+
+/* ---------- 9. SettingsPage：设置面板范式 ---------------------------------- */
+
+.form-mac-settings {
+  max-width: 920px;
+}
+
+.form-mac-group {
+  background: var(--panel-bg);
+  border: 1px solid var(--sep-2);
+  border-radius: var(--radius-m);
+  overflow: hidden;
+}
+
+.form-mac-group + .form-mac-group {
+  margin-top: var(--form-mac-group-gap);
+}
+
+.form-mac-group-head {
+  padding: 9px 14px 7px;
+  border-bottom: 1px solid var(--sep-2);
+  color: var(--text-2);
+  font-size: var(--fs-meta);
+  font-weight: 600;
+}
+
+.form-mac-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 320px);
+  gap: var(--sp-2) var(--sp-4);
+  align-items: center;
+  padding: 10px 14px;
+}
+
+.form-mac-row + .form-mac-row {
+  border-top: 1px solid var(--sep-2);
+}
+
+/* 开关行整行是 <label>：cursor 与 hover 反馈跟着行给，用户才知道整行可点。 */
+label.form-mac-row {
+  cursor: pointer;
+}
+
+label.form-mac-row:hover {
+  background: var(--fill-1);
+}
+
+.form-mac-row-label {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.form-mac-row-label b {
+  color: var(--text-1);
+  font-size: var(--fs-item);
+  line-height: var(--lh-item);
+  font-weight: 500;
+}
+
+.form-mac-row-label span {
+  color: var(--text-3);
+  font-size: var(--fs-tiny);
+  line-height: 1.5;
+}
+
+.form-mac-row-control {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.form-mac-row-control > input:not([type="checkbox"]),
+.form-mac-row-control > select {
+  width: 100%;
+  max-width: 320px;
+}
+
+.form-mac-row-control .btn {
+  flex: 0 0 auto;
+}
+
+.form-mac-row-hint {
+  grid-column: 1 / -1;
+  color: var(--text-3);
+  font-size: var(--fs-tiny);
+  line-height: 1.5;
+  margin: 0;
+}
+
+@media (max-width: 720px) {
+  .form-mac-row {
+    grid-template-columns: minmax(0, 1fr);
+    align-items: start;
+  }
+
+  .form-mac-row-control {
+    justify-content: flex-start;
+  }
+
+  .form-mac-row-control > input:not([type="checkbox"]),
+  .form-mac-row-control > select {
+    max-width: 100%;
+  }
+}
+
+/* ---------- 10. 游戏页：操作分组 ------------------------------------------ */
+
+.form-mac-page .game-page .panel-body > .row,
+.form-mac-page .panel-body > .row {
+  gap: var(--sp-2);
+}
+
+.form-mac-page .config-input::placeholder {
+  color: var(--text-3);
+}
+
+/* ---------- 11. FieldControl / AiModelPicker 配合 ------------------------- */
+
+.form-mac-page .model-picker {
+  gap: var(--sp-2);
+  align-items: center;
+}
+
+.form-mac-page .model-picker input {
+  min-width: 160px;
+  max-width: var(--form-mac-control-max);
+}
+
+.form-mac-page .model-picker .btn {
+  flex: 0 0 auto;
+}
+
+.form-mac-page .config-prompt-text {
+  min-height: 96px;
+  font-family: var(--font-sans);
+  font-size: var(--fs-item);
+  line-height: 1.5;
+}
+
+.form-mac-page .config-field-error {
+  color: var(--danger);
+  font-size: var(--fs-tiny);
+  line-height: 1.5;
+}
+
+.form-mac-page .config-num-row label {
+  color: var(--text-3);
+  font-size: var(--fs-tiny);
+}

@@ -1,9 +1,9 @@
 <template>
-  <div class="entertainment-page">
+  <div class="entertainment-page form-mac-page">
     <h1 class="page-title">娱乐玩法</h1>
     <p class="page-subtitle">海龟汤、谁是卧底对局管理，以及数字炸弹/成语接龙/塔罗/卡牌玩法动态</p>
 
-    <div class="tabs" role="tablist" aria-label="娱乐玩法">
+    <div class="tabs form-mac-seg" role="tablist" aria-label="娱乐玩法">
       <button class="tab" :class="{ active: tab === 'turtle' }" type="button" @click="tab = 'turtle'">
         海龟汤
         <span class="tab-meta">{{ turtleMeta }}</span>

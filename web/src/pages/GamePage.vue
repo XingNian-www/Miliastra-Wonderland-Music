@@ -1,5 +1,5 @@
 <template>
-  <div class="game-page">
+  <div class="game-page form-mac-page">
     <h1 class="page-title">游戏与聊天</h1>
     <p class="page-subtitle">值守状态、最近聊天与手动操作；命令可直接以 @ 形式发送到游戏聊天</p>
 
@@ -27,7 +27,7 @@
           <small>{{ listener.pendingMode ? `等待切换到 ${displayMode(listener.pendingMode)}` : '即时生效' }}</small>
         </div>
         <div class="panel-body">
-          <div class="tabs" role="tablist" aria-label="聊天值守模式">
+          <div class="tabs form-mac-seg" role="tablist" aria-label="聊天值守模式">
             <button class="tab" :class="{ active: modeIsPrimary }" type="button" :disabled="busy" @click="setListener('primary')">一级</button>
             <button class="tab" :class="{ active: modeIsSecondary }" type="button" :disabled="busy" @click="setListener('secondary')">二级</button>
           </div>

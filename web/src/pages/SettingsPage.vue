@@ -1,32 +1,55 @@
 <template>
-  <h1 class="page-title">设置</h1>
-  <p class="page-subtitle">访问令牌与页面偏好</p>
-  <div class="page-grid">
-    <div class="panel">
-      <div class="panel-head"><h2>访问令牌</h2><small>面板所有请求都带 X-Miliastra-Token</small></div>
-      <div class="panel-body">
-        <label class="config-field-label">Token</label>
-        <input v-model="tokenDraft" class="config-input" type="password" placeholder="填入面板访问令牌" />
-        <p class="config-field-hint">保存在本机浏览器 cookie；换浏览器或清除 cookie 后需要重新填。</p>
-        <div style="display:flex;gap:8px;margin-top:8px">
+  <div class="form-mac-page form-mac-settings">
+    <h1 class="page-title">设置</h1>
+    <p class="page-subtitle">访问令牌与页面偏好</p>
+
+    <div class="form-mac-group">
+      <div class="form-mac-group-head">访问令牌</div>
+      <div class="form-mac-row">
+        <label class="form-mac-row-label" for="formMacToken">
+          <b>Token</b>
+          <span>面板所有请求都带 X-Miliastra-Token</span>
+        </label>
+        <div class="form-mac-row-control">
+          <input id="formMacToken" v-model="tokenDraft" class="config-input" type="password" placeholder="填入面板访问令牌" />
+        </div>
+        <p class="form-mac-row-hint">保存在本机浏览器 cookie；换浏览器或清除 cookie 后需要重新填。</p>
+      </div>
+      <div class="form-mac-row">
+        <div class="form-mac-row-label">
+          <b>令牌操作</b>
+          <span v-if="tokenMessage">{{ tokenMessage }}</span>
+          <span v-else>保存后会立即用一个受保护接口验证令牌是否有效</span>
+        </div>
+        <div class="form-mac-row-control">
           <button class="btn primary" @click="saveToken">保存并测试</button>
           <button class="btn ghost" @click="clear">清除</button>
-          <span v-if="tokenMessage" class="config-field-hint">{{ tokenMessage }}</span>
         </div>
       </div>
     </div>
-    <div class="panel">
-      <div class="panel-head"><h2>页面偏好</h2></div>
-      <div class="panel-body">
-        <label style="display:flex;align-items:center;gap:8px">
+
+    <div class="form-mac-group">
+      <div class="form-mac-group-head">页面偏好</div>
+      <!-- 开关行整行可点：用 <label> 包住「文字 + 开关」，与改造前的
+           点击命中面积一致（只是外观从"行内复选框"换成 macOS 的开关行）。 -->
+      <label class="form-mac-row">
+        <span class="form-mac-row-label">
+          <b>自动刷新状态</b>
+          <span>每 15 秒拉取一次监控状态</span>
+        </span>
+        <span class="form-mac-row-control">
           <input v-model="state.autoRefresh" type="checkbox" />
-          <span>自动刷新状态（15 秒）</span>
-        </label>
-        <label style="display:flex;align-items:center;gap:8px;margin-top:8px">
+        </span>
+      </label>
+      <label class="form-mac-row">
+        <span class="form-mac-row-label">
+          <b>日间模式</b>
+          <span>在浅色与暗色主题之间切换</span>
+        </span>
+        <span class="form-mac-row-control">
           <input v-model="light" type="checkbox" @change="applyTheme" />
-          <span>日间模式</span>
-        </label>
-      </div>
+        </span>
+      </label>
     </div>
   </div>
 </template>

@@ -1,9 +1,9 @@
 <template>
-  <div class="ai-config-page">
+  <div class="ai-config-page form-mac-page">
     <h1 class="page-title">AI 配置</h1>
     <p class="page-subtitle">AI 服务商、AI 聊天、识图与语音 TTS；配置页只提交改动过的段</p>
 
-    <div class="tabs ai-main-tabs" role="tablist" aria-label="AI 配置">
+    <div class="tabs ai-main-tabs form-mac-seg" role="tablist" aria-label="AI 配置">
       <button
         v-for="item in mainTabs"
         :key="item.key"
@@ -17,7 +17,7 @@
     </div>
 
     <div v-if="tab === 'config'" class="ai-config-body">
-      <div class="tabs ai-section-tabs" role="tablist" aria-label="配置分组">
+      <div class="tabs ai-section-tabs form-mac-seg form-mac-seg-compact" role="tablist" aria-label="配置分组">
         <button
           v-for="item in sectionTabs"
           :key="item.name"

@@ -1285,6 +1285,55 @@ input[type=range]::-moz-range-track {
   word-break: break-word;
 }
 
+/* 酷狗手机号验证码登录区块：与卡片内其它控件保持同一套 macOS 观感。
+   用 flex + min-width:0 保证 1024 小屏下输入框不会被按钮挤出容器。 */
+.kugou-phone-login {
+  margin-top: var(--sp-3);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--sep-1);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.kugou-phone-login-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--sp-2);
+}
+
+.kugou-phone-login-head small {
+  color: var(--text-3);
+  font-size: var(--fs-meta);
+}
+
+.kugou-phone-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+}
+
+.kugou-phone-row > label {
+  flex: 0 0 auto;
+  width: 4.5em;
+  color: var(--text-3);
+  font-size: var(--fs-meta);
+}
+
+.kugou-phone-row > .config-input {
+  flex: 1 1 auto;
+  /* 基础规则给了 width:100%，在 flex 行里必须让位，否则会把按钮挤出容器。 */
+  width: auto;
+  min-width: 0;
+}
+
+.kugou-phone-row > .btn {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
 /* 「需要重新登录」提示：是提醒而非报错，所以用告警色描边而不是错误红。 */
 .login-reauth-note {
   margin-top: var(--sp-2);

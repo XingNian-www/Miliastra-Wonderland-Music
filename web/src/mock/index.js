@@ -31,6 +31,8 @@ export const MOCK_ROUTES = Object.freeze({
     '/player/providers',
     '/player/login/status',
     '/player/kugou/status',
+    '/player/kugou/phone/code',
+    '/player/kugou/phone/login',
     '/player/account/status',
     '/playback/insights',
     '/playback/leaderboard',
@@ -230,6 +232,10 @@ export function mockResponse(pathOrUrl, method = 'GET', body) {
       return json(demo.loginStatus())
     case '/player/kugou/status':
       return json(demo.kugouStatus())
+    case '/player/kugou/phone/code':
+      return json(demo.kugouPhoneCodeSent(payload?.mobile))
+    case '/player/kugou/phone/login':
+      return json(demo.kugouPhoneLoginStatus())
     case '/player/account/status':
       return json(demo.accountStatus(params.provider || 'netease'))
     case '/player/play-track':

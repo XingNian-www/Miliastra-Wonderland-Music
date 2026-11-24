@@ -100,7 +100,7 @@
           <button class="btn ghost" :disabled="busy || !keyword" @click="searchRaw">文本搜索</button>
         </div>
 
-        <div v-if="candidates.length" class="candidate-list">
+        <div v-if="candidates.length" class="candidate-list playback-mac-candidates">
           <div v-for="(item, index) in candidates" :key="candidateKey(item, index)" class="candidate-item">
             <div>
               <div class="queue-title">{{ item.text || '未命名候选' }}</div>
@@ -128,10 +128,10 @@
         <small>{{ queue.length }} 首</small>
       </div>
       <div class="panel-body">
-        <div class="queue-list">
+        <div class="queue-list playback-mac-list">
           <div v-for="(item, index) in queue" :key="item.id ?? index" class="queue-item">
             <div class="queue-index">{{ index + 1 }}</div>
-            <div>
+            <div class="playback-mac-list-main">
               <div class="queue-title">{{ item.keyword || '未命名歌曲' }}</div>
               <div class="queue-meta">{{ queueMeta(item) }}</div>
             </div>
@@ -152,13 +152,13 @@
         <small>{{ cache?.enabled ? '已启用' : '未启用' }}</small>
       </div>
       <div class="panel-body">
-        <div class="login-facts">
+        <div class="login-facts playback-mac-stats">
           <div class="login-fact"><span>音频</span><strong>{{ cache?.completeEntries ?? 0 }} 首</strong></div>
-          <div class="login-fact"><span>占用</span><strong>{{ formatBytes(cache?.completeBytes) }} / {{ formatBytes(cache?.maxBytes) }}</strong></div>
+          <div class="login-fact"><span>占用</span><strong>{{ formatBytes(cache?.completeBytes) }} <small>/ {{ formatBytes(cache?.maxBytes) }}</small></strong></div>
           <div class="login-fact"><span>下载中</span><strong>{{ cache?.activeDownloads ?? 0 }}</strong></div>
-          <div class="login-fact"><span>播放 / 失败</span><strong>{{ cache?.playCount ?? 0 }} / {{ cache?.failureCount ?? 0 }}</strong></div>
-          <div class="login-fact"><span>点歌 / 池</span><strong>{{ cache?.requestedPlayCount ?? 0 }} / {{ cache?.poolPlayCount ?? 0 }}</strong></div>
-          <div class="login-fact"><span>命中</span><strong>{{ cache?.cacheHitCount ?? 0 }} 次</strong></div>
+          <div class="login-fact"><span>播放 / 失败</span><strong>{{ cache?.playCount ?? 0 }} <small>/ {{ cache?.failureCount ?? 0 }}</small></strong></div>
+          <div class="login-fact"><span>点歌 / 池</span><strong>{{ cache?.requestedPlayCount ?? 0 }} <small>/ {{ cache?.poolPlayCount ?? 0 }}</small></strong></div>
+          <div class="login-fact"><span>命中</span><strong>{{ cache?.cacheHitCount ?? 0 }} <small>次</small></strong></div>
         </div>
         <div class="config-field-hint">目录：{{ cache?.directory || '未知' }}</div>
       </div>
@@ -170,9 +170,9 @@
         <small>最近 {{ history.length }} 首</small>
       </div>
       <div class="panel-body">
-        <div class="history">
+        <div class="history playback-mac-log">
           <div v-for="(item, index) in history" :key="index" class="history-item">
-            <div>
+            <div class="playback-mac-log-head">
               <span class="history-time">{{ formatDate(item.startedAtMs) }}</span>
               <b>{{ historyTitle(item) }}</b>
             </div>
@@ -203,9 +203,13 @@
           </select>
           <button class="btn ghost" :disabled="busy" @click="loadLeaderboard">刷新</button>
         </div>
-        <div class="history">
+        <div class="history playback-mac-log">
           <div v-for="(item, index) in leaderboard" :key="index" class="history-item">
-            <div><span class="history-time">#{{ index + 1 }}</span><b>{{ item.requester || '匿名' }}</b> · {{ item.count ?? 0 }} 次</div>
+            <div class="playback-mac-log-head">
+              <span class="history-time">#{{ index + 1 }}</span>
+              <b>{{ item.requester || '匿名' }}</b>
+              <span class="playback-mac-count">{{ item.count ?? 0 }} 次</span>
+            </div>
             <div class="history-result">最近播放确认 {{ formatDate(item.lastRequestedAtMs) }}</div>
           </div>
           <div v-if="!leaderboard.length" class="empty-hint">该时间范围内暂无成功点歌记录</div>
@@ -227,17 +231,17 @@
           <option value="cache_hit_count:desc">缓存命中（多→少）</option>
           <option value="bytes:desc">文件大小（大→小）</option>
         </select>
-        <div class="cache-track-list">
+        <div class="cache-track-list playback-mac-cache-list">
           <div
             v-for="(track, index) in cacheTracks"
             :key="(track.source || 'unknown') + '/' + (track.id || index)"
             class="cache-track-item"
             :class="{ orphan: !track.source }"
           >
-            <div>
+            <div class="playback-mac-list-main">
               <b>{{ cacheTitle(track) }}</b>
               <span class="cache-track-source">{{ sourceLabel(track.source) }}</span>
-              <div class="controls" style="margin-top:6px">
+              <div class="controls playback-mac-track-actions">
                 <button class="btn small ghost" :disabled="busy || !track.source || !track.id" @click="playCached(track)">播放</button>
                 <button class="btn small ghost" :disabled="busy || !track.source || !track.id" @click="invalidateCached(track)">仅清缓存</button>
                 <button class="btn small ghost" :disabled="busy || !track.source || !track.id" @click="deleteCached(track)">删除歌曲</button>
@@ -764,3 +768,245 @@ onBeforeUnmount(() => {
   clearInterval(playerTimer)
 })
 </script>
+
+<style scoped>
+/* =============================================================================
+ * 播放与点歌：macOS 数据密集面板
+ *
+ * 只作用于本页（scoped）与 `.playback-mac-*` 前缀，不改 components.css 的共享规则。
+ * 要点：
+ *   - 队列 / 缓存 / 候选 / 历史都收进「一圈圆角 + 1px 极淡横线」的 grouped 容器，
+ *     不再是每项一张独立小卡（macOS 用 grouped list，不用卡片墙）。
+ *   - 历史与点歌榜是日志块：深色圆角面板（--bg-0）+ 等宽字体 + 12px 内边距。
+ *   - 统计卡强调「标签小、数值大」：标签 11px 灰、数值 15px 半粗等宽数字。
+ * ========================================================================== */
+
+/* ---------- 统计：标签小、数值大 ---------- */
+
+.playback-mac-stats {
+  gap: var(--sp-3) var(--sp-4);
+  padding: var(--sp-3);
+  border: 1px solid var(--sep-2);
+  border-radius: var(--radius-m);
+  background: var(--bg-input);
+}
+
+.playback-mac-stats .login-fact span {
+  color: var(--text-3);
+  font-size: var(--fs-tiny);
+  line-height: var(--lh-tiny);
+  letter-spacing: 0.04em;
+}
+
+.playback-mac-stats .login-fact strong {
+  margin-top: 2px;
+  color: var(--text-1);
+  font-size: 15px;
+  line-height: 22px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.playback-mac-stats .login-fact strong small {
+  color: var(--text-3);
+  font-size: var(--fs-meta);
+  font-weight: 500;
+}
+
+/* ---------- grouped 列表：队列 / 缓存 / 候选 ---------- */
+
+.playback-mac-list,
+.playback-mac-cache-list,
+.playback-mac-candidates {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  border: 1px solid var(--sep-2);
+  border-radius: var(--radius-m);
+  background: var(--bg-input);
+  padding: 2px;
+  overflow: auto;
+}
+
+/* 队列恢复单列：grouped 列表不该是双列卡片墙（窄屏原本就是单列）。 */
+.playback-queue-panel .playback-mac-list {
+  grid-template-columns: none;
+  display: flex;
+}
+
+.playback-mac-list .queue-item,
+.playback-mac-cache-list .cache-track-item,
+.playback-mac-candidates .candidate-item {
+  min-height: 32px;
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-s);
+  padding: 5px var(--sp-2);
+}
+
+.playback-mac-list .queue-item + .queue-item,
+.playback-mac-cache-list .cache-track-item + .cache-track-item,
+.playback-mac-candidates .candidate-item + .candidate-item {
+  border-top: 1px solid var(--sep-2);
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
+
+.playback-mac-list .queue-item:hover,
+.playback-mac-cache-list .cache-track-item:hover,
+.playback-mac-candidates .candidate-item:hover {
+  background: var(--fill-1);
+}
+
+.playback-mac-list .queue-item .queue-title,
+.playback-mac-candidates .candidate-item .queue-title {
+  font-size: var(--fs-item);
+  line-height: var(--lh-item);
+  color: var(--text-1);
+}
+
+.playback-mac-list .queue-index {
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.playback-mac-cache-list {
+  max-height: 360px;
+}
+
+/* 缓存行：左侧信息 + 右侧元信息，按钮只在 hover / 聚焦时显形，
+ * 免得每一行都挂着四个按钮把列表读成工具栏。 */
+.playback-mac-cache-list .cache-track-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 320px);
+  gap: var(--sp-3);
+  align-items: center;
+  padding: 6px var(--sp-3);
+}
+
+.playback-mac-list-main {
+  min-width: 0;
+}
+
+/* 缓存行操作常驻（这些是操作主入口，不能靠 hover 才出现），
+ * 但降一档视觉权重：ghost 按钮本身已经是 --text-2。 */
+.playback-mac-track-actions {
+  display: flex;
+  gap: var(--sp-1);
+  flex-wrap: wrap;
+  margin-top: 2px;
+}
+
+.playback-mac-cache-list .cache-track-meta {
+  color: var(--text-3);
+  font-size: var(--fs-tiny);
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+@media (max-width: 900px) {
+  .playback-mac-cache-list .cache-track-item {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* ---------- 历史 / 点歌榜：深色日志块 ---------- */
+
+.playback-mac-log {
+  gap: 0;
+  padding: 2px;
+  border: 1px solid var(--sep-2);
+  border-radius: var(--radius-m);
+  background: var(--bg-0);
+  max-height: 360px;
+  overflow: auto;
+}
+
+.playback-mac-log .history-item {
+  border: 0;
+  border-left: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 6px var(--sp-3);
+  transition: background 0.12s ease;
+}
+
+.playback-mac-log .history-item + .history-item {
+  border-top: 1px solid var(--sep-2);
+}
+
+.playback-mac-log .history-item:hover {
+  background: var(--fill-1);
+}
+
+.playback-mac-log-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+.playback-mac-log .history-time {
+  color: var(--text-3);
+  font-family: var(--font-mono);
+  font-size: var(--fs-tiny);
+  font-variant-numeric: tabular-nums;
+}
+
+.playback-mac-log .history-item b {
+  font-size: var(--fs-item);
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+.playback-mac-log .history-result {
+  margin-top: 2px;
+  color: var(--text-2);
+  font-family: var(--font-mono);
+  font-size: var(--fs-tiny);
+  line-height: 1.55;
+  word-break: break-word;
+}
+
+.playback-mac-count {
+  color: var(--text-3);
+  font-size: var(--fs-tiny);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- 空状态：居中、灰色、小字 ---------- */
+
+.playback-mac-list .empty-hint,
+.playback-mac-cache-list .empty-hint,
+.playback-mac-candidates .empty-hint,
+.playback-mac-log .empty-hint {
+  padding: 20px 12px;
+  color: var(--text-3);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-meta);
+  text-align: center;
+}
+
+/* ---------- 正在播放：标题与进度条的层级 ---------- */
+
+.current-song {
+  font-size: 17px;
+  line-height: 23px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.now-playing-sub {
+  color: var(--text-2);
+  font-size: var(--fs-meta);
+}
+
+.playback-progress {
+  margin-top: var(--sp-3);
+}
+
+.playback-progress .progress-row {
+  font-size: var(--fs-tiny);
+  font-variant-numeric: tabular-nums;
+}
+</style>

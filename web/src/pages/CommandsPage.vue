@@ -1,5 +1,5 @@
 <template>
-  <div id="page-commands">
+  <div id="page-commands" class="commands-mac-page">
     <h1 class="page-title">命令面板</h1>
     <p class="page-subtitle">聊天命令目录、回复覆盖与权限策略；权限与回复分别保存</p>
 

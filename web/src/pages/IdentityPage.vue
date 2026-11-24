@@ -13,8 +13,8 @@
       <button class="btn small ghost" type="button" @click="openJson">JSON 编辑</button>
     </div>
 
-    <div class="identity-table-wrap">
-      <table class="identity-table">
+    <div class="identity-table-wrap identity-mac-table-wrap">
+      <table class="identity-table identity-mac-table">
         <thead>
           <tr>
             <th style="width: 120px" title="游戏内好友备注：屏幕显示名 / OCR 精确匹配键 / 授权依据（JSON 键 nickname）">游戏备注</th>
@@ -52,10 +52,10 @@
               </select>
             </td>
             <td><input v-model="row.accountsText" placeholder="genshin:123456" @input="markDirty(row)" /></td>
-            <td><button class="btn small danger" type="button" @click="removeRow(row)">删除</button></td>
+            <td class="identity-mac-row-action"><button class="btn small danger" type="button" @click="removeRow(row)">删除</button></td>
           </tr>
           <tr v-if="!filteredRows.length">
-            <td colspan="6" class="config-field-hint" style="text-align:center;padding:20px">
+            <td colspan="6" class="identity-mac-empty">
               {{ rows.length ? '没有匹配的映射' : '还没有身份映射，点「添加映射」' }}
             </td>
           </tr>
@@ -235,21 +235,144 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
 </script>
 
 <style scoped>
+/* =============================================================================
+ * 身份映射：macOS 表格
+ *
+ * 只作用于本页（scoped）与 `.identity-mac-*` 前缀，不动 components.css 的共享规则。
+ * macOS 表格没有竖线、没有外框重边：只有一圈容器圆角 + 每行 1px 极淡横向分隔线；
+ * 表头是小号灰色大写/半粗小字，行 hover 是极淡填充；斑马纹不用。
+ * 行高按 32px 控制（表内输入框收到 26px 才塞得下）。
+ * ========================================================================== */
+
 .identity-page { padding: 0 24px 24px; max-width: 1480px; margin: 0 auto; }
 .identity-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 12px 0; }
 .identity-toolbar input { flex: 1 1 220px; max-width: 360px; }
-.identity-table-wrap { overflow-x: auto; border: 1px solid var(--sep-1); border-radius: 12px; }
-.identity-table { width: 100%; border-collapse: collapse; font-size: 12px; }
-.identity-table th { text-align: left; padding: 8px 10px; color: var(--text-3); font-weight: 600; font-size: 11px; border-bottom: 1px solid var(--sep-1); white-space: nowrap; }
-.identity-table td { padding: 6px 8px; border-bottom: 1px solid var(--sep-2); vertical-align: middle; }
-.identity-table tr.dirty td { background: rgba(245, 176, 76, 0.06); }
-.identity-table input, .identity-table select { width: 100%; min-width: 0; height: 28px; }
-.identity-json { margin-top: 12px; border: 1px solid var(--sep-2); border-radius: 10px; padding: 8px 12px; }
+
+/* ---------- 容器：一圈圆角，不要竖线与重边框 ---------- */
+
+.identity-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--sep-2);
+  border-radius: var(--radius-m);
+  background: var(--bg-input);
+}
+
+.identity-table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: var(--fs-meta);
+}
+
+/* 表头：小号灰色、半粗、不抢视觉；粘在滚动容器顶部。 */
+.identity-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  text-align: left;
+  padding: 7px 10px;
+  color: var(--text-3);
+  font-weight: 600;
+  font-size: var(--fs-tiny);
+  line-height: var(--lh-tiny);
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  background: var(--bg-card);
+  border: 0;
+  border-bottom: 1px solid var(--sep-2);
+}
+
+/* 数据行：没有竖线，只有极淡的横向分隔；斑马纹不用。 */
+.identity-table tbody td {
+  padding: 3px 10px;
+  border: 0;
+  border-bottom: 1px solid var(--sep-2);
+  vertical-align: middle;
+  background: transparent;
+  transition: background 0.12s ease;
+}
+
+.identity-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.identity-table tbody tr:hover td {
+  background: var(--fill-1);
+}
+
+/* 行高 32px：表内输入框比全局控件矮，表格才排得紧。
+ *
+ * 前缀 `.identity-page` 不是为了作用域（scoped 已经做了），而是为了特异性：
+ * components.css 里那条全局控件高度是 `input:not([type]):not([type]):not([type])`，
+ * 三个 :not() 里的属性选择器让它到 (0,3,1)，比 `.identity-table tbody td input`
+ * 的 (0,2,3) 高；不加这一层前缀，下面的 26px 会被静默覆盖回 32px。
+ */
+.identity-page .identity-table tbody td input,
+.identity-page .identity-table tbody td select {
+  width: 100%;
+  min-width: 0;
+  height: 26px;
+  min-height: 26px;
+  font-size: var(--fs-meta);
+  background: transparent;
+  border-color: transparent;
+}
+
+.identity-page .identity-table tbody td input:hover,
+.identity-page .identity-table tbody td select:hover {
+  border-color: var(--sep-1);
+}
+
+.identity-page .identity-table tbody td input:focus,
+.identity-page .identity-table tbody td select:focus {
+  background: var(--bg-input);
+  border-color: var(--accent);
+}
+
+/* 删除按钮：平时是低对比的灰色文字（macOS 表格行操作不在行里喊话），
+ * hover 行 / 聚焦 / 按钮自身 hover 时才变成红字。始终可点，不做「隐藏到 hover」。 */
+.identity-mac-row-action {
+  text-align: right;
+}
+
+.identity-mac-row-action .btn.danger {
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-3);
+  box-shadow: none;
+}
+
+.identity-table tbody tr:hover .identity-mac-row-action .btn.danger,
+.identity-table tbody tr:focus-within .identity-mac-row-action .btn.danger,
+.identity-mac-row-action .btn.danger:hover,
+.identity-mac-row-action .btn.danger:focus-visible {
+  background: var(--danger-soft);
+  border-color: transparent;
+  color: var(--danger);
+}
+
+/* 有未保存修改的行：左侧 2px 警告条（macOS 的「已修改」标记），不铺满整行底色。 */
+.identity-table tbody tr.dirty td:first-child {
+  box-shadow: inset 2px 0 0 var(--warn);
+}
+
+/* 空状态：居中、灰色、小字。 */
+.identity-mac-empty {
+  padding: 24px 12px;
+  color: var(--text-3);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-meta);
+  text-align: center;
+}
+
+.identity-json { margin-top: 12px; border: 1px solid var(--sep-2); border-radius: var(--radius-m); padding: 8px 12px; }
 .identity-json summary { cursor: pointer; font-size: 12.5px; color: var(--text-2); }
 .identity-json textarea { width: 100%; min-height: 220px; margin-top: 8px; font-family: var(--font-mono); }
 .identity-json-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
 .identity-savebar { margin-top: 12px; }
+
 @media (max-width: 720px) {
   .identity-page { padding: 0 16px 20px; }
+  .identity-table tbody td { padding: 3px 8px; }
 }
 </style>

@@ -48,38 +48,42 @@
           <small>{{ tasks.length }} 条</small>
         </div>
         <div class="panel-body">
-          <div v-if="!tasks.length" class="config-field-hint">暂无任务</div>
-          <div
-            v-for="task in tasks"
-            :key="task.id"
-            class="task-item"
-            :class="{ selected: selectedId === task.id }"
-            role="button"
-            tabindex="0"
-            @click="selectedId = task.id"
-            @keydown.enter.prevent="selectedId = task.id"
-            @keydown.space.prevent="selectedId = task.id"
-          >
-            <span class="task-status" :class="task.status">{{ statusLabel(task.status) }}</span>
-            <div class="queue-title">#{{ task.id }} {{ task.label || '未命名任务' }}</div>
-            <div class="queue-meta">{{ elapsedText(task) }}</div>
-            <div v-if="task.result" class="task-result" :title="task.result">{{ task.result }}</div>
-            <button
-              v-if="task.status === 'queued' || task.status === 'running'"
-              type="button"
-              class="btn small ghost"
-              :disabled="cancelingId === task.id"
-              @click.stop="cancelTask(task)"
+          <div class="tasks-mac-list" role="list">
+            <div
+              v-for="task in tasks"
+              :key="task.id"
+              class="task-item"
+              :class="{ selected: selectedId === task.id }"
+              role="button"
+              tabindex="0"
+              @click="selectedId = task.id"
+              @keydown.enter.prevent="selectedId = task.id"
+              @keydown.space.prevent="selectedId = task.id"
             >
-              {{ cancelingId === task.id ? '撤销中…' : '撤销' }}
-            </button>
+              <span class="task-status" :class="task.status">{{ statusLabel(task.status) }}</span>
+              <div class="queue-title">#{{ task.id }} {{ task.label || '未命名任务' }}</div>
+              <div class="queue-meta">{{ elapsedText(task) }}</div>
+              <div v-if="task.result" class="task-result" :title="task.result">{{ task.result }}</div>
+              <button
+                v-if="task.status === 'queued' || task.status === 'running'"
+                type="button"
+                class="btn small ghost"
+                :disabled="cancelingId === task.id"
+                @click.stop="cancelTask(task)"
+              >
+                {{ cancelingId === task.id ? '撤销中…' : '撤销' }}
+              </button>
+            </div>
+            <div v-if="!tasks.length" class="tasks-mac-empty">暂无任务</div>
           </div>
         </div>
       </div>
 
       <div v-if="!selectedTask" class="panel task-detail-panel">
         <div class="panel-head"><h2>任务详情</h2></div>
-        <div class="panel-body"><p class="config-field-hint">选择左侧任务查看详情</p></div>
+        <div class="panel-body">
+          <p class="tasks-mac-empty">选择左侧任务查看详情</p>
+        </div>
       </div>
       <div v-else class="panel task-detail-panel">
         <div class="panel-head">
@@ -87,7 +91,7 @@
           <small>#{{ selectedTask.id }}</small>
         </div>
         <div class="panel-body">
-          <div class="row wrap" style="align-items: center">
+          <div class="tasks-mac-detail-title">
             <span class="task-status" :class="selectedTask.status">{{ statusLabel(selectedTask.status) }}</span>
             <b>{{ selectedTask.label || '未命名任务' }}</b>
             <span style="flex: 1"></span>
@@ -102,11 +106,25 @@
               {{ cancelingId === selectedTask.id ? '撤销中…' : '撤销任务' }}
             </button>
           </div>
-          <div class="config-field-hint">
-            入队 {{ formatTime(selectedTask.queuedAtMs) }} · 开始 {{ formatTime(selectedTask.startedAtMs) }} ·
-            结束 {{ formatTime(selectedTask.finishedAtMs) }} · 耗时 {{ elapsedText(selectedTask) }}
-          </div>
-          <p class="config-field-hint" style="white-space: pre-wrap; word-break: break-word">{{ selectedTask.result || '暂无结果' }}</p>
+          <dl class="tasks-mac-facts">
+            <div class="tasks-mac-fact">
+              <dt>入队</dt>
+              <dd>{{ formatTime(selectedTask.queuedAtMs) }}</dd>
+            </div>
+            <div class="tasks-mac-fact">
+              <dt>开始</dt>
+              <dd>{{ formatTime(selectedTask.startedAtMs) }}</dd>
+            </div>
+            <div class="tasks-mac-fact">
+              <dt>结束</dt>
+              <dd>{{ formatTime(selectedTask.finishedAtMs) }}</dd>
+            </div>
+            <div class="tasks-mac-fact">
+              <dt>耗时</dt>
+              <dd>{{ elapsedText(selectedTask) }}</dd>
+            </div>
+          </dl>
+          <p class="tasks-mac-result">{{ selectedTask.result || '暂无结果' }}</p>
         </div>
       </div>
 
@@ -133,10 +151,9 @@
           </div>
         </div>
         <div class="panel-body">
-          <pre v-if="tab === 'logs'" class="scroll">{{ logsText }}</pre>
-          <pre v-else-if="tab === 'commands'" class="scroll">{{ commandsText }}</pre>
-          <div v-else class="history">
-            <div v-if="!history.length" class="config-field-hint">暂无接口记录</div>
+          <pre v-if="tab === 'logs'" class="scroll tasks-mac-log">{{ logsText }}</pre>
+          <pre v-else-if="tab === 'commands'" class="scroll tasks-mac-log">{{ commandsText }}</pre>
+          <div v-else class="tasks-mac-history">
             <div v-for="(item, index) in history" :key="`${item.time}-${index}`" class="history-item" :class="{ err: !item.ok }">
               <div>
                 <span class="history-time">{{ item.time }}</span>
@@ -145,6 +162,7 @@
               </div>
               <div class="history-result">{{ item.result }}</div>
             </div>
+            <p v-if="!history.length" class="tasks-mac-empty">暂无接口记录</p>
           </div>
           <p class="config-field-hint">
             事件/命令日志来自 GET /monitor 的内存环形缓冲，不落盘、无法清空；「清空接口记录」调用 POST /clear-history。
@@ -401,3 +419,231 @@ onBeforeUnmount(() => {
   timer = null
 })
 </script>
+
+<style scoped>
+/* =============================================================================
+ * 任务与日志：macOS 数据密集面板
+ *
+ * 只作用于本页（`<style scoped>`）与页面专属前缀 `.tasks-mac-*`，不改
+ * components.css 里共享的 `.panel` / `.btn` / `.tab` / `.task-item` 规则。
+ * 队列是 grouped 列表：容器一圈圆角，行与行之间只有 1px 淡分隔线，
+ * 选中行是内嵌的蓝色圆角胶囊（radius 6px + 白字），不是整行铺满。
+ * ========================================================================== */
+
+/* ---------- 队列：grouped 列表 ---------- */
+
+.tasks-mac-list {
+  border: 1px solid var(--sep-2);
+  border-radius: var(--radius-m);
+  background: var(--bg-input);
+  overflow: auto;
+  max-height: 480px;
+  padding: 2px;
+}
+
+.tasks-mac-list .task-item {
+  grid-template-columns: 52px minmax(0, 1fr) auto auto;
+  min-height: 30px;
+  padding: 5px var(--sp-2);
+  margin: 0 2px;
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-s);
+}
+
+.tasks-mac-list .task-item + .task-item {
+  border-top: 1px solid var(--sep-2);
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
+
+.tasks-mac-list .task-item:hover {
+  background: var(--fill-1);
+}
+
+.tasks-mac-list .task-item .queue-title {
+  font-size: var(--fs-item);
+  line-height: var(--lh-item);
+  color: var(--text-1);
+}
+
+.tasks-mac-list .task-item .queue-meta {
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.tasks-mac-list .task-item .task-status {
+  font-size: var(--fs-tiny);
+  letter-spacing: 0.02em;
+}
+
+.tasks-mac-list .task-item .task-result {
+  color: var(--text-3);
+}
+
+/* 选中：内嵌圆角胶囊蓝底 + 白字（Finder 侧栏式），不是整行铺满。 */
+.tasks-mac-list .task-item.selected,
+.tasks-mac-list .task-item.selected + .task-item.selected {
+  background: var(--accent);
+  border-color: transparent;
+  color: var(--on-accent);
+}
+
+.tasks-mac-list .task-item.selected .queue-title,
+.tasks-mac-list .task-item.selected .queue-meta,
+.tasks-mac-list .task-item.selected .task-status,
+.tasks-mac-list .task-item.selected .task-result {
+  color: var(--on-accent);
+}
+
+.tasks-mac-list .task-item.selected .queue-meta,
+.tasks-mac-list .task-item.selected .task-result,
+.tasks-mac-list .task-item.selected .task-status {
+  opacity: 0.82;
+}
+
+.tasks-mac-list .task-item.selected .btn.ghost {
+  color: var(--on-accent);
+  border-color: var(--on-accent);
+  background: transparent;
+  opacity: 0.9;
+}
+
+/* ---------- 任务详情：标签小、数值大 ---------- */
+
+.tasks-mac-detail-title {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  min-height: 30px;
+}
+
+.tasks-mac-detail-title b {
+  font-size: var(--fs-item);
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+.tasks-mac-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--sp-2) var(--sp-3);
+  margin: 0;
+  padding: var(--sp-3);
+  border: 1px solid var(--sep-2);
+  border-radius: var(--radius-m);
+  background: var(--bg-input);
+}
+
+.tasks-mac-fact dt {
+  color: var(--text-3);
+  font-size: var(--fs-tiny);
+  line-height: var(--lh-tiny);
+  letter-spacing: 0.04em;
+}
+
+.tasks-mac-fact dd {
+  margin: 2px 0 0;
+  color: var(--text-1);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-meta);
+  font-variant-numeric: tabular-nums;
+  word-break: break-word;
+}
+
+.tasks-mac-result {
+  margin: 0;
+  padding: 12px;
+  max-height: 200px;
+  overflow: auto;
+  background: var(--bg-0);
+  border: 1px solid var(--sep-2);
+  border-radius: var(--radius-s);
+  color: var(--text-2);
+  font-family: var(--font-mono);
+  font-size: var(--fs-meta);
+  line-height: 1.65;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ---------- 日志块：深色圆角面板 + 等宽 + 12px 内边距 ---------- */
+
+.tasks-mac-empty {
+  margin: 0;
+  padding: var(--sp-4) var(--sp-3);
+  color: var(--text-3);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-meta);
+  text-align: center;
+}
+
+.scroll.tasks-mac-log {
+  background: var(--bg-0);
+  border: 1px solid var(--sep-2);
+  border-radius: var(--radius-m);
+  padding: 12px;
+  min-height: 132px;
+  max-height: 320px;
+  color: var(--text-2);
+  font-family: var(--font-mono);
+  font-size: var(--fs-meta);
+  line-height: 1.65;
+  tab-size: 2;
+}
+
+/* ---------- 接口记录：无左侧色条，只有极淡分隔 + hover 填充 ---------- */
+
+.tasks-mac-history {
+  display: flex;
+  flex-direction: column;
+  max-height: 260px;
+  overflow: auto;
+  border: 1px solid var(--sep-2);
+  border-radius: var(--radius-m);
+  background: var(--bg-input);
+}
+
+.tasks-mac-history .history-item {
+  border: 0;
+  border-left: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 6px var(--sp-3);
+  transition: background 0.12s ease;
+}
+
+.tasks-mac-history .history-item + .history-item {
+  border-top: 1px solid var(--sep-2);
+}
+
+.tasks-mac-history .history-item:hover {
+  background: var(--fill-1);
+}
+
+.tasks-mac-history .history-time {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-3);
+}
+
+.tasks-mac-history .history-item.err .history-time,
+.tasks-mac-history .history-item.err b {
+  color: var(--danger);
+}
+
+/* 两个面板在宽屏并排时底边对齐，避免一高一低留台阶。 */
+.page-grid > .task-detail-panel {
+  height: 100% !important;
+}
+
+@media (max-width: 720px) {
+  .tasks-mac-list {
+    max-height: none;
+  }
+
+  .tasks-mac-facts {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+</style>

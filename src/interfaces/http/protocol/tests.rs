@@ -3292,6 +3292,24 @@ fn remote_http_api_requires_token_when_configured() {
     assert!(!requires_access_token(&config.http, "/"));
 }
 
+/// 发短信是最敏感的动作：两个手机登录端点必须落在需要令牌的通道内，
+/// 且必须是 mutating（POST）路由，不能通过 GET 触发。
+#[test]
+fn kugou_phone_login_endpoints_require_auth_and_post() {
+    let mut config: AppConfig =
+        serde_norway::from_str(crate::config::bundled_config_yaml()).expect("default config");
+    config.http.access_token = "secret".to_string();
+    for path in ["/player/kugou/phone/code", "/player/kugou/phone/login"] {
+        assert!(
+            requires_access_token(&config.http, path),
+            "{path} 必须要求访问令牌"
+        );
+        assert!(is_mutating_route(path), "{path} 必须是 mutating 路由");
+        // 只有注册成 BodyRouteSpec，enforce_method 才会要求 POST。
+        assert!(body_route_spec(path).is_some(), "{path} 必须是 POST 路由");
+    }
+}
+
 #[test]
 fn status_route_includes_requester_for_the_matching_active_song() {
     let status = PlayerStatus {

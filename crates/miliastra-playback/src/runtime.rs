@@ -926,8 +926,11 @@ async fn run_commands(
     let mut lyric_state: Option<LyricState> = None;
     let mut pending_play: Option<PendingPlay> = None;
     let mut pending_login: Option<PendingLoginValidation> = None;
-    // 酷狗手机验证码的下次可发送时刻。跨命令保持，用于「同一号码 60 秒内不重发」。
-    let mut phone_code_next_send_at: Option<u64> = None;
+    // 酷狗手机验证码的下次可发送时刻，**按号码**记录。
+    // 必须按号码而不是全局：全局一份会让给 A 号码发码把 B 号码也锁住，
+    // 既不合理，也会诱使用户反复重试。
+    let mut phone_code_next_send_at: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
     let mut searches = JoinSet::new();
     let mut login_validations = JoinSet::new();
     // 预加载任务管理：JoinSet 统一跟踪、可整体取消；in-flight 集合实现
@@ -1370,8 +1373,11 @@ async fn run_commands(
                 // 冷却检查必须在**发出任何网络请求之前**完成：发送验证码会真实
                 // 下发短信，重复触发等于骚扰用户。
                 let now = current_epoch_ms();
-                if let Some(next_send_at_ms) = phone_code_next_send_at
-                    && next_send_at_ms > now
+                let cooldown_key = mobile.trim().to_owned();
+                // 顺手清理已过期的条目，避免长期运行后无限增长。
+                phone_code_next_send_at.retain(|_, next| *next > now);
+                if let Some(next_send_at_ms) = phone_code_next_send_at.get(&cooldown_key)
+                    && *next_send_at_ms > now
                 {
                     let _ = reply.send(Err(PlaybackError::Failure(
                         Failure::new(
@@ -1393,7 +1399,8 @@ async fn run_commands(
                         next_send_at_ms: now.saturating_add(PHONE_CODE_COOLDOWN_MS),
                     }));
                 });
-                phone_code_next_send_at = Some(now.saturating_add(PHONE_CODE_COOLDOWN_MS));
+                phone_code_next_send_at
+                    .insert(cooldown_key, now.saturating_add(PHONE_CODE_COOLDOWN_MS));
             }
             Command::KugouPhoneLogin {
                 mobile,
@@ -3002,6 +3009,36 @@ mod tests {
                     .unwrap()
             );
         }
+    }
+
+    /// 验证码冷却必须**按号码**独立：给 A 号码发过码，不应把 B 号码也锁住。
+    ///
+    /// 这里直接测冷却记账结构的行为（真实路径需要联网发码，测试绝不触网）。
+    #[test]
+    fn phone_code_cooldown_is_tracked_per_mobile() {
+        use std::collections::BTreeMap;
+        let now = current_epoch_ms();
+        let mut cooldown: BTreeMap<String, u64> = BTreeMap::new();
+        let a = "13800138000".to_owned();
+        let b = "13800138001".to_owned();
+        cooldown.insert(a.clone(), now.saturating_add(PHONE_CODE_COOLDOWN_MS));
+
+        // A 在冷却期内。
+        assert!(
+            cooldown.get(&a).is_some_and(|next| *next > now),
+            "A 号码应处于冷却期"
+        );
+        // B 未发送过，不受 A 影响。
+        assert!(
+            !cooldown.get(&b).is_some_and(|next| *next > now),
+            "B 号码不应被 A 的冷却锁住"
+        );
+
+        // 过期条目会被清理，避免长期运行后无限增长。
+        cooldown.insert("expired".to_owned(), now.saturating_sub(1));
+        cooldown.retain(|_, next| *next > now);
+        assert!(!cooldown.contains_key("expired"));
+        assert!(cooldown.contains_key(&a));
     }
 
     /// 「没有真正换到新令牌」绝不能把下次自动刷新推迟一整天。

@@ -62,6 +62,12 @@ impl std::fmt::Debug for ProviderCredential {
     }
 }
 
+/// 供适配器单测校验「组装出的凭据能否被保存」。
+#[cfg(test)]
+pub(crate) fn validate_for_test(credential: &ProviderCredential) -> Result<(), CredentialError> {
+    credential.validate()
+}
+
 impl ProviderCredential {
     pub fn provider(&self) -> &'static str {
         match self {
@@ -78,6 +84,22 @@ impl ProviderCredential {
             | Self::Netease { cookies }
             | Self::Bilibili { cookies, .. }
             | Self::Kugou { cookies, .. } => cookies,
+        }
+    }
+
+    /// 凭据里的主要令牌/账号标识（仅酷狗与 B 站有独立字段）。
+    ///
+    /// 暴露只读引用是为了让运维/诊断工具能展示「哪些字段已就位」而不必把
+    /// 凭据结构体字段对外公开。
+    pub fn kugou_fields(&self) -> Option<(&str, &str, &str)> {
+        match self {
+            Self::Kugou {
+                token,
+                userid,
+                dfid,
+                ..
+            } => Some((token, userid, dfid)),
+            _ => None,
         }
     }
 

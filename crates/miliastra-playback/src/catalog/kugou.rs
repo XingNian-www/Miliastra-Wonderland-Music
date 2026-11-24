@@ -60,6 +60,62 @@ const KUGOU_LITE_LOGIN_T1_IV: &str = "04bd09a46d8add98";
 const KUGOU_LOGIN_T3: &str = "MCwwLDAsMCwwLDAsMCwwLDA=";
 /// t2 中的固定常量（上游与官方客户端一致）。
 const KUGOU_LOGIN_T2_CONST: &str = "0f607264fc6318a92b9e13c65db7cd3c";
+
+// ---------------------------------------------------------------------------
+// 概念版（lite）手机号验证码登录
+// ---------------------------------------------------------------------------
+//
+// 网页扫码登录只能拿到 Web 会话 Cookie，`KuGoo` 里的 `t1` 恒为空且不会产生
+// `KUGOU_API_TOKEN`，因此那类凭据在协议上无法自动续期。概念版验证码登录是唯一
+// 能在登录阶段就拿到设备绑定 `t1` / `vip_token` 的路径（上游 module/login_cellphone.js）。
+//
+// 端点选 `loginserviceretry.kugou.com`：它是单层子域，`*.kugou.com` 证书可以覆盖，
+// 严格 TLS 校验天然通过。上游写的是 `http://login.user.kugou.com`（那个主机的证书
+// 不覆盖两级子域），这里不使用它。
+const URL_SEND_MOBILE_CODE: &str = "https://loginserviceretry.kugou.com/v7/send_mobile_code";
+const URL_LOGIN_BY_VERIFYCODE: &str = "https://loginserviceretry.kugou.com/v7/login_by_verifycode";
+/// 验证码登录接口要求的专用 UA（上游 module/login_cellphone.js 固定值）。
+const KUGOU_LOGIN_UA: &str = "Android16-1070-11440-130-0-LOGIN-wifi";
+/// 发送验证码的业务号（上游 captcha_sent.js 固定值）。
+const KUGOU_MOBILE_CODE_BUSINESS_ID: i64 = 5;
+/// 验证码登录的 plat 参数（上游 login_cellphone.js 固定值）。
+const KUGOU_LOGIN_PLAT: i64 = 1;
+/// 概念版登录请求体里的 gitversion（上游固定值）。
+const KUGOU_LOGIN_GITVERSION: &str = "5f0b7c4";
+
+/// `/v7/send_mobile_code` 请求体。
+#[derive(Serialize)]
+struct KugouSendMobileCodeBody {
+    businessid: i64,
+    mobile: String,
+    plat: i64,
+}
+
+/// `/v7/login_by_verifycode` 请求体（概念版分支）。
+///
+/// 字段顺序沿用官方客户端；Android 签名覆盖该请求体的序列化文本。
+#[derive(Serialize)]
+struct KugouLoginByVerifyCodeBody {
+    plat: i64,
+    support_multi: i64,
+    t1: String,
+    t2: String,
+    clienttime_ms: u64,
+    mobile: String,
+    key: String,
+    pk: String,
+    params: String,
+    dfid: String,
+    dev: String,
+    gitversion: String,
+}
+
+/// 验证码登录 `params` 字段的明文。
+#[derive(Serialize)]
+struct KugouLoginVerifyParams {
+    mobile: String,
+    code: String,
+}
 const KUGOU_UA: &str = "Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi";
 const KUGOU_KG_RFC: &str = "B9EDA08A64250DEFFBCADDEE00F8F25F";
 const KUGOU_LITE_URL_VERSION: &str = "11430";
@@ -1552,6 +1608,189 @@ impl KugouAdapter {
     }
 
     /// 用设备绑定身份续期 Lite 登录令牌。
+    /// 构造 `/v7/login_by_verifycode`（概念版）请求体。
+    ///
+    /// `t1`/`t2` 由客户端现场自造（上游 login_cellphone.js 的做法），不依赖任何
+    /// 前置会话字段——这正是它能在“还没有 t1”时完成登录的原因。响应里的 `t1`
+    /// 是服务端下发的真实续期字段。
+    fn login_by_verifycode_body(
+        mobile: &str,
+        code: &str,
+        device: &KugouDeviceIdentity,
+        date_now_ms: u64,
+        session_key: &str,
+    ) -> Result<String, CatalogError> {
+        let derived = kugou_md5_hex(session_key);
+        let session_aes_key = derived.get(..32).unwrap_or(derived.as_str());
+        let session_aes_iv = derived
+            .get(derived.len().saturating_sub(16)..)
+            .unwrap_or_default();
+        let params_plaintext = serde_json::to_vec(&KugouLoginVerifyParams {
+            mobile: mobile.to_owned(),
+            code: code.to_owned(),
+        })
+        .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
+        let params = aes_cbc_encrypt_hex(&params_plaintext, session_aes_key, session_aes_iv)
+            .map_err(kugou_crypto_error)?;
+        let pk_plaintext = serde_json::to_vec(&KugouLoginPk {
+            clienttime_ms: date_now_ms,
+            key: session_key.to_owned(),
+        })
+        .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
+        let pk = rsa_raw_encrypt_hex(&pk_plaintext, KUGOU_LITE_RSA_PUBLIC_KEY)
+            .map_err(kugou_crypto_error)?;
+        // 上游状态：t1 = AES("|" + clienttime_ms)，t2 绑定本机设备标识。
+        let t1 = aes_cbc_encrypt_hex(
+            format!("|{date_now_ms}").as_bytes(),
+            KUGOU_LITE_LOGIN_T1_KEY,
+            KUGOU_LITE_LOGIN_T1_IV,
+        )
+        .map_err(kugou_crypto_error)?;
+        let t2 = aes_cbc_encrypt_hex(
+            format!(
+                "{}|{KUGOU_LOGIN_T2_CONST}|{}|{}|{date_now_ms}",
+                device.guid, device.mac, device.dev
+            )
+            .as_bytes(),
+            KUGOU_LITE_LOGIN_T2_KEY,
+            KUGOU_LITE_LOGIN_T2_IV,
+        )
+        .map_err(kugou_crypto_error)?;
+        // key = md5(appid + 概念版盐 + clientver + clienttime_ms)
+        let key = md5_hex(&format!(
+            "{KUGOU_LITE_APPID}{KUGOU_LITE_SIGN_SALT}{KUGOU_LITE_CLIENTVER}{date_now_ms}"
+        ));
+        let body = KugouLoginByVerifyCodeBody {
+            plat: KUGOU_LOGIN_PLAT,
+            support_multi: 1,
+            t1,
+            t2,
+            clienttime_ms: date_now_ms,
+            mobile: mask_kugou_mobile(mobile),
+            key,
+            pk,
+            params,
+            dfid: "-".to_owned(),
+            dev: device.dev.clone(),
+            gitversion: KUGOU_LOGIN_GITVERSION.to_owned(),
+        };
+        serialize_kugou_body(&body)
+    }
+
+    /// 从 `/v7/login_by_verifycode` 响应组装凭据。
+    ///
+    /// `secu_params` 用本次会话密钥解密，里面可能带 `token`/`userid`/`t1`/
+    /// `vip_token` 等；顶层同名字段作为兜底。`t1` 与 `vip_token` 是后续续期和
+    /// VIP 判定所需的关键字段，缺 `t1` 时直接报错，避免又产出一份不可续期凭据。
+    fn credential_from_verifycode_response(
+        value: &Value,
+        device: &KugouDeviceIdentity,
+        session_key: &str,
+        lite_dfid: &str,
+    ) -> Result<ProviderCredential, CatalogError> {
+        let data = response_data(value);
+        let mut token = data.get("token").and_then(value_string);
+        let mut userid = data.get("userid").and_then(value_string);
+        let mut cookies = BTreeMap::new();
+        if let Some(secu_params) = data.get("secu_params").and_then(Value::as_str) {
+            let derived = kugou_md5_hex(session_key);
+            let key = derived.get(..32).unwrap_or(derived.as_str());
+            let iv = derived
+                .get(derived.len().saturating_sub(16)..)
+                .unwrap_or_default();
+            let decrypted =
+                aes_cbc_decrypt_hex(secu_params, key, iv).map_err(kugou_crypto_error)?;
+            let text = String::from_utf8(decrypted).map_err(|error| {
+                CatalogError::InvalidResponse(format!(
+                    "Kugou verifycode payload is not UTF-8: {error}"
+                ))
+            })?;
+            match serde_json::from_str::<Value>(&text) {
+                Ok(Value::Object(map)) => {
+                    for (name, value) in map {
+                        let text = match value {
+                            Value::String(text) => text,
+                            other => value_string(&other).unwrap_or_default(),
+                        };
+                        if text.is_empty() {
+                            continue;
+                        }
+                        if name == "token" {
+                            token = Some(text.clone());
+                        }
+                        if name == "userid" {
+                            userid = Some(text.clone());
+                        }
+                        if KUGOU_CREDENTIAL_COOKIE_NAMES.contains(&name.as_str()) {
+                            cookies.insert(name, text);
+                        }
+                    }
+                }
+                // 上游在旧版本里 secu_params 直接就是令牌本身。
+                _ => token = Some(text),
+            }
+        }
+        for name in ["t1", "vip_type", "vip_token"] {
+            if let Some(value) = data.get(name).and_then(value_string)
+                && !value.trim().is_empty()
+            {
+                cookies.insert(name.to_owned(), value);
+            }
+        }
+        let token = token
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                CatalogError::CredentialRejected(
+                    "Kugou verifycode login returned no session token".to_owned(),
+                )
+            })?;
+        let userid = userid
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                CatalogError::CredentialRejected(
+                    "Kugou verifycode login returned no userid".to_owned(),
+                )
+            })?;
+        // t1 缺失意味着又拿到一份不可续期凭据，必须在登录阶段就暴露。
+        if !cookies
+            .get("t1")
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            return Err(CatalogError::RefreshUnavailable {
+                reason: "kugou_verifycode_login_returned_no_t1: 服务端未下发 t1".to_owned(),
+            });
+        }
+        cookies.insert("KUGOU_API_GUID".to_owned(), device.guid.clone());
+        cookies.insert("KUGOU_API_DEV".to_owned(), device.dev.clone());
+        cookies.insert("KUGOU_API_MAC".to_owned(), device.mac.clone());
+        cookies.insert(
+            "KUGOU_API_MID".to_owned(),
+            kugou_calculate_mid(&device.guid),
+        );
+        // 概念版会话令牌同时作为 Lite 令牌保存，续期与 Lite 取流都使用它。
+        cookies.insert(KUGOU_LITE_TOKEN_COOKIE.to_owned(), token.clone());
+        cookies.retain(|name, _| KUGOU_CREDENTIAL_COOKIE_NAMES.contains(&name.as_str()));
+        // dfid 不是登录响应会下发的字段（上游由客户端生成或复用），必须由调用方
+        // 通过设备注册补齐；凭据保存校验要求 dfid 非空。
+        let dfid = cookies
+            .get("KUGOU_API_DFID")
+            .cloned()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| Some(lite_dfid.trim().to_owned()).filter(|value| !value.is_empty()))
+            .ok_or_else(|| {
+                CatalogError::AuthRequired(
+                    "酷狗登录缺少设备 dfid：请确认设备信息完整后重试".to_owned(),
+                )
+            })?;
+        cookies.insert("KUGOU_API_DFID".to_owned(), dfid.clone());
+        Ok(ProviderCredential::Kugou {
+            token,
+            userid,
+            dfid,
+            cookies,
+        })
+    }
+
     async fn refresh_login_by_token(
         &self,
         credential: &ProviderCredential,
@@ -1894,6 +2133,140 @@ impl KugouAdapter {
             Err(error) => return Err(error),
         };
         Ok(parse_listen_report(&value, "酷狗已接受升级请求"))
+    }
+
+    /// 请求向手机号发送登录验证码（概念版）。
+    ///
+    /// 这会**真实触发短信下发**，因此：
+    /// - 只应在用户显式点击「发送验证码」时调用，实现里不含任何自动重试；
+    /// - 冷却与频控由调用方（登录通道）负责，本方法只做一次请求；
+    /// - 日志与错误里只出现打码手机号。
+    pub async fn send_login_code(&self, mobile: &str) -> Result<(), CatalogError> {
+        let mobile = validate_kugou_mobile(mobile)?;
+        // 上游 captcha_sent.js 在请求体里发送**真实手机号**（打码只用于日志/展示），
+        // 这里必须传原值，否则服务端无法确定收件号码。
+        let body = serialize_kugou_body(&KugouSendMobileCodeBody {
+            businessid: KUGOU_MOBILE_CODE_BUSINESS_ID,
+            mobile: mobile.to_owned(),
+            plat: 3,
+        })?;
+        // 上游 captcha_sent.js 用 cookie.mid 参与签名；这里用设备 MID，缺失回落 "-"。
+        let mid = self
+            .legacy_device
+            .as_ref()
+            .map(|device| kugou_calculate_mid(&device.guid))
+            .unwrap_or_else(|| "-".to_owned());
+        self.post_login_json(URL_SEND_MOBILE_CODE, &body, &mid)
+            .await
+            .map(|_| ())
+    }
+
+    /// 用手机号 + 验证码完成概念版登录，返回可直接持久化的凭据。
+    ///
+    /// 与网页扫码登录的关键差别：这条路径能拿到服务端下发的 `t1` 与 `vip_token`，
+    /// 因此产出的凭据**具备自动续期能力**，不会一登录就掉线。
+    pub async fn login_by_verifycode(
+        &self,
+        mobile: &str,
+        code: &str,
+    ) -> Result<ProviderCredential, CatalogError> {
+        let mobile = validate_kugou_mobile(mobile)?;
+        let code = code.trim();
+        if code.is_empty() {
+            return Err(CatalogError::InvalidResolverLocator(
+                "验证码不能为空".to_owned(),
+            ));
+        }
+        // 登录必须绑定本机设备标识，否则服务端下发的 t1 与后续续期请求的设备不一致。
+        let device = self.legacy_device.clone().ok_or_else(|| {
+            CatalogError::AuthRequired(
+                "酷狗设备信息缺失：请在设置页填写设备 GUID、设备型号与设备 MAC 后再登录".to_owned(),
+            )
+        })?;
+        let date_now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or(0);
+        let session_key = random_lowercase_string(16);
+        let body =
+            Self::login_by_verifycode_body(mobile, code, &device, date_now_ms, &session_key)?;
+        let mid = kugou_calculate_mid(&device.guid);
+        let value = self
+            .post_login_json(URL_LOGIN_BY_VERIFYCODE, &body, &mid)
+            .await?;
+        // 登录响应不含 dfid：用既有设备注册流程换取 Lite dfid，再组装凭据。
+        let lite_dfid = self.register_lite_dfid(&device).await?;
+        Self::credential_from_verifycode_response(&value, &device, &session_key, &lite_dfid)
+    }
+
+    /// 用本机设备标识注册 Lite 设备并取得服务端下发的 dfid。
+    async fn register_lite_dfid(
+        &self,
+        device: &KugouDeviceIdentity,
+    ) -> Result<String, CatalogError> {
+        let guid = device.guid.clone();
+        let dev = device.dev.clone();
+        let mac = device.mac.clone();
+        // `kugou_register_device` 是阻塞实现，放到阻塞线程池避免卡住异步运行时。
+        tokio::task::spawn_blocking(move || {
+            let cookies = BTreeMap::from([
+                ("KUGOU_API_GUID".to_owned(), guid.clone()),
+                ("KUGOU_API_DEV".to_owned(), dev),
+                ("KUGOU_API_MAC".to_owned(), mac),
+            ]);
+            kugou_register_device("", "", &cookies)
+        })
+        .await
+        .map_err(|error| CatalogError::Transient(error.to_string()))?
+    }
+
+    /// 发送登录类请求：概念版登录接口使用专用 UA，且不携带任何已有会话凭据。
+    async fn post_login_json(
+        &self,
+        endpoint: &str,
+        body_text: &str,
+        mid: &str,
+    ) -> Result<Value, CatalogError> {
+        let params = Self::device_params(None, KUGOU_LITE_APPID, KUGOU_LITE_CLIENTVER);
+        let signed = {
+            let mut params = params;
+            params.insert("mid".to_owned(), mid.to_owned());
+            let signature = kugou_android_signature(&params, body_text);
+            params.insert("signature".to_owned(), signature);
+            params
+        };
+        let request = self
+            .client
+            .post(endpoint)
+            .query(&signed)
+            .header("User-Agent", KUGOU_LOGIN_UA)
+            .header("Accept", "*/*")
+            .header(
+                "dfid",
+                signed.get("dfid").map(String::as_str).unwrap_or("-"),
+            )
+            .header(
+                "clienttime",
+                signed.get("clienttime").map(String::as_str).unwrap_or("0"),
+            )
+            .header("mid", mid)
+            .header("kg-rc", "1")
+            .header("kg-thash", "5d816a0")
+            .header("kg-rec", "1")
+            .header("kg-rf", KUGOU_KG_RFC)
+            .header("support-calm", "1")
+            .header("Content-Type", "application/json")
+            .body(body_text.to_owned());
+        // 登录接口是用户显式动作，不受 SSA 冷却影响，但仍按全局节奏节流。
+        pace_kugou_request().await;
+        let response = request.send().await.map_err(classify_request_error)?;
+        classify_status(&response)?;
+        let value = response
+            .json::<Value>()
+            .await
+            .map_err(|error| CatalogError::InvalidResponse(error.to_string()))?;
+        classify_login_response(&value)?;
+        Ok(value)
     }
 
     /// 刷新酷狗 token，并在成功后返回新凭据。
@@ -2989,6 +3362,65 @@ fn kugou_web_credential_is_rejected(response: &Value) -> bool {
 /// 酷狗的长期续期依赖设备绑定的 Lite 会话令牌（`KUGOU_API_TOKEN`）与续期链字段
 /// （`t1`）。网页扫码登录只会下发 Web 会话 Cookie，`KuGoo` 里的 `t1` 恒为空，
 /// 也不会产生 `KUGOU_API_TOKEN`，因此这类凭据在协议上就不具备自动续期能力。
+#[cfg(test)]
+fn login_by_verifycode_body_for_test(
+    mobile: &str,
+    code: &str,
+    device: &KugouDeviceIdentity,
+    date_now_ms: u64,
+    session_key: &str,
+) -> Result<String, CatalogError> {
+    KugouAdapter::login_by_verifycode_body(mobile, code, device, date_now_ms, session_key)
+}
+
+#[cfg(test)]
+fn credential_from_verifycode_response_for_test(
+    value: &Value,
+    device: &KugouDeviceIdentity,
+    session_key: &str,
+    lite_dfid: &str,
+) -> Result<ProviderCredential, CatalogError> {
+    KugouAdapter::credential_from_verifycode_response(value, device, session_key, lite_dfid)
+}
+
+/// 按上游口径打码手机号（保留前 2 位与第 11 位）。
+///
+/// 手机号属于用户个人数据：请求体与日志里都只能是打码形式。
+fn mask_kugou_mobile(mobile: &str) -> String {
+    let chars = mobile.chars().collect::<Vec<_>>();
+    if chars.len() < 11 {
+        return "*".repeat(chars.len().max(1));
+    }
+    let head = chars
+        .get(..2)
+        .unwrap_or_default()
+        .iter()
+        .collect::<String>();
+    let tail = chars
+        .get(10..11)
+        .unwrap_or_default()
+        .iter()
+        .collect::<String>();
+    format!("{head}*****{tail}")
+}
+
+/// 校验手机号是否为大陆 11 位手机号。
+///
+/// 发送验证码会真实触发短信下发，因此必须在本地严格校验，避免把畸形号码
+/// 送到上游（也对应用户侧「输错号码反复发码」的体验）。
+fn validate_kugou_mobile(mobile: &str) -> Result<&str, CatalogError> {
+    let mobile = mobile.trim();
+    let valid =
+        mobile.len() == 11 && mobile.starts_with('1') && mobile.chars().all(|c| c.is_ascii_digit());
+    if valid {
+        Ok(mobile)
+    } else {
+        Err(CatalogError::InvalidResolverLocator(
+            "手机号必须是 11 位数字且以 1 开头".to_owned(),
+        ))
+    }
+}
+
 fn refresh_unavailable_reason(credential: &ProviderCredential) -> String {
     let has_lite_token = KugouAdapter::lite_credential_token(credential).is_some();
     let has_t1 = KugouAdapter::credential_cookie_value(credential, "t1").is_some();
@@ -3225,6 +3657,46 @@ fn parse_listen_report(value: &Value, default_message: &str) -> KugouListenRepor
         vip_days,
         message,
     }
+}
+
+/// 登录接口的业务错误分类。
+///
+/// 登录/发码端点复用 20018/20020 这类通用码，但在登录语境下它们的含义是
+/// 「验证码过期」「验证码错误」等**用户可自助纠正**的问题，不能归成
+/// 「凭据被拒绝」——那会让 UI 提示用户去重新登录，而实际上只需重新获取验证码。
+fn classify_login_response(value: &Value) -> Result<(), CatalogError> {
+    if let Some(error) = kugou_verification_failure(value) {
+        return Err(error);
+    }
+    let status = find_kugou_business_number(value, &["status"]);
+    let error_code = find_kugou_business_number(value, &["error_code", "err_code", "errorCode"]);
+    let response_code = find_kugou_root_business_number(value, "code");
+    let failed = status.is_some_and(|status| status == 0)
+        || error_code.is_some_and(|code| code != 0)
+        || response_code.is_some_and(|code| code != 0);
+    if !failed {
+        return Ok(());
+    }
+    let code = [error_code, response_code, status]
+        .into_iter()
+        .flatten()
+        .find(|code| *code != 0);
+    // 上游把具体原因放在 data 字符串里（如 "验证码过期"）。
+    let detail = response_data(value)
+        .as_str()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned);
+    let message = match (code, detail.as_deref()) {
+        (Some(20020), Some(detail)) => format!("验证码已失效（{detail}），请重新获取"),
+        (Some(20001), _) => "验证码不正确，请检查后重试".to_owned(),
+        (Some(20018), _) => "登录会话已失效，请重新获取验证码".to_owned(),
+        (Some(code), Some(detail)) => format!("酷狗拒绝了本次登录（业务码 {code}：{detail}）"),
+        (Some(code), None) => format!("酷狗拒绝了本次登录（业务码 {code}）"),
+        (None, Some(detail)) => format!("酷狗拒绝了本次登录（{detail}）"),
+        (None, None) => "酷狗拒绝了本次登录".to_owned(),
+    };
+    Err(CatalogError::InvalidResponse(message))
 }
 
 fn classify_business_response(value: &Value) -> Result<(), CatalogError> {
@@ -4477,6 +4949,190 @@ mod login_refresh_endpoint_tests {
             "续期请求必须经证书合法的网关发出: {URL_LOGIN_BY_TOKEN}"
         );
         assert_eq!(KUGOU_LOGIN_ROUTER, "login.user.kugou.com");
+    }
+}
+
+/// 概念版（lite）手机号验证码登录的纯函数测试。
+///
+/// 全部离线：不发送真实短信、不调用真实登录接口。真机验证由
+/// `examples/kugou_phone_login.rs` 手动驱动。
+#[cfg(test)]
+mod phone_login_tests {
+    use super::{
+        KUGOU_LOGIN_PLAT, KugouDeviceIdentity, classify_login_response,
+        credential_from_verifycode_response_for_test, login_by_verifycode_body_for_test,
+        mask_kugou_mobile, validate_kugou_mobile,
+    };
+    use crate::catalog::CatalogError;
+    use serde_json::json;
+
+    fn device() -> KugouDeviceIdentity {
+        KugouDeviceIdentity {
+            guid: "a1b2c3d4e5f60718293a4b5c6d7e8f90".to_owned(),
+            dev: "TESTDEV".to_owned(),
+            mac: "AA:BB:CC:DD:EE:FF".to_owned(),
+        }
+    }
+
+    #[test]
+    fn mobile_is_masked_for_display_but_not_for_the_wire() {
+        // 打码口径沿用上游：保留前 2 位与第 11 位。
+        assert_eq!(mask_kugou_mobile("13800138000"), "13*****0");
+        assert_eq!(mask_kugou_mobile("1"), "*");
+        assert_eq!(mask_kugou_mobile(""), "*");
+    }
+
+    #[test]
+    fn mobile_validation_rejects_malformed_numbers_before_any_sms_is_sent() {
+        // 发码会真实下发短信，本地必须先挡住畸形号码。
+        assert_eq!(validate_kugou_mobile("13800138000").unwrap(), "13800138000");
+        assert_eq!(
+            validate_kugou_mobile(" 13800138000 ").unwrap(),
+            "13800138000"
+        );
+        for bad in [
+            "",
+            "1",
+            "1312353398",
+            "138001380001",
+            "23123533987",
+            "1312353398a",
+            "-",
+            "abcdefghijk",
+        ] {
+            assert!(
+                validate_kugou_mobile(bad).is_err(),
+                "{bad:?} 不应通过手机号校验"
+            );
+        }
+    }
+
+    #[test]
+    fn verifycode_body_carries_lite_identity_and_self_minted_t1() {
+        let body = login_by_verifycode_body_for_test(
+            "13800138000",
+            "000000",
+            &device(),
+            1_700_000_000_000,
+            "abcdefghijklmnop",
+        )
+        .expect("body");
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(value["plat"], json!(KUGOU_LOGIN_PLAT));
+        assert_eq!(value["support_multi"], json!(1));
+        // 请求体里的 mobile 是打码形式（真实号码在加密的 params 里）。
+        assert_eq!(value["mobile"], json!("13*****0"));
+        assert_eq!(value["dev"], json!("TESTDEV"));
+        assert_eq!(value["gitversion"], json!("5f0b7c4"));
+        // t1/t2/pk/params/key 都必须非空，且 t1 不能是占位值。
+        for field in ["t1", "t2", "pk", "params", "key"] {
+            let text = value[field].as_str().unwrap_or_default();
+            assert!(!text.is_empty(), "{field} 不能为空");
+        }
+        assert_ne!(value["t1"], json!("0"));
+        assert_ne!(value["t2"], json!("0"));
+        // 明文手机号绝不能出现在请求体里。
+        assert!(
+            !body.contains("13800138000"),
+            "请求体不得包含明文手机号: {body}"
+        );
+    }
+
+    #[test]
+    fn verifycode_body_is_deterministic_for_the_same_inputs() {
+        // 相同时间戳与会话密钥必须产生完全相同的请求体，否则签名与解密无法复现。
+        let build = || {
+            login_by_verifycode_body_for_test(
+                "13800138000",
+                "000000",
+                &device(),
+                1_700_000_000_000,
+                "abcdefghijklmnop",
+            )
+            .unwrap()
+        };
+        assert_eq!(build(), build());
+    }
+
+    #[test]
+    fn verifycode_response_requires_t1_so_we_never_store_an_unrefreshable_credential() {
+        // 只有 token/userid 没有 t1：必须报错，不能再产出一份「登录即不可续期」的凭据。
+        let value = json!({
+            "status": 1,
+            "error_code": 0,
+            "data": {"token": "tok-123456", "userid": "42"}
+        });
+        let result = credential_from_verifycode_response_for_test(
+            &value,
+            &device(),
+            "abcdefghijklmnop",
+            "lite-dfid",
+        );
+        assert!(
+            matches!(result, Err(CatalogError::RefreshUnavailable { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn verifycode_response_assembles_a_refreshable_credential() {
+        let value = json!({
+            "status": 1,
+            "error_code": 0,
+            "data": {
+                "token": "tok-123456",
+                "userid": "42",
+                "t1": "real-t1",
+                "vip_token": "real-vip",
+                "vip_type": "1"
+            }
+        });
+        let credential = credential_from_verifycode_response_for_test(
+            &value,
+            &device(),
+            "abcdefghijklmnop",
+            "lite-dfid",
+        )
+        .expect("credential");
+        let (token, userid, dfid) = credential.kugou_fields().unwrap();
+        assert_eq!(token, "tok-123456");
+        assert_eq!(userid, "42");
+        // dfid 来自设备注册，凭据保存校验要求它非空。
+        assert_eq!(dfid, "lite-dfid");
+        let cookies = credential.cookies();
+        // 关键：续期所需字段必须齐全，这样 needs_reauth 才不会在导入时被置位。
+        assert_eq!(cookies.get("t1").map(String::as_str), Some("real-t1"));
+        assert_eq!(
+            cookies.get("KUGOU_API_TOKEN").map(String::as_str),
+            Some("tok-123456")
+        );
+        assert_eq!(
+            cookies.get("vip_token").map(String::as_str),
+            Some("real-vip")
+        );
+        assert_eq!(
+            cookies.get("KUGOU_API_DEV").map(String::as_str),
+            Some("TESTDEV")
+        );
+        // 保存校验会拒绝非白名单 Cookie，这里先确保组装结果本身合法。
+        let saved = crate::credentials::validate_for_test(&credential);
+        assert!(saved.is_ok(), "组装出的凭据必须能通过保存校验: {saved:?}");
+    }
+
+    #[test]
+    fn login_errors_are_readable_and_never_leak_credentials() {
+        // 20020 在登录语境下是「验证码过期」，不能当成「凭据被拒」。
+        let expired = json!({"data": "验证码过期", "status": 0, "error_code": 20020});
+        let error = classify_login_response(&expired).unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("验证码已失效"), "{text}");
+        assert!(!text.contains("http"), "错误文本不得包含 URL: {text}");
+
+        // 成功响应不应报错。
+        assert!(
+            classify_login_response(&json!({"status": 1, "error_code": 0, "data": {}})).is_ok()
+        );
     }
 }
 

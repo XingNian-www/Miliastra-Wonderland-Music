@@ -843,6 +843,11 @@ body {
 .app-nav {
   background: var(--nav-bg);
   border-right: 1px solid var(--sep-1);
+  /* macOS 侧边栏是毛玻璃材质（vibrancy）：背后内容透出并被模糊/饱和。
+   * 没有 backdrop-filter 时只是「半透明色块」，看起来像普通网页而非原生窗口。
+   * 加 saturate 让透出的颜色更鲜明，这是 macOS/AppKit 的既有配方。 */
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
 }
 
 .nav-link.active {
@@ -862,6 +867,9 @@ body {
 .topbar {
   background: var(--topbar-bg);
   border-bottom: 1px solid var(--sep-1);
+  /* 顶栏同属「窗口 chrome」，与侧边栏一致的毛玻璃，两者拼成连续的窗框。 */
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
 }
 
 .config-sidebar {

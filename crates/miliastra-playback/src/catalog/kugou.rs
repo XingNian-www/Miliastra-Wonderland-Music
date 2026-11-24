@@ -40,7 +40,16 @@ const KUGOU_LITE_CLIENTVER: i64 = 11440;
 const KUGOU_ANDROID_APPID: i64 = 1005;
 const KUGOU_ANDROID_CLIENTVER: i64 = 20489;
 /// 登录续期端点与固定密钥（上游 module/login_token.js）。
-const URL_LOGIN_BY_TOKEN: &str = "https://login.user.kugou.com/v5/login_by_token";
+///
+/// 请求经 `gateway.kugou.com` 发出，并用 `x-router` 头路由到 `login.user.kugou.com`，
+/// 与上游 `module/login.js` 的做法完全一致。不能直接请求
+/// `https://login.user.kugou.com/v5/login_by_token`：该主机证书只含 `*.kugou.com`，
+/// 而通配符不覆盖 `login.user.` 这个两级子域，严格 TLS 校验证书必然失败，
+/// 续期在传输层就会中断（用户可见后果是刷新静默失效、token 过期即掉登录）。
+/// `x-router` 是酷狗网关的内部路由头；若上游调整路由方式需重新复核此约定。
+const URL_LOGIN_BY_TOKEN: &str = "https://gateway.kugou.com/v5/login_by_token";
+/// `/v5/login_by_token` 的路由目标。仅用于 `x-router` 请求头，不用于拼接 URL。
+const KUGOU_LOGIN_ROUTER: &str = "login.user.kugou.com";
 const KUGOU_LITE_LOGIN_TOKEN_KEY: &str = "c24f74ca2820225badc01946dba4fdf7";
 const KUGOU_LITE_LOGIN_TOKEN_IV: &str = "adc01946dba4fdf7";
 const KUGOU_LITE_LOGIN_T2_KEY: &str = "fd14b35e3f81af3817a20ae7adae7020";
@@ -1570,7 +1579,7 @@ impl KugouAdapter {
                 Vec::new(),
                 Some(&body),
                 Some(credential),
-                &[],
+                &[("x-router", KUGOU_LOGIN_ROUTER)],
             )
             .await?;
         let data = response_data(&value);
@@ -1826,7 +1835,7 @@ impl KugouAdapter {
             play_end: now_ms,
             play_start: now_ms.saturating_sub(KUGOU_VIP_AD_PLAY_MS),
         })?;
-        let (value, _) = self
+        let value = match self
             .post_json_text_direct_with_headers(
                 URL_YOUTH_VIP,
                 Vec::new(),
@@ -1834,83 +1843,105 @@ impl KugouAdapter {
                 Some(&credential),
                 &[],
             )
-            .await?;
-        let data = response_data(&value);
-        let code = value
-            .get("code")
-            .and_then(value_u64)
-            .or_else(|| data.get("code").and_then(value_u64));
-        let vip_days = data
-            .get("vip_days")
-            .or_else(|| data.get("vipDays"))
-            .and_then(value_u64)
-            .unwrap_or(0) as u32;
-        Ok(KugouListenReport {
-            accepted: code == Some(0),
-            vip_days,
-            message: value
-                .get("message")
-                .or_else(|| data.get("message"))
-                .and_then(Value::as_str)
-                .unwrap_or("酷狗已接受广告播放上报")
-                .to_owned(),
-        })
+            .await
+        {
+            Ok((value, _)) => value,
+            // token 过期/被拒时先续期再重试一次：领取 VIP 是用户显式动作，
+            // 值得为一次可能的续期多花一个请求。
+            Err(CatalogError::CredentialRejected(_)) => {
+                let refreshed = self.refresh_token(&credential).await?;
+                let body = serialize_kugou_body(&KugouAdPlayReportBody {
+                    ad_id: KUGOU_VIP_AD_ID,
+                    play_end: now_ms,
+                    play_start: now_ms.saturating_sub(KUGOU_VIP_AD_PLAY_MS),
+                })?;
+                self.post_json_text_direct_with_headers(
+                    URL_YOUTH_VIP,
+                    Vec::new(),
+                    Some(&body),
+                    Some(&refreshed),
+                    &[],
+                )
+                .await?
+                .0
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(parse_listen_report(&value, "酷狗已接受广告播放上报"))
     }
 
     /// 测试版（概念版/lite）升级 VIP：听歌奖励升级。
     pub async fn upgrade_vip(&self) -> Result<KugouListenReport, CatalogError> {
         let credential = self.credential()?;
         let (_, userid, _) = Self::credential_fields(&credential)?;
-        let (value, _) = self
+        let query = vec![("kugouid", userid.to_owned()), ("ad_type", "1".to_owned())];
+        let value = match self
             .post_json_direct(
                 URL_YOUTH_VIP_UPGRADE,
-                vec![("kugouid", userid.to_owned()), ("ad_type", "1".to_owned())],
+                query.clone(),
                 None,
                 Some(&credential),
             )
-            .await?;
-        let data = response_data(&value);
-        let code = value
-            .get("code")
-            .and_then(value_u64)
-            .or_else(|| data.get("code").and_then(value_u64));
-        let vip_days = data
-            .get("vip_days")
-            .or_else(|| data.get("vipDays"))
-            .and_then(value_u64)
-            .unwrap_or(0) as u32;
-        Ok(KugouListenReport {
-            accepted: code == Some(0),
-            vip_days,
-            message: value
-                .get("message")
-                .or_else(|| data.get("message"))
-                .and_then(Value::as_str)
-                .unwrap_or("酷狗已接受升级请求")
-                .to_owned(),
-        })
+            .await
+        {
+            Ok((value, _)) => value,
+            Err(CatalogError::CredentialRejected(_)) => {
+                let refreshed = self.refresh_token(&credential).await?;
+                self.post_json_direct(URL_YOUTH_VIP_UPGRADE, query, None, Some(&refreshed))
+                    .await?
+                    .0
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(parse_listen_report(&value, "酷狗已接受升级请求"))
     }
 
     /// 刷新酷狗 token，并在成功后返回新凭据。
+    ///
+    /// 结果分三类，调用方必须区别对待：
+    /// 1. `Ok(新凭据)`：Lite 续期真正换到了新令牌，`KUGOU_API_TOKEN`/`t1` 已更新；
+    /// 2. `Err(RefreshUnavailable)`：上游明确拒绝为这份凭据续期（典型是网页扫码登录
+    ///    得到的凭据缺 `t1`，协议上就没有续期能力）。凭据当前仍可用，调用方应保留它
+    ///    并标记需要重新登录，**不要**当成登录失败；
+    /// 3. 其他 `Err`：网络、TLS、风控等真实故障，同样不得伪装成成功。
+    ///
+    /// 这里绝不返回「看起来成功但其实没换令牌」的结果：早期实现会在续期失败后回落
+    /// `validate_web_credential` 并返回原凭据，使上层认为续期成功、把旧凭据原样写回，
+    /// token 真过期时用户就毫无提示地掉登录。
     pub async fn refresh_token(
         &self,
         credential: &ProviderCredential,
     ) -> Result<ProviderCredential, CatalogError> {
         let credential = self.credential_with_device(credential);
         // 首选设备绑定的 Lite 续期（/v5/login_by_token）：它把登录会话绑定到
-        // 本机设备标识，并返回供 Lite/Android 请求使用的令牌。缺少设备标识、
-        // 或上游未返回新令牌时，退回 Web 会话校验并返回仍有效的快照。
+        // 本机设备标识，并返回供 Lite/Android 请求使用的令牌。
         if Self::has_lite_device_identity(&credential) {
             match self.refresh_login_by_token(&credential).await {
                 Ok(refreshed) => return Ok(refreshed),
                 Err(error @ CatalogError::VerificationRequired(_)) => return Err(error),
+                // 上游明确拒绝续期：这份凭据在协议上无法续期。先确认会话本身是否
+                // 仍然有效，以区分「凭据还能用、只是不能续期」和「凭据已经失效」。
+                Err(error @ CatalogError::CredentialRejected(_)) => {
+                    log::warn!("酷狗 Lite 登录续期被上游拒绝，检查 Web 会话是否仍有效: {error}");
+                    return match self.validate_web_credential(&credential).await {
+                        Ok(()) => Err(CatalogError::RefreshUnavailable {
+                            reason: refresh_unavailable_reason(&credential),
+                        }),
+                        Err(session_error) => Err(session_error),
+                    };
+                }
                 Err(error) => {
-                    log::debug!("酷狗 Lite 登录续期未成功，回落到 Web 会话校验: {error}");
+                    log::warn!("酷狗 Lite 登录续期失败，未替换现有凭据: {error}");
+                    return Err(error);
                 }
             }
         }
+        // 缺少 Lite 设备标识时无法发起设备绑定续期。此时只判断会话是否仍有效：
+        // 有效就明确说明「该凭据不支持长期续期」，绝不能返回原凭据冒充续期成功。
         self.validate_web_credential(&credential).await?;
-        Ok(credential)
+        Err(CatalogError::RefreshUnavailable {
+            reason: refresh_unavailable_reason(&credential),
+        })
     }
 
     /// 解析 get_union_vip 系列响应中的 VIP 判定字段（is_vip / vip_type / vip）。
@@ -2953,6 +2984,29 @@ fn kugou_web_credential_is_rejected(response: &Value) -> bool {
     })
 }
 
+/// 说明为什么这份酷狗凭据无法自动续期（供结构化状态与用户提示复用）。
+///
+/// 酷狗的长期续期依赖设备绑定的 Lite 会话令牌（`KUGOU_API_TOKEN`）与续期链字段
+/// （`t1`）。网页扫码登录只会下发 Web 会话 Cookie，`KuGoo` 里的 `t1` 恒为空，
+/// 也不会产生 `KUGOU_API_TOKEN`，因此这类凭据在协议上就不具备自动续期能力。
+fn refresh_unavailable_reason(credential: &ProviderCredential) -> String {
+    let has_lite_token = KugouAdapter::lite_credential_token(credential).is_some();
+    let has_t1 = KugouAdapter::credential_cookie_value(credential, "t1").is_some();
+    if has_lite_token && has_t1 {
+        // 字段齐全却被上游拒绝：属于凭据与服务端会话状态不一致，需要重新登录。
+        return "kugou_refresh_rejected: 上游拒绝了支撑续期的 Lite 会话，请重新登录".to_owned();
+    }
+    let missing = match (has_lite_token, has_t1) {
+        (false, false) => "KUGOU_API_TOKEN 与 t1",
+        (false, true) => "KUGOU_API_TOKEN",
+        _ => "t1",
+    };
+    format!(
+        "kugou_web_credential_not_refreshable: 该凭据由网页扫码登录产生，缺少 {missing}，\
+         协议上不支持自动续期；token 过期后需要重新登录"
+    )
+}
+
 fn validate_web_credential_response(response: &Value) -> Result<(), CatalogError> {
     if !response.is_object() {
         return Err(CatalogError::InvalidResponse(
@@ -3115,6 +3169,62 @@ fn kugou_verification_failure(value: &Value) -> Option<CatalogError> {
         Some(hint) => hint,
         None => "errcode 20028",
     }))
+}
+
+/// 酷狗 youth/VIP 端点已知的业务拒绝码。
+///
+/// 51002 在 `ad/play_report` 与 `upgrade_vip_reward` 上都出现过，且与签名、appid、
+/// 请求参数无关（已用真实凭据逐一排除），属于上游对「账号/活动资格」的业务拒绝。
+/// 这里只做可读化，不尝试绕过。
+fn kugou_youth_error_message(code: Option<i64>) -> Option<&'static str> {
+    match code {
+        Some(51002) => Some(
+            "酷狗拒绝领取（业务码 51002）：账号或活动资格不满足，可能需要真实播放态或该活动未对你开放",
+        ),
+        Some(20018) | Some(20020) | Some(30020) => Some("酷狗登录态已失效，请重新登录后再领取"),
+        Some(20001) | Some(20019) => Some("酷狗拒绝了本次请求参数，请稍后重试"),
+        _ => None,
+    }
+}
+
+/// 解析 youth/VIP 端点的领取结果。
+///
+/// 业务拒绝码必须转成可读文案：早期实现把 51002 之类的拒绝统一压成
+/// "Kugou API returned an error response"，用户完全无法判断是网络问题、
+/// 登录问题还是资格问题。
+fn parse_listen_report(value: &Value, default_message: &str) -> KugouListenReport {
+    let data = response_data(value);
+    let code = value
+        .get("code")
+        .and_then(value_u64)
+        .or_else(|| data.get("code").and_then(value_u64));
+    let error_code = kugou_business_error_code(value);
+    let vip_days = data
+        .get("vip_days")
+        .or_else(|| data.get("vipDays"))
+        .and_then(value_u64)
+        .unwrap_or(0) as u32;
+    let accepted = code == Some(0) && error_code.is_none();
+    let message = if accepted {
+        value
+            .get("message")
+            .or_else(|| data.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or(default_message)
+            .to_owned()
+    } else {
+        kugou_youth_error_message(error_code)
+            .map(str::to_owned)
+            .unwrap_or_else(|| match error_code {
+                Some(code) => format!("酷狗拒绝了本次领取（业务码 {code}）"),
+                None => default_message.to_owned(),
+            })
+    };
+    KugouListenReport {
+        accepted,
+        vip_days,
+        message,
+    }
 }
 
 fn classify_business_response(value: &Value) -> Result<(), CatalogError> {
@@ -4339,6 +4449,34 @@ mod tests {
         );
         assert_eq!(parse_kugou_datetime_ms(""), None);
         assert_eq!(parse_kugou_datetime_ms("2026-09-12"), None);
+    }
+}
+
+/// 登录续期端点的回归测试。
+///
+/// 背景：`login.user.kugou.com` 的证书只覆盖 `*.kugou.com`，而通配符不匹配
+/// `login.user.` 这个两级子域，直连该主机时严格 TLS 校验必然失败，续期在传输层
+/// 就中断（用户可见后果是刷新静默失效、token 过期即掉登录）。
+#[cfg(test)]
+mod login_refresh_endpoint_tests {
+    use super::{KUGOU_LOGIN_ROUTER, URL_LOGIN_BY_TOKEN};
+
+    #[test]
+    fn login_refresh_uses_gateway_with_router_header_over_https() {
+        assert!(
+            URL_LOGIN_BY_TOKEN.starts_with("https://"),
+            "续期端点必须使用 HTTPS，不得明文传输登录凭据: {URL_LOGIN_BY_TOKEN}"
+        );
+        assert!(
+            !URL_LOGIN_BY_TOKEN.contains("login.user.kugou.com"),
+            "不得直连证书不覆盖的 login.user.kugou.com: {URL_LOGIN_BY_TOKEN}"
+        );
+        // 网关主机名只有一层子域，`*.kugou.com` 可以覆盖，严格校验可通过。
+        assert!(
+            URL_LOGIN_BY_TOKEN.starts_with("https://gateway.kugou.com/"),
+            "续期请求必须经证书合法的网关发出: {URL_LOGIN_BY_TOKEN}"
+        );
+        assert_eq!(KUGOU_LOGIN_ROUTER, "login.user.kugou.com");
     }
 }
 

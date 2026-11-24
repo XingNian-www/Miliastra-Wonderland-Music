@@ -241,11 +241,21 @@ impl ProviderCredential {
                 token,
                 userid,
                 dfid,
-                ..
+                cookies,
             } => BTreeMap::from([
                 ("token", has_value(token)),
                 ("userId", has_value(userid)),
                 ("dfid", has_value(dfid)),
+                // 长期续期依赖设备绑定的 Lite 会话令牌与续期链字段。网页扫码登录
+                // 不会下发这两项，UI 据此提示「该凭据不支持自动续期」。
+                (
+                    "liteToken",
+                    has_value(cookies.get("KUGOU_API_TOKEN").map_or("", |v| v.as_str())),
+                ),
+                (
+                    "t1",
+                    has_value(cookies.get("t1").map_or("", |v| v.as_str())),
+                ),
             ]),
         };
         CredentialStatus {
@@ -272,8 +282,46 @@ impl ProviderCredential {
             last_refresh_at_ms: None,
             next_refresh_check_at_ms: None,
             last_refresh_error: None,
+            // 结构上不具备续期能力的酷狗凭据（网页扫码登录产物）在导入时就明确标记，
+            // 不等 token 过期才让用户发现。
+            needs_reauth: matches!(self, Self::Kugou { .. }) && !kugou_refresh_capable(self),
+            needs_reauth_reason: (matches!(self, Self::Kugou { .. })
+                && !kugou_refresh_capable(self))
+            .then(|| KUGOU_NOT_REFRESHABLE_CODE.to_owned()),
         }
     }
+}
+
+/// 与 `catalog::kugou::refresh_unavailable_reason` 使用同一个机器可读码，
+/// UI 可据此选择文案。
+pub(crate) const KUGOU_NOT_REFRESHABLE_CODE: &str = "kugou_web_credential_not_refreshable";
+
+/// 酷狗凭据是否具备自动续期能力。
+///
+/// 续期协议要求设备绑定的 Lite 会话令牌（`KUGOU_API_TOKEN`）和续期链字段（`t1`）。
+/// 网页扫码登录只下发 Web 会话 Cookie，`KuGoo` 里的 `t1` 恒为空且没有
+/// `KUGOU_API_TOKEN`，因此这类凭据在协议上无法自动续期。
+fn kugou_refresh_capable(credential: &ProviderCredential) -> bool {
+    let ProviderCredential::Kugou { cookies, .. } = credential else {
+        return false;
+    };
+    ["KUGOU_API_TOKEN", "t1"].into_iter().all(|name| {
+        cookies.get(name).is_some_and(|value| {
+            let value = value.trim();
+            !value.is_empty() && !value.eq_ignore_ascii_case("undefined") && value != "-"
+        })
+    })
+}
+
+/// 一次凭据续期的结果分类。
+///
+/// `NeedsReauth` 与 `Failed` 必须分开：前者代表「凭据仍然可用，但上游明确拒绝为它
+/// 续期」，属于能力边界，要提示用户重新登录；后者是网络/风控等真实故障，可以重试。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RefreshOutcome {
+    Succeeded,
+    NeedsReauth(String),
+    Failed,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -283,6 +331,11 @@ struct RefreshMetadata {
     next_refresh_check_at_ms: Option<u64>,
     next_account_status_check_at_ms: Option<u64>,
     last_error: Option<String>,
+    /// 上游明确拒绝续期、需要用户重新登录。持久化以确保重启后仍能提示用户。
+    #[serde(default)]
+    needs_reauth: bool,
+    #[serde(default)]
+    needs_reauth_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -301,6 +354,15 @@ pub struct CredentialStatus {
     pub next_refresh_check_at_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_refresh_error: Option<String>,
+    /// 需要用户重新登录才能恢复自动续期。
+    ///
+    /// 只在「凭据仍可用、但上游明确拒绝为其续期」时置位（例如酷狗网页扫码登录
+    /// 产生的凭据缺少 Lite 续期字段）。绝不会出现 `needs_reauth` 为假、而本次刷新
+    /// 实际没有换到新令牌的情况。
+    pub needs_reauth: bool,
+    /// `needs_reauth` 为真时给出机器可读原因（如 `kugou_web_credential_not_refreshable`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub needs_reauth_reason: Option<String>,
 }
 
 impl CredentialStatus {
@@ -336,6 +398,8 @@ impl CredentialStatus {
             last_refresh_at_ms: None,
             next_refresh_check_at_ms: None,
             last_refresh_error: None,
+            needs_reauth: false,
+            needs_reauth_reason: None,
         }
     }
 }
@@ -483,6 +547,16 @@ impl CredentialStore {
             status.last_refresh_at_ms = metadata.last_refresh_at_ms;
             status.next_refresh_check_at_ms = metadata.next_refresh_check_at_ms;
             status.last_refresh_error = metadata.last_error;
+            status.needs_reauth = metadata.needs_reauth || status.needs_reauth;
+            if status.needs_reauth_reason.is_none() {
+                status.needs_reauth_reason = metadata.needs_reauth_reason;
+            }
+            // 已经确认需要重新登录时不再参与自动刷新调度：否则后台循环会按
+            // refresh_check 周期反复失败、反复 warn，把日志淹掉。用户手动点
+            // 刷新仍然允许尝试（手动路径不读 refresh_ready）。
+            if status.needs_reauth {
+                status.refresh_ready = false;
+            }
         }
         Ok(status)
     }
@@ -573,7 +647,11 @@ impl CredentialStore {
         next_check_at_ms: Option<u64>,
     ) -> Result<(), CredentialError> {
         let provider = canonical_provider(provider)?;
-        let persisted = self.write_refresh_metadata(provider, result, next_check_at_ms);
+        let outcome = match result {
+            Ok(()) => RefreshOutcome::Succeeded,
+            Err(_) => RefreshOutcome::Failed,
+        };
+        let persisted = self.write_refresh_metadata(provider, outcome, next_check_at_ms);
         self.release_refresh_lease(provider);
         persisted
     }
@@ -586,7 +664,7 @@ impl CredentialStore {
         &self,
         provider: &str,
         expected_revision: Option<u64>,
-        result: Result<(), String>,
+        result: RefreshOutcome,
         next_check_at_ms: Option<u64>,
     ) -> Result<bool, CredentialError> {
         let provider = canonical_provider(provider)?;
@@ -700,18 +778,24 @@ impl CredentialStore {
     fn write_refresh_metadata(
         &self,
         provider: &'static str,
-        result: Result<(), String>,
+        result: RefreshOutcome,
         next_check_at_ms: Option<u64>,
     ) -> Result<(), CredentialError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis() as u64)
             .ok();
-        let (state, error) = match result {
-            Ok(()) => ("success", None),
-            // refresh-state.json 会被 Web 状态接口读取，绝不能把请求 URL、cookie
-            // 或 provider 原始错误持久化进去。
-            Err(_) => ("failed", Some("refresh_failed".to_owned())),
+        // refresh-state.json 会被 Web 状态接口读取，绝不能把请求 URL、cookie
+        // 或 provider 原始错误持久化进去。
+        let (state, error, needs_reauth, needs_reauth_reason) = match result {
+            RefreshOutcome::Succeeded => ("success", None, false, None),
+            RefreshOutcome::NeedsReauth(reason) => (
+                "failed",
+                Some("refresh_requires_reauth".to_owned()),
+                true,
+                Some(reason),
+            ),
+            RefreshOutcome::Failed => ("failed", Some("refresh_failed".to_owned()), false, None),
         };
         let updated = {
             let mut metadata = self
@@ -729,6 +813,8 @@ impl CredentialStore {
                     next_refresh_check_at_ms: next_check_at_ms,
                     next_account_status_check_at_ms,
                     last_error: error,
+                    needs_reauth,
+                    needs_reauth_reason,
                 },
             );
             metadata.clone()
@@ -998,6 +1084,8 @@ impl CredentialStore {
                     next_refresh_check_at_ms: refresh_supported.then_some(next_check_at_ms),
                     next_account_status_check_at_ms: Some(next_check_at_ms),
                     last_error: None,
+                    needs_reauth: false,
+                    needs_reauth_reason: None,
                 },
             );
             metadata.clone()
@@ -1489,9 +1577,28 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        CredentialStore, DAILY_REFRESH_INTERVAL_MS, ProviderCredential, REFRESH_STATE_FILE,
-        epoch_ms, qq_refresh_key_is_wechat, qq_refresh_ready,
+        CredentialStore, DAILY_REFRESH_INTERVAL_MS, KUGOU_NOT_REFRESHABLE_CODE, ProviderCredential,
+        REFRESH_STATE_FILE, RefreshOutcome, epoch_ms, kugou_refresh_capable,
+        qq_refresh_key_is_wechat, qq_refresh_ready,
     };
+
+    fn kugou_credential(cookies: BTreeMap<String, String>) -> ProviderCredential {
+        ProviderCredential::Kugou {
+            token: "web-token".to_owned(),
+            userid: "42".to_owned(),
+            dfid: "web-dfid".to_owned(),
+            cookies,
+        }
+    }
+
+    /// 具备 Lite 续期字段的凭据：导入时不会被标记 needs_reauth，
+    /// 用于隔离「刷新元数据」这条路径本身。
+    fn refreshable_kugou_credential() -> ProviderCredential {
+        kugou_credential(BTreeMap::from([
+            ("KUGOU_API_TOKEN".to_owned(), "lite-token".to_owned()),
+            ("t1".to_owned(), "t1-value".to_owned()),
+        ]))
+    }
 
     #[test]
     fn qq_refresh_requires_a_complete_supported_credential_set() {
@@ -2068,6 +2175,129 @@ mod tests {
         let status = serde_json::to_string(&store.status("bilibili").unwrap()).unwrap();
         assert!(status.contains("\"refreshToken\":true"));
         assert!(!status.contains("independent-refresh"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn kugou_web_credential_is_reported_as_unable_to_refresh() {
+        // 网页扫码登录产出的凭据：KuGoo 里 t1 为空，也没有 KUGOU_API_TOKEN。
+        let web = kugou_credential(BTreeMap::from([(
+            "KuGoo".to_owned(),
+            "t=web-token&KugooID=42&t1=".to_owned(),
+        )]));
+        assert!(!kugou_refresh_capable(&web));
+        let status = web.presence();
+        assert!(
+            status.needs_reauth,
+            "缺少 Lite 续期字段的酷狗凭据在导入时就应标记需要重新登录"
+        );
+        assert_eq!(
+            status.needs_reauth_reason.as_deref(),
+            Some(KUGOU_NOT_REFRESHABLE_CODE)
+        );
+        let fields = &status.fields;
+        assert_eq!(fields.get("liteToken"), Some(&false));
+        assert_eq!(fields.get("t1"), Some(&false));
+
+        // 带完整 Lite 续期字段的凭据不应被误标。
+        let lite = kugou_credential(BTreeMap::from([
+            ("KUGOU_API_TOKEN".to_owned(), "lite-token".to_owned()),
+            ("t1".to_owned(), "t1-value".to_owned()),
+        ]));
+        assert!(kugou_refresh_capable(&lite));
+        let status = lite.presence();
+        assert!(!status.needs_reauth);
+        assert!(status.needs_reauth_reason.is_none());
+        assert!(status.refresh_ready);
+        assert_eq!(status.fields.get("liteToken"), Some(&true));
+        assert_eq!(status.fields.get("t1"), Some(&true));
+    }
+
+    #[test]
+    fn kugou_placeholder_lite_fields_do_not_count_as_refreshable() {
+        // "-"、"undefined" 与空白都是缺省占位值，不能当成真的拿到了续期令牌。
+        for placeholder in ["", "-", "undefined", "   "] {
+            let credential = kugou_credential(BTreeMap::from([
+                ("KUGOU_API_TOKEN".to_owned(), placeholder.to_owned()),
+                ("t1".to_owned(), placeholder.to_owned()),
+            ]));
+            assert!(
+                !kugou_refresh_capable(&credential),
+                "占位值 {placeholder:?} 不应被视为可续期"
+            );
+        }
+    }
+
+    #[test]
+    fn needs_reauth_disables_automatic_refresh_but_is_persisted() {
+        let directory = std::env::temp_dir().join(format!(
+            "miliastra-kugou-reauth-{}-{}",
+            std::process::id(),
+            epoch_ms()
+        ));
+        let store = CredentialStore::open(directory.clone()).unwrap();
+        store.save("kugou", refreshable_kugou_credential()).unwrap();
+        let revision = store.snapshot("kugou").unwrap().unwrap().revision;
+        assert!(!store.status("kugou").unwrap().needs_reauth);
+
+        store
+            .mark_refresh_finished_if_current_revision(
+                "kugou",
+                Some(revision),
+                RefreshOutcome::NeedsReauth(KUGOU_NOT_REFRESHABLE_CODE.to_owned()),
+                Some(epoch_ms() + 60_000),
+            )
+            .unwrap();
+
+        let status = store.status("kugou").unwrap();
+        assert!(status.needs_reauth);
+        assert_eq!(
+            status.needs_reauth_reason.as_deref(),
+            Some(KUGOU_NOT_REFRESHABLE_CODE)
+        );
+        assert!(
+            !status.refresh_ready,
+            "needs_reauth 后必须停止自动刷新调度，否则后台循环会按周期反复失败、刷屏日志"
+        );
+        // 失败原因只能是稳定码，不得把凭据或 URL 写进状态文件。
+        assert_eq!(
+            status.last_refresh_error.as_deref(),
+            Some("refresh_requires_reauth")
+        );
+
+        // 重启后标记仍在，用户不会因为重启就丢失提示。
+        drop(store);
+        let reopened = CredentialStore::open(directory.clone()).unwrap();
+        let status = reopened.status("kugou").unwrap();
+        assert!(status.needs_reauth);
+        assert!(!status.refresh_ready);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn concurrent_refresh_outcomes_do_not_overwrite_newer_login() {
+        let directory = std::env::temp_dir().join(format!(
+            "miliastra-kugou-concurrent-{}-{}",
+            std::process::id(),
+            epoch_ms()
+        ));
+        let store = CredentialStore::open(directory.clone()).unwrap();
+        store.save("kugou", refreshable_kugou_credential()).unwrap();
+        let stale_revision = store.snapshot("kugou").unwrap().unwrap().revision;
+
+        // 用户在刷新期间重新登录：凭据版本前进，旧网络任务的结果必须被丢弃。
+        store.save("kugou", refreshable_kugou_credential()).unwrap();
+        let written = store
+            .mark_refresh_finished_if_current_revision(
+                "kugou",
+                Some(stale_revision),
+                RefreshOutcome::NeedsReauth(KUGOU_NOT_REFRESHABLE_CODE.to_owned()),
+                Some(epoch_ms() + 60_000),
+            )
+            .unwrap();
+        assert!(!written, "旧版本的刷新结果不得写入");
+        let status = store.status("kugou").unwrap();
+        assert!(!status.needs_reauth, "新登录的凭据不能被旧刷新结果污染");
         fs::remove_dir_all(directory).unwrap();
     }
 }

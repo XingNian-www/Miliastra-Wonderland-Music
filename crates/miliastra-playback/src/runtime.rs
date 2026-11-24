@@ -10,6 +10,7 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 use tokio::task::{AbortHandle, Id as TaskId, JoinError, JoinHandle as TokioJoinHandle, JoinSet};
 use uuid::Uuid;
 
+use crate::catalog::CatalogError;
 use crate::catalog::{
     BilibiliAdapter, CredentialRefreshAdapter, KugouAccountStatus, KugouAdapter, KugouListenReport,
     NeteaseAdapter, ProviderAccountStatus, ProviderId, ProviderRegistry, QqMusicAdapter,
@@ -18,7 +19,7 @@ use crate::catalog::{
 use crate::core::{PlaybackCore, PlaybackCoreError};
 use crate::credentials::{
     CredentialRefreshLease, CredentialStatus, CredentialStore, DAILY_REFRESH_INTERVAL_MS,
-    ProviderCredential,
+    ProviderCredential, RefreshOutcome,
 };
 use crate::domain::{
     EndBehavior, EndCause, EngineState, Failure, PlaybackSnapshot as EngineSnapshot, SearchSpec,
@@ -1784,14 +1785,32 @@ async fn refresh_kugou_credential(
                 "provider_auth_required",
                 "该平台尚未登录",
             )));
-            return finish_refresh(credentials, provider, None, false, refresh_lease, result).await;
+            return finish_refresh(
+                credentials,
+                provider,
+                None,
+                false,
+                refresh_lease,
+                result,
+                RefreshOutcome::Failed,
+            )
+            .await;
         }
         Err(error) => {
             let result = Err(internal_error(error));
-            return finish_refresh(credentials, provider, None, false, refresh_lease, result).await;
+            return finish_refresh(
+                credentials,
+                provider,
+                None,
+                false,
+                refresh_lease,
+                result,
+                RefreshOutcome::Failed,
+            )
+            .await;
         }
     };
-    let (result, credential_written) = match core
+    let (result, credential_written, outcome) = match core
         .refresh_kugou_credential(&snapshot.credential)
         .await
     {
@@ -1799,12 +1818,25 @@ async fn refresh_kugou_credential(
             match save_refreshed_credential(credentials, provider, snapshot.revision, credential)
                 .await
             {
-                Ok(Some(status)) => (Ok(status), true),
-                Ok(None) => (Err(refresh_superseded()), false),
-                Err(error) => (Err(error), false),
+                Ok(Some(status)) => (Ok(status), true, RefreshOutcome::Succeeded),
+                Ok(None) => (Err(refresh_superseded()), false, RefreshOutcome::Failed),
+                Err(error) => (Err(error), false, RefreshOutcome::Failed),
             }
         }
-        Err(error) => (Err(refresh_failure(error)), false),
+        // 上游明确拒绝为这份凭据续期（典型是网页扫码登录产生的、缺少 Lite
+        // 续期字段的凭据）。凭据本身仍然可用，保留它、只标记需要重新登录，
+        // 不要当成登录失败把用户踢下线。
+        Err(PlaybackCoreError::Catalog(CatalogError::RefreshUnavailable { reason })) => {
+            let status = credentials
+                .status(provider.as_str())
+                .map_err(internal_error);
+            (
+                status,
+                false,
+                RefreshOutcome::NeedsReauth(refresh_reauth_reason(&reason)),
+            )
+        }
+        Err(error) => (Err(refresh_failure(error)), false, RefreshOutcome::Failed),
     };
     finish_refresh(
         credentials,
@@ -1813,6 +1845,7 @@ async fn refresh_kugou_credential(
         credential_written,
         refresh_lease,
         result,
+        outcome,
     )
     .await
 }
@@ -1832,18 +1865,36 @@ async fn refresh_manual_credential(
     let snapshot = match credentials.snapshot(provider.as_str()) {
         Err(error) => {
             let result = Err(internal_error(error));
-            return finish_refresh(credentials, provider, None, false, refresh_lease, result).await;
+            return finish_refresh(
+                credentials,
+                provider,
+                None,
+                false,
+                refresh_lease,
+                result,
+                RefreshOutcome::Failed,
+            )
+            .await;
         }
         Ok(None) => {
             let result = Err(PlaybackError::Failure(Failure::new(
                 "provider_auth_required",
                 "该平台尚未登录",
             )));
-            return finish_refresh(credentials, provider, None, false, refresh_lease, result).await;
+            return finish_refresh(
+                credentials,
+                provider,
+                None,
+                false,
+                refresh_lease,
+                result,
+                RefreshOutcome::Failed,
+            )
+            .await;
         }
         Ok(Some(snapshot)) => snapshot,
     };
-    let (result, credential_written) = match core
+    let (result, credential_written, outcome) = match core
         .refresh_credential(provider, &snapshot.credential)
         .await
     {
@@ -1851,9 +1902,9 @@ async fn refresh_manual_credential(
             match save_refreshed_credential(credentials, provider, snapshot.revision, refreshed)
                 .await
             {
-                Ok(Some(status)) => (Ok(status), true),
-                Ok(None) => (Err(refresh_superseded()), false),
-                Err(error) => (Err(error), false),
+                Ok(Some(status)) => (Ok(status), true, RefreshOutcome::Succeeded),
+                Ok(None) => (Err(refresh_superseded()), false, RefreshOutcome::Failed),
+                Err(error) => (Err(error), false, RefreshOutcome::Failed),
             }
         }
         // 凭据仍有效、无需刷新：视为正常完成，不记录失败状态，
@@ -1863,8 +1914,9 @@ async fn refresh_manual_credential(
                 .status(provider.as_str())
                 .map_err(internal_error),
             false,
+            RefreshOutcome::Succeeded,
         ),
-        Err(error) => (Err(refresh_failure(error)), false),
+        Err(error) => (Err(refresh_failure(error)), false, RefreshOutcome::Failed),
     };
     finish_refresh(
         credentials,
@@ -1873,6 +1925,7 @@ async fn refresh_manual_credential(
         credential_written,
         refresh_lease,
         result,
+        outcome,
     )
     .await
 }
@@ -1885,8 +1938,8 @@ async fn finish_refresh(
     credential_written: bool,
     _refresh_lease: CredentialRefreshLease,
     result: Result<CredentialStatus, PlaybackError>,
+    outcome: RefreshOutcome,
 ) -> Result<CredentialStatus, PlaybackError> {
-    let metadata_result = result.as_ref().map(|_| ()).map_err(ToString::to_string);
     let next_check = Some(current_epoch_ms().saturating_add(if result.is_ok() {
         REFRESH_CHECK_INTERVAL_MS
     } else {
@@ -1903,14 +1956,26 @@ async fn finish_refresh(
     } else {
         started_revision
     };
+    let reauth_reason = match &outcome {
+        RefreshOutcome::NeedsReauth(reason) => Some(reason.clone()),
+        _ => None,
+    };
     // 网络请求期间若用户退出或重新登录，旧结果不能改写新的元数据或下次检查时间。
     let _ = credentials.mark_refresh_finished_if_current_revision(
         provider.as_str(),
         Some(expected_revision),
-        metadata_result,
+        outcome,
         next_check,
     );
-    result
+    // 需要重新登录时，返回的状态必须携带该标记，UI 才能显示提示。
+    match (result, reauth_reason) {
+        (Ok(mut status), Some(reason)) => {
+            status.needs_reauth = true;
+            status.needs_reauth_reason = Some(reason);
+            Ok(status)
+        }
+        (other, _) => other,
+    }
 }
 
 async fn save_refreshed_credential(
@@ -1942,6 +2007,17 @@ fn refresh_superseded() -> PlaybackError {
         "credential_changed",
         "登录状态已变更，未写入旧的刷新结果",
     ))
+}
+
+/// 把上游的续期不可用原因归并为稳定的机器可读码，供 UI 判定与文案选择。
+fn refresh_reauth_reason(reason: &str) -> String {
+    reason
+        .split(':')
+        .next()
+        .map(str::trim)
+        .filter(|code| !code.is_empty())
+        .unwrap_or("kugou_refresh_unavailable")
+        .to_owned()
 }
 
 fn refresh_failure(error: PlaybackCoreError) -> PlaybackError {
@@ -2787,6 +2863,61 @@ mod tests {
                     .unwrap()
             );
         }
+    }
+
+    /// needs_reauth 置位后，后台自动刷新循环必须停止重试：
+    /// 否则它会在每个 refresh_check 周期重复失败并重复 warn，把日志淹掉。
+    #[tokio::test]
+    async fn background_refresh_skips_credentials_marked_needs_reauth() {
+        let credentials = CredentialStore::memory();
+        credentials
+            .save("kugou", kugou_credential("token"))
+            .unwrap();
+        let snapshot = credentials.snapshot("kugou").unwrap().unwrap();
+        // 让自动刷新到期，并记录「需要重新登录」。
+        assert!(
+            credentials
+                .mark_refresh_finished_if_current_revision(
+                    "kugou",
+                    None,
+                    crate::credentials::RefreshOutcome::NeedsReauth(
+                        "kugou_web_credential_not_refreshable".to_owned()
+                    ),
+                    Some(0),
+                )
+                .unwrap()
+        );
+        let status = credentials.status("kugou").unwrap();
+        assert!(status.needs_reauth);
+        assert!(
+            !status.refresh_ready,
+            "needs_reauth 必须让 refresh_ready 为假，自动循环才会跳过它"
+        );
+        let _ = snapshot;
+
+        let (refresh_started_tx, mut refresh_started_rx) = oneshot::channel();
+        let refresh_adapter = Arc::new(BlockingKugouRefresh {
+            refresh_started: Mutex::new(Some(refresh_started_tx)),
+            release_refresh: Arc::new(Notify::new()),
+            refreshed: kugou_credential("refreshed-token"),
+        });
+        let core = PlaybackCore::new(
+            SourceCatalog::new(Vec::<(String, Arc<dyn SourceAdapter>)>::new())
+                .with_kugou_account(refresh_adapter as Arc<dyn KugouAccountAdapter>),
+            Arc::new(FakeEngine::new()),
+            Duration::from_secs(1),
+        );
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            refresh_due_credentials(&core, &credentials),
+        )
+        .await
+        .expect("needs_reauth 的凭据不应触发后台刷新");
+        assert!(
+            refresh_started_rx.try_recv().is_err(),
+            "needs_reauth 后自动刷新不得再发起请求"
+        );
     }
 
     #[tokio::test]

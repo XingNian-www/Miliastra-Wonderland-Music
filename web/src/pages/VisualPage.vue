@@ -454,7 +454,7 @@ onMounted(() => load())
 .visual-toolbar-sep {
   width: 1px;
   height: 18px;
-  background: var(--line, #3a3a38);
+  background: var(--sep-1);
   margin: 0 4px;
 }
 .visual-layout {
@@ -530,8 +530,8 @@ onMounted(() => load())
   overflow: auto;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 11px;
-  background: var(--panel, #22221f);
-  border: 1px solid var(--line, #3a3a38);
+  background: var(--bg-2);
+  border: 1px solid var(--sep-1);
   border-radius: 6px;
   padding: 8px;
 }

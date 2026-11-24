@@ -360,9 +360,9 @@ function commitRaw(path, target) {
   flex-direction: column;
   gap: 4px;
   padding: 6px 8px;
-  border: 1px solid var(--line, #3a3a38);
+  border: 1px solid var(--sep-1);
   border-radius: 6px;
-  background: var(--panel, #22221f);
+  background: var(--bg-2);
 }
 .visual-field > span {
   font-size: 12px;

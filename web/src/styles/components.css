@@ -2965,8 +2965,8 @@ code, pre {
 /* ========== 控件尺寸统一（按钮 / 输入 / 开关） ========== */
 
 .btn, .button, button.btn {
-  height: 32px;
-  min-height: 32px;
+  height: var(--btn-h);
+  min-height: var(--btn-h);
   padding: 0 12px;
   display: inline-flex;
   align-items: center;
@@ -3531,8 +3531,11 @@ input:focus, select:focus, textarea:focus {
    以前这里是 var(--bg-2) 实心块 + 1px 边，放在不透明面板上会形成「深色方块」，
    正是「网页感」的主要来源。 */
 .btn, .top-actions .btn, .command-savebar .btn {
-  height: 30px;
-  min-height: 30px;
+  /* 必须读令牌而不是写死：L2967 的 `button.btn` 特异度 (0,1,1) 高于本条 (0,1,0)，
+     写死 30px 时对真正的 <button> 从未生效，只有 <a class="btn"> 吃到 30px，
+     于是同一页出现 30/32 两种按钮高度。改读 var(--btn-h) 后两边同源。 */
+  height: var(--btn-h);
+  min-height: var(--btn-h);
   padding: 0 12px;
   border-radius: 7px;
   border: 1px solid transparent;

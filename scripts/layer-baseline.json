@@ -1996,8 +1996,8 @@
       "pub_items": 6
     },
     "src/adapters/login_helper.rs": {
-      "lines": 3110,
-      "pub_items": 22
+      "lines": 3183,
+      "pub_items": 24
     },
     "src/adapters/mod.rs": {
       "lines": 9,
@@ -2628,7 +2628,7 @@
       "pub_items": 11
     },
     "src/interfaces/http/facade.rs": {
-      "lines": 1697,
+      "lines": 1718,
       "pub_items": 16
     },
     "src/interfaces/http/mod.rs": {
@@ -2640,11 +2640,11 @@
       "pub_items": 3
     },
     "src/interfaces/http/ports.rs": {
-      "lines": 647,
+      "lines": 664,
       "pub_items": 25
     },
     "src/interfaces/http/protocol.rs": {
-      "lines": 2177,
+      "lines": 2185,
       "pub_items": 12
     },
     "src/interfaces/http/tools.rs": {
@@ -2680,8 +2680,8 @@
       "pub_items": 8
     },
     "src/interfaces/http/routes/playback.rs": {
-      "lines": 904,
-      "pub_items": 40
+      "lines": 957,
+      "pub_items": 42
     },
     "src/interfaces/http/routes/system.rs": {
       "lines": 682,

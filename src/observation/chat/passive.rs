@@ -416,10 +416,7 @@ pub(crate) fn recognize_passive_secondary(
             .map(|bubble| {
                 let sender_rect = bubble.sender_rect();
                 if sender_rect.is_none() {
-                    log::warn!(
-                        "二级大厅气泡缺少发言人区域（头像边界/纹理证据不足），仅按正文交付：block {:?}",
-                        bubble.rect
-                    );
+                    log::warn!("二级大厅气泡缺少发言人区域（头像边界/纹理证据不足），仅按正文交付");
                 }
                 (bubble.rect, sender_rect)
             }),

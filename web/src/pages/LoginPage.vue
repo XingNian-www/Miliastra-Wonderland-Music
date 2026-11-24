@@ -57,7 +57,55 @@
           </div>
         </div>
         <div v-else class="result">暂无酷狗账号状态，或该平台未启用。</div>
-        <div class="config-field-hint">此状态只读；领取/升级 VIP 使用下方平台卡片按钮。</div>
+
+        <!-- 手机号验证码登录（酷狗概念版）：产出的凭据带 t1，可自动续期。
+             这是「不静默掉线」的正解；网页扫码登录拿不到 t1，只能靠它。 -->
+        <div class="kugou-phone-login">
+          <div class="kugou-phone-login-head">
+            <strong>手机号验证码登录（概念版）</strong>
+            <small>登录后凭据支持自动续期；会真实下发短信</small>
+          </div>
+          <div class="kugou-phone-row">
+            <label for="kugouPhoneMobile">手机号</label>
+            <input
+              id="kugouPhoneMobile"
+              v-model.trim="kugouPhone.mobile"
+              class="config-input"
+              type="tel"
+              inputmode="numeric"
+              maxlength="11"
+              placeholder="11 位手机号"
+              autocomplete="off"
+              :disabled="busy || phoneCodeCountdown > 0"
+            />
+            <button
+              class="btn small primary"
+              :disabled="busy || phoneCodeCountdown > 0 || !phoneMobileValid"
+              @click="sendKugouPhoneCode"
+            >{{ phoneCodeButtonText }}</button>
+          </div>
+          <div class="kugou-phone-row">
+            <label for="kugouPhoneCode">验证码</label>
+            <input
+              id="kugouPhoneCode"
+              v-model.trim="kugouPhone.code"
+              class="config-input"
+              type="text"
+              inputmode="numeric"
+              maxlength="8"
+              placeholder="短信验证码"
+              autocomplete="one-time-code"
+              :disabled="busy"
+            />
+            <button
+              class="btn small good"
+              :disabled="busy || !phoneLoginValid"
+              @click="loginByKugouPhoneCode"
+            >登录</button>
+          </div>
+          <div v-if="phoneCodeSentMasked" class="config-field-hint">验证码已发送至 {{ phoneCodeSentMasked }}</div>
+          <div class="config-field-hint">此处的状态只读；领取/升级 VIP 使用下方平台卡片按钮。</div>
+        </div>
       </div>
     </section>
 
@@ -140,6 +188,11 @@ const busy = ref(false)
 const actionText = ref('')
 const qrBroken = ref(false)
 const now = ref(Date.now())
+// 酷狗手机号验证码登录（概念版）：纯前端状态，两条接口调用见下方函数。
+const kugouPhone = ref({ mobile: '', code: '' })
+const phoneCodeCountdown = ref(0)
+const phoneCodeSentMasked = ref('')
+let phoneCodeTimer = null
 let timer = null
 let statusTimer = null
 let loading = false
@@ -236,6 +289,85 @@ function reauthNote(item) {
   if (!item.needsReauth) return ''
   return REAUTH_NOTES[item.needsReauthReason] || '当前登录无法自动续期，过期后需要重新登录。'
 }
+const phoneMobileValid = computed(() => /^1\d{10}$/.test(String(kugouPhone.value.mobile || '').trim()))
+const phoneLoginValid = computed(() => phoneMobileValid.value && String(kugouPhone.value.code || '').trim().length > 0)
+const phoneCodeButtonText = computed(() => phoneCodeCountdown.value > 0 ? `${phoneCodeCountdown.value} 秒后重发` : '发送验证码')
+
+function clearPhoneCodeTimer() {
+  if (phoneCodeTimer) {
+    clearInterval(phoneCodeTimer)
+    phoneCodeTimer = null
+  }
+  phoneCodeCountdown.value = 0
+}
+// 按后端 nextSendAtMs 做倒计时，前端禁用按钮，避免用户连点触发短信轰炸。
+function startPhoneCodeCountdown(untilMs) {
+  clearPhoneCodeTimer()
+  const target = Number(untilMs)
+  const tick = () => {
+    const remain = Math.max(0, Math.ceil((target - Date.now()) / 1000))
+    phoneCodeCountdown.value = remain
+    if (remain <= 0) clearPhoneCodeTimer()
+  }
+  tick()
+  phoneCodeTimer = setInterval(tick, 500)
+}
+async function sendKugouPhoneCode() {
+  if (busy.value || phoneCodeCountdown.value > 0) return
+  if (!phoneMobileValid.value) {
+    toast('请输入 11 位手机号', 'err')
+    return
+  }
+  busy.value = true
+  try {
+    const value = await requestJson('/player/kugou/phone/code', { mobile: kugouPhone.value.mobile.trim() })
+    phoneCodeSentMasked.value = value?.mobileMasked || ''
+    const nextAt = Number(value?.nextSendAtMs)
+    startPhoneCodeCountdown(Number.isFinite(nextAt) && nextAt > Date.now() ? nextAt : Date.now() + 60000)
+    actionText.value = value?.mobileMasked ? `验证码已发送至 ${value.mobileMasked}` : '验证码已发送'
+    toast('验证码已发送', 'ok')
+  } catch (error) {
+    // 冷却错误不是故障：后端返回 kugou_phone_code_cooldown，这里优雅提示并进入倒计时，
+    // 不弹红色错误、不影响其它控件。
+    if (String(error?.message || '').includes('kugou_phone_code_cooldown')) {
+      startPhoneCodeCountdown(Date.now() + 60000)
+      actionText.value = '验证码发送过于频繁，请稍后再试'
+      toast('发送过于频繁，请稍后再试', 'warn')
+    } else {
+      report(error)
+    }
+  } finally {
+    busy.value = false
+  }
+}
+async function loginByKugouPhoneCode() {
+  if (busy.value) return
+  if (!phoneLoginValid.value) {
+    toast('请填写手机号与验证码', 'err')
+    return
+  }
+  busy.value = true
+  actionText.value = '正在用验证码登录酷狗…'
+  try {
+    await requestJson('/player/kugou/phone/login', {
+      mobile: kugouPhone.value.mobile.trim(),
+      code: kugouPhone.value.code.trim()
+    })
+    actionText.value = '酷狗手机验证码登录成功'
+    toast('酷狗登录成功', 'ok')
+    kugouPhone.value.code = ''
+    phoneCodeSentMasked.value = ''
+    clearPhoneCodeTimer()
+    // 登录成功后刷新酷狗状态，让卡片反映最新登录/续期能力。
+    await loadKugouStatus()
+    await loadAll()
+  } catch (error) {
+    report(error)
+  } finally {
+    busy.value = false
+  }
+}
+
 let lastReport = { at: 0, text: '' }
 function report(error) {
   if (handleAuth(error)) return false
@@ -410,5 +542,6 @@ onMounted(() => {
 onBeforeUnmount(() => {
   clearInterval(timer)
   clearInterval(statusTimer)
+  clearPhoneCodeTimer()
 })
 </script>

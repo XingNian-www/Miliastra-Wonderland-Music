@@ -582,6 +582,34 @@ export function kugouStatus() {
   }
 }
 
+/** POST /player/kugou/phone/code —— KugouPhoneCodeSent（crates/miliastra-playback/src/runtime.rs）。
+ *
+ * 手机号必须打码（后端从不回明文）；nextSendAtMs 用于前端 60 秒倒计时禁用。 */
+export function kugouPhoneCodeSent(mobile) {
+  const text = String(mobile || '')
+  const masked = text.length === 11 ? `${text.slice(0, 2)}*****${text.slice(-1)}` : '1**********'
+  return { ok: true, mobileMasked: masked, nextSendAtMs: 1795000000000 + 60000 }
+}
+
+/** POST /player/kugou/phone/login —— CredentialStatus（crates/miliastra-playback/src/credentials.rs）。
+ *
+ * 概念版登录会带来 t1/liteToken，因此各字段就绪、可自动续期（与网页扫码凭据相反）。 */
+export function kugouPhoneLoginStatus() {
+  return {
+    provider: 'kugou',
+    configured: true,
+    fields: { token: true, userId: true, dfid: true, liteToken: true, t1: true },
+    refreshSupported: true,
+    manualRefreshSupported: true,
+    refreshReady: true,
+    refreshState: 'success',
+    lastRefreshAtMs: 1795000000000,
+    nextRefreshCheckAtMs: 1795000000000 + 86400000,
+    lastRefreshError: null,
+    needsReauth: false,
+  }
+}
+
 /** GET /player/account/status —— ProviderAccountStatus（crates/miliastra-playback/src/catalog/mod.rs）。 */
 export function accountStatus(provider) {
   const table = {

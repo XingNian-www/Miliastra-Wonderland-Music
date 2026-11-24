@@ -17,51 +17,51 @@
   color-scheme: dark;
 
   /* ---------- 表面与填充 ---------- */
-  --bg-0: #0e1012;            /* 最底层（body 背景） */
-  --bg-1: #171a1e;            /* 次级表面 */
-  --bg-2: #1d2126;            /* 控件底色、Tab 轨道 */
-  --bg-3: #242930;            /* hover 抬升 */
-  --bg-ground: #181817;       /* 页面底色 */
-  --bg-card: #1f1f1f;         /* 卡片 */
-  --bg-input: #101010;        /* 输入框 */
-  --bg-raised: #262626;       /* 抬升块 */
-  --panel-bg: #171a1e;        /* 面板 */
-  --nav-bg: #111315;          /* 左侧导航 */
-  --topbar-bg: rgba(14, 16, 18, 0.88);
-  --input-bg: #1b1f24;
-  --savebar-bg: rgba(12, 13, 15, 0.94);
-  --fill-1: rgba(255, 255, 255, 0.06);
-  --fill-2: rgba(255, 255, 255, 0.11);
+  --bg-0: #1c1c1e;            /* 最底层（body 背景） */
+  --bg-1: #2c2c2e;            /* 次级表面 */
+  --bg-2: #3a3a3c;            /* 控件底色、Tab 轨道 */
+  --bg-3: #48484a;            /* hover 抬升 */
+  --bg-ground: #1c1c1e;       /* 页面底色 */
+  --bg-card: #2c2c2e;         /* 卡片 */
+  --bg-input: #1c1c1e;        /* 输入框 */
+  --bg-raised: #3a3a3c;       /* 抬升块 */
+  --panel-bg: #2c2c2e;        /* 面板 */
+  --nav-bg: rgba(28, 28, 30, 0.72);          /* 左侧导航 */
+  --topbar-bg: rgba(28, 28, 30, 0.72);
+  --input-bg: rgba(255, 255, 255, 0.06);
+  --savebar-bg: rgba(28, 28, 30, 0.82);
+  --fill-1: rgba(255, 255, 255, 0.08);
+  --fill-2: rgba(255, 255, 255, 0.14);
 
   /* ---------- 分隔线 ---------- */
-  --sep-1: rgba(255, 255, 255, 0.1);
-  --sep-2: rgba(255, 255, 255, 0.06);
-  --border: rgba(255, 255, 255, 0.1);
+  --sep-1: rgba(255, 255, 255, 0.12);
+  --sep-2: rgba(255, 255, 255, 0.07);
+  --border: rgba(255, 255, 255, 0.12);
 
   /* ---------- 文字 ---------- */
-  --text-1: #e9e7e2;
-  --text-2: #a6a29a;
-  --text-3: #6d6a63;
-  --inverse: #101010;
+  --text-1: #f5f5f7;
+  --text-2: #a1a1a6;
+  --text-3: #6e6e73;
+  --inverse: #1c1c1e;
 
   /* ---------- 语义色 ---------- */
-  --accent: #4f9d8b;
-  --accent-strong: #57a996;
-  --accent-soft: rgba(79, 157, 139, 0.16);
-  --primary-hover: rgba(255, 255, 255, 0.28);
-  --ok: #5fbf8a;
-  --ok-soft: rgba(58, 217, 122, 0.12);
-  --warn: #d9a441;
-  --warn-soft: rgba(255, 176, 46, 0.12);
-  --danger: #d96c6c;
-  --danger-soft: rgba(255, 92, 102, 0.12);
-  --info: #52c7e0;
-  --info-soft: rgba(82, 199, 224, 0.12);
-  --purple: #a16bff;
+  --accent: #0a84ff;
+  --accent-strong: #409cff;
+  --accent-soft: rgba(10, 132, 255, 0.18);
+  --primary-hover: rgba(255, 255, 255, 0.24);
+  --ok: #30d158;
+  --ok-soft: rgba(48, 209, 88, 0.16);
+  --warn: #ff9f0a;
+  --warn-soft: rgba(255, 159, 10, 0.16);
+  --danger: #ff453a;
+  --danger-soft: rgba(255, 69, 58, 0.16);
+  --info: #64d2ff;
+  --info-soft: rgba(100, 210, 255, 0.16);
+  --purple: #bf5af2;
 
   /* ---------- 字体 ---------- */
-  --font-sans: -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
-  --font-ui: "Inter", "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
   --font-mono: "JetBrains Mono", "Cascadia Code", ui-monospace, monospace;
 
   /* ---------- 字号 / 行高 ---------- */
@@ -88,46 +88,46 @@
   --sp-5: 20px;
 
   /* ---------- 圆角 ---------- */
-  --radius-s: 7px;
+  --radius-s: 6px;
   --radius-m: 10px;
-  --radius-l: 12px;
+  --radius-l: 14px;
   --radius: 10px;
 
   /* ---------- 控件尺寸 ---------- */
-  --btn-h: 32px;
-  --btn-h-sm: 26px;
-  --ctl-h: 28px;
+  --btn-h: 30px;
+  --btn-h-sm: 24px;
+  --ctl-h: 26px;
   --ic: 16px;
   --ic-sm: 14px;
 
   /* ---------- 阴影与交互底色 ---------- */
-  --shadow: 0 1px 2px rgba(0, 0, 0, 0.28);
-  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.22);
-  --shadow-savebar: 0 -2px 12px rgba(0, 0, 0, 0.25);
+  --shadow: 0 2px 8px rgba(0, 0, 0, 0.32);
+  --shadow-1: 0 1px 4px rgba(0, 0, 0, 0.28);
+  --shadow-savebar: 0 -4px 20px rgba(0, 0, 0, 0.36);
   --bg-hover: var(--fill-1);
 
   /* ---------- 滚动条 ---------- */
-  --scrollbar-thumb: rgba(148, 163, 184, 0.26);
-  --scrollbar-thumb-hover: rgba(148, 163, 184, 0.42);
+  --scrollbar-thumb: rgba(255, 255, 255, 0.2);
+  --scrollbar-thumb-hover: rgba(255, 255, 255, 0.32);
 
   /* ---------- 主按钮文案（主色底上的白字） ---------- */
-  --on-accent: #fff;
+  --on-accent: #ffffff;
 
   /* ---------- 状态点光晕 ---------- */
-  --ok-glow: rgba(53, 211, 154, 0.12);
-  --warn-glow: rgba(245, 176, 76, 0.12);
-  --danger-glow: rgba(255, 107, 107, 0.14);
+  --ok-glow: rgba(48, 209, 88, 0.16);
+  --warn-glow: rgba(255, 159, 10, 0.16);
+  --danger-glow: rgba(255, 69, 58, 0.18);
 
   /* ---------- 点缀色：页面底色、选中态描边、徽标点 ---------- */
-  --page-glow: rgba(79, 157, 139, 0.07);
-  --select-border: rgba(79, 157, 139, 0.45);
-  --accent-outline: rgba(79, 157, 139, 0.35);
+  --page-glow: rgba(10, 132, 255, 0.08);
+  --select-border: rgba(10, 132, 255, 0.5);
+  --accent-outline: rgba(10, 132, 255, 0.4);
   --dot-ok: var(--ok);
   --dot-warn: var(--warn);
   --dot-danger: var(--danger);
 
   /* ---------- 遮罩与开关滑块 ---------- */
-  --overlay: rgba(0, 0, 0, 0.66);
+  --overlay: rgba(0, 0, 0, 0.5);
   --switch-thumb: #f2f1ec;
   --switch-thumb-on: #fff;
   --switch-inset: inset 0 1px 2px rgba(0, 0, 0, 0.25);
@@ -138,76 +138,76 @@ html[data-theme="light"] {
   color-scheme: light;
 
   /* ---------- 表面与填充 ---------- */
-  --bg-0: #f2f0ea;
-  --bg-1: #fcfbf8;
-  --bg-2: #f1eee7;
-  --bg-3: #e8e4db;
-  --bg-ground: #f5f5f3;
+  --bg-0: #ececec;
+  --bg-1: #ffffff;
+  --bg-2: #f5f5f7;
+  --bg-3: #e8e8ed;
+  --bg-ground: #f5f5f7;
   --bg-card: #ffffff;
-  --bg-input: #fafaf8;
-  --bg-raised: #eeeeea;
-  --panel-bg: #fcfbf8;
-  --nav-bg: #ece9e2;
-  --topbar-bg: rgba(242, 240, 234, 0.92);
-  --input-bg: #ffffff;
-  --savebar-bg: rgba(242, 240, 234, 0.95);
-  --fill-1: rgba(0, 0, 0, 0.045);
+  --bg-input: #ffffff;
+  --bg-raised: #f5f5f7;
+  --panel-bg: #ffffff;
+  --nav-bg: rgba(236, 236, 236, 0.72);
+  --topbar-bg: rgba(255, 255, 255, 0.72);
+  --input-bg: rgba(0, 0, 0, 0.04);
+  --savebar-bg: rgba(255, 255, 255, 0.86);
+  --fill-1: rgba(0, 0, 0, 0.05);
   --fill-2: rgba(0, 0, 0, 0.09);
 
   /* ---------- 分隔线 ---------- */
-  --sep-1: rgba(36, 38, 34, 0.13);
-  --sep-2: rgba(36, 38, 34, 0.07);
+  --sep-1: rgba(0, 0, 0, 0.12);
+  --sep-2: rgba(0, 0, 0, 0.06);
   --border: rgba(0, 0, 0, 0.1);
 
   /* ---------- 文字 ---------- */
-  --text-1: #242622;
-  --text-2: #5f615a;
-  --text-3: #8d8f86;
+  --text-1: #1d1d1f;
+  --text-2: #6e6e73;
+  --text-3: #8e8e93;
   --inverse: #ffffff;
 
   /* ---------- 语义色 ---------- */
-  --accent: #2f7c6c;
-  --accent-strong: #369080;
-  --accent-soft: rgba(47, 124, 108, 0.12);
-  --primary-hover: rgba(0, 0, 0, 0.16);
-  --ok: #2f8f5b;
-  --ok-soft: rgba(20, 154, 75, 0.1);
-  --warn: #a87316;
-  --warn-soft: rgba(201, 118, 10, 0.1);
-  --danger: #b34a4a;
-  --danger-soft: rgba(217, 48, 56, 0.1);
-  --info: #0e8fae;
-  --info-soft: rgba(14, 143, 174, 0.1);
-  --purple: #8a4df0;
+  --accent: #007aff;
+  --accent-strong: #0066d6;
+  --accent-soft: rgba(0, 122, 255, 0.12);
+  --primary-hover: rgba(0, 0, 0, 0.14);
+  --ok: #28cd41;
+  --ok-soft: rgba(40, 205, 65, 0.12);
+  --warn: #ff9500;
+  --warn-soft: rgba(255, 149, 0, 0.12);
+  --danger: #ff3b30;
+  --danger-soft: rgba(255, 59, 48, 0.12);
+  --info: #5ac8fa;
+  --info-soft: rgba(90, 200, 250, 0.14);
+  --purple: #af52de;
 
   /* ---------- 阴影（浅色下更轻） ---------- */
-  --shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
-  --shadow-1: 0 1px 2px rgba(30, 30, 25, 0.06);
-  --shadow-savebar: 0 -2px 12px rgba(30, 30, 25, 0.08);
+  --shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.06);
+  --shadow-savebar: 0 -4px 20px rgba(0, 0, 0, 0.1);
 
   /* ---------- 滚动条（浅色下改用深色半透明，白底上仍可见） ---------- */
-  --scrollbar-thumb: rgba(70, 74, 68, 0.22);
-  --scrollbar-thumb-hover: rgba(70, 74, 68, 0.36);
+  --scrollbar-thumb: rgba(0, 0, 0, 0.22);
+  --scrollbar-thumb-hover: rgba(0, 0, 0, 0.34);
 
   /* ---------- 状态点光晕（浅色下减弱，避免发灰） ---------- */
-  --ok-glow: rgba(47, 143, 91, 0.16);
-  --warn-glow: rgba(168, 115, 22, 0.16);
-  --danger-glow: rgba(179, 74, 74, 0.16);
+  --ok-glow: rgba(40, 205, 65, 0.18);
+  --warn-glow: rgba(255, 149, 0, 0.18);
+  --danger-glow: rgba(255, 59, 48, 0.18);
 
   /* ---------- 点缀色 ---------- */
-  --page-glow: rgba(47, 124, 108, 0.05);
-  --select-border: rgba(47, 124, 108, 0.45);
-  --accent-outline: rgba(47, 124, 108, 0.35);
-  --dot-ok: #2f8f5b;
-  --dot-warn: #c98212;
-  --dot-danger: #c64a4a;
+  --page-glow: rgba(0, 122, 255, 0.05);
+  --select-border: rgba(0, 122, 255, 0.5);
+  --accent-outline: rgba(0, 122, 255, 0.4);
+  --dot-ok: #28cd41;
+  --dot-warn: #ff9500;
+  --dot-danger: #ff3b30;
 
   /* 浅色下开关轨道已足够深，滑块改用白色并保留 1px 描边。 */
   --switch-thumb: #ffffff;
   --switch-thumb-on: #ffffff;
 
   /* 浅色下控件留一圈更明显的圆角（历史值即为 8px，保持不变以免视觉回归）。 */
-  --radius-s: 8px;
+  --radius-s: 6px;
 }
 
 /* 触摸屏放大控件命中区，避免窄屏误触。 */

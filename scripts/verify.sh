@@ -17,10 +17,11 @@ if ! command -v cargo >/dev/null 2>&1 && [ -x /root/.cargo/bin/cargo ]; then
 fi
 
 PRIVACY_STRICT="${PRIVACY_STRICT:-0}"
-# `windows` 放在 check 之后：它补的是「Windows 专属代码在 Linux 目标下完全不可见」
-# 这个盲区（2026-11-23 曾把 error[E0432] 推到 Windows Release 构建才发现）。
-# 需要 mingw 交叉编译器与 rustup 的 x86_64-pc-windows-gnu target；缺失时脚本自己报错退出。
-STEPS=(fmt check windows test layers panel web)
+# `windows`（mingw 交叉到 x86_64-pc-windows-gnu）默认**不再**纳入 verify：
+# 它交叉编译整个 workspace 耗时 20+ 分钟，而发版 CI 的「构建 Windows x64 EXE」
+# job 本就用 MSVC 全量编译，Windows 编不过会在那里红——对发版是冗余前置。
+# 需要提前在本地抓 Windows 专属代码的编译错误时，仍可手动 `make windows`。
+STEPS=(fmt check test layers panel web)
 declare -a RESULTS=()
 FAILED=0
 

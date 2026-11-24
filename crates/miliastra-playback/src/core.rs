@@ -898,6 +898,42 @@ impl PlaybackCore {
             .map_err(PlaybackCoreError::Catalog)
     }
 
+    /// 请求向手机号发送概念版登录验证码。
+    ///
+    /// 该调用会**真实下发短信**。它只应该由用户显式动作触发；这里不做任何
+    /// 重试，超时直接失败，避免一次点击发出多条短信。
+    pub async fn kugou_send_phone_login_code(&self, mobile: &str) -> Result<(), PlaybackCoreError> {
+        let account = self
+            .catalog
+            .kugou_account()
+            .ok_or_else(|| PlaybackCoreError::UnknownSource("kugou".to_owned()))?;
+        timeout(self.source_timeout, account.send_phone_login_code(mobile))
+            .await
+            .map_err(|_| PlaybackCoreError::Catalog(CatalogError::TimedOut("kugou".to_owned())))?
+            .map_err(PlaybackCoreError::Catalog)
+    }
+
+    /// 用手机号 + 验证码完成概念版登录，返回可自动续期的酷狗凭据。
+    ///
+    /// 调用方负责把它原子写回 `CredentialStore`（走 `save_if_revision` 语义）。
+    pub async fn kugou_login_by_phone_code(
+        &self,
+        mobile: &str,
+        code: &str,
+    ) -> Result<crate::credentials::ProviderCredential, PlaybackCoreError> {
+        let account = self
+            .catalog
+            .kugou_account()
+            .ok_or_else(|| PlaybackCoreError::UnknownSource("kugou".to_owned()))?;
+        timeout(
+            self.source_timeout,
+            account.login_by_phone_code(mobile, code),
+        )
+        .await
+        .map_err(|_| PlaybackCoreError::Catalog(CatalogError::TimedOut("kugou".to_owned())))?
+        .map_err(PlaybackCoreError::Catalog)
+    }
+
     pub async fn kugou_upgrade_vip(
         &self,
     ) -> Result<crate::catalog::KugouListenReport, PlaybackCoreError> {

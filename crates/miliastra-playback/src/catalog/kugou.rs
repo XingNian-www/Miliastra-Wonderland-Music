@@ -1875,10 +1875,11 @@ impl KugouAdapter {
                 cookies.insert(name.to_owned(), value);
             }
         }
+        // 防串号：上游若回显 userid 且与当前账号不一致，绝不能把这份会话写回。
+        verify_refreshed_userid(userid.as_deref(), web_userid)?;
         // userid 由 KuGoo/token 字段与请求侧合成，不作为凭据 Cookie 持久化；
         // 同时清理历史保存中可能残留的非白名单键，保证保存校验通过。
         cookies.retain(|name, _| KUGOU_CREDENTIAL_COOKIE_NAMES.contains(&name.as_str()));
-        let _ = userid;
         Ok(ProviderCredential::Kugou {
             token: web_token.clone(),
             userid: web_userid.clone(),
@@ -2659,6 +2660,16 @@ impl crate::catalog::KugouAccountAdapter for KugouAdapter {
     async fn upgrade_vip(&self) -> Result<KugouListenReport, CatalogError> {
         self.upgrade_vip().await
     }
+    async fn send_phone_login_code(&self, mobile: &str) -> Result<(), CatalogError> {
+        self.send_login_code(mobile).await
+    }
+    async fn login_by_phone_code(
+        &self,
+        mobile: &str,
+        code: &str,
+    ) -> Result<ProviderCredential, CatalogError> {
+        self.login_by_verifycode(mobile, code).await
+    }
 }
 
 #[async_trait]
@@ -3381,6 +3392,23 @@ fn credential_from_verifycode_response_for_test(
     lite_dfid: &str,
 ) -> Result<ProviderCredential, CatalogError> {
     KugouAdapter::credential_from_verifycode_response(value, device, session_key, lite_dfid)
+}
+
+/// 校验续期响应回显的 userid 与当前账号一致。
+///
+/// 设备标识或会话串味时，若不校验就可能把账号 A 的凭据写成账号 B 的，后续所有
+/// 请求都会打到错误账号上。上游未回显 userid（`None` 或空串）时无法判断，放行
+/// 并沿用原账号——这比因缺少可选字段而拒绝整次续期更安全。
+fn verify_refreshed_userid(returned: Option<&str>, current: &str) -> Result<(), CatalogError> {
+    let Some(returned) = returned.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    if returned == current.trim() {
+        return Ok(());
+    }
+    Err(CatalogError::CredentialRejected(
+        "Kugou login refresh returned a different account".to_owned(),
+    ))
 }
 
 /// 按上游口径打码手机号（保留前 2 位与第 11 位）。
@@ -4961,7 +4989,7 @@ mod phone_login_tests {
     use super::{
         KUGOU_LOGIN_PLAT, KugouDeviceIdentity, classify_login_response,
         credential_from_verifycode_response_for_test, login_by_verifycode_body_for_test,
-        mask_kugou_mobile, validate_kugou_mobile,
+        mask_kugou_mobile, validate_kugou_mobile, verify_refreshed_userid,
     };
     use crate::catalog::CatalogError;
     use serde_json::json;
@@ -5118,6 +5146,25 @@ mod phone_login_tests {
         // 保存校验会拒绝非白名单 Cookie，这里先确保组装结果本身合法。
         let saved = crate::credentials::validate_for_test(&credential);
         assert!(saved.is_ok(), "组装出的凭据必须能通过保存校验: {saved:?}");
+    }
+
+    #[test]
+    fn refresh_rejects_a_response_for_a_different_account() {
+        // 上游回显同一账号：放行。
+        assert!(verify_refreshed_userid(Some("42"), "42").is_ok());
+        // 前后空白不算差异。
+        assert!(verify_refreshed_userid(Some(" 42 "), "42").is_ok());
+        // 上游未回显 userid：无法判断，放行并沿用原账号。
+        assert!(verify_refreshed_userid(None, "42").is_ok());
+        assert!(verify_refreshed_userid(Some(""), "42").is_ok());
+        assert!(verify_refreshed_userid(Some("   "), "42").is_ok());
+        // 回显了**另一个**账号：必须拒绝，否则会把 A 的凭据写成 B 的。
+        let error = verify_refreshed_userid(Some("99"), "42").unwrap_err();
+        assert!(
+            matches!(error, CatalogError::CredentialRejected(_)),
+            "{error:?}"
+        );
+        assert!(!error.to_string().contains("99"), "错误文本不得回显账号");
     }
 
     #[test]

@@ -2045,6 +2045,8 @@ impl HttpLoginPort for HttpTestLoginPort {
                     last_refresh_at_ms: status.last_refresh_at_ms,
                     next_refresh_check_at_ms: status.next_refresh_check_at_ms,
                     last_refresh_error: status.last_refresh_error,
+                    needs_reauth: status.needs_reauth,
+                    needs_reauth_reason: status.needs_reauth_reason.clone(),
                 }
             })
             .collect())
@@ -2167,6 +2169,26 @@ impl HttpLoginPort for HttpTestLoginPort {
             vip_days: 7,
             message: "升级成功".to_owned(),
         })
+    }
+
+    // 手机登录相关的替身：真实实现会发短信/登录，测试替身一律返回可预测值，
+    // 绝不触网。
+    fn kugou_send_phone_login_code(
+        &self,
+        _mobile: &str,
+    ) -> Result<miliastra_playback::KugouPhoneCodeSent, HttpLoginError> {
+        Ok(miliastra_playback::KugouPhoneCodeSent {
+            mobile_masked: "13*****0".to_owned(),
+            next_send_at_ms: 1_700_000_060_000,
+        })
+    }
+
+    fn kugou_phone_login(
+        &self,
+        _mobile: &str,
+        _code: &str,
+    ) -> Result<miliastra_playback::CredentialStatus, HttpLoginError> {
+        Ok(miliastra_playback::CredentialStatus::empty("kugou"))
     }
 }
 

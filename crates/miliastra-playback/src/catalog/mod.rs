@@ -28,6 +28,17 @@ pub trait KugouAccountAdapter: Send + Sync + 'static {
     async fn account_status(&self) -> Result<kugou::KugouAccountStatus, CatalogError>;
     async fn claim_vip(&self) -> Result<kugou::KugouListenReport, CatalogError>;
     async fn upgrade_vip(&self) -> Result<kugou::KugouListenReport, CatalogError>;
+    /// 向手机号发送概念版登录验证码。
+    ///
+    /// **会真实下发短信**：只有用户在前端点「发送验证码」时才允许调用，
+    /// 实现与调用链都不得包含自动重试。
+    async fn send_phone_login_code(&self, mobile: &str) -> Result<(), CatalogError>;
+    /// 用手机号 + 验证码完成概念版登录，返回具备自动续期能力的凭据。
+    async fn login_by_phone_code(
+        &self,
+        mobile: &str,
+        code: &str,
+    ) -> Result<ProviderCredential, CatalogError>;
 }
 
 /// 支持手动凭据刷新的平台适配器（QQ 音乐、哔哩哔哩）。

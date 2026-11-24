@@ -46,6 +46,15 @@ trait LoginPlaybackPort: Send + Sync {
     ) -> Result<Option<miliastra_playback::ProviderAccountStatus>, PlaybackError>;
     fn kugou_claim_vip(&self) -> Result<miliastra_playback::KugouListenReport, PlaybackError>;
     fn kugou_upgrade_vip(&self) -> Result<miliastra_playback::KugouListenReport, PlaybackError>;
+    fn kugou_send_phone_login_code(
+        &self,
+        mobile: &str,
+    ) -> Result<miliastra_playback::KugouPhoneCodeSent, PlaybackError>;
+    fn kugou_phone_login(
+        &self,
+        mobile: &str,
+        code: &str,
+    ) -> Result<CredentialStatus, PlaybackError>;
     fn begin_login(&self, provider: ProviderId) -> Result<LoginSession, PlaybackError>;
     fn complete_login(
         &self,
@@ -115,6 +124,21 @@ impl LoginPlaybackPort for PlaybackHandle {
 
     fn kugou_upgrade_vip(&self) -> Result<miliastra_playback::KugouListenReport, PlaybackError> {
         PlaybackHandle::kugou_upgrade_vip(self)
+    }
+
+    fn kugou_send_phone_login_code(
+        &self,
+        mobile: &str,
+    ) -> Result<miliastra_playback::KugouPhoneCodeSent, PlaybackError> {
+        PlaybackHandle::kugou_send_phone_login_code(self, mobile)
+    }
+
+    fn kugou_phone_login(
+        &self,
+        mobile: &str,
+        code: &str,
+    ) -> Result<CredentialStatus, PlaybackError> {
+        PlaybackHandle::kugou_login_by_phone_code(self, mobile, code)
     }
 
     fn begin_login(&self, provider: ProviderId) -> Result<LoginSession, PlaybackError> {
@@ -434,6 +458,9 @@ pub(crate) struct ProviderView {
     pub last_refresh_at_ms: Option<u64>,
     pub next_refresh_check_at_ms: Option<u64>,
     pub last_refresh_error: Option<String>,
+    /// 该凭据需要重新登录才能恢复自动续期（如酷狗网页扫码凭据缺 t1）。
+    pub needs_reauth: bool,
+    pub needs_reauth_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -625,6 +652,8 @@ impl LoginHelperManager {
                     last_refresh_at_ms: status.last_refresh_at_ms,
                     next_refresh_check_at_ms: status.next_refresh_check_at_ms,
                     last_refresh_error: status.last_refresh_error,
+                    needs_reauth: status.needs_reauth,
+                    needs_reauth_reason: status.needs_reauth_reason.clone(),
                     fields,
                 }
             })
@@ -928,6 +957,31 @@ impl LoginHelperManager {
         self.inner
             .playback
             .kugou_upgrade_vip()
+            .map_err(|error| playback_failure(error, Some(ProviderId::Kugou)))
+    }
+
+    /// 请求发送酷狗概念版登录验证码。
+    ///
+    /// **会真实下发短信**：运行时内置 60 秒冷却，本方法不做任何重试。
+    pub(crate) fn kugou_send_phone_login_code(
+        &self,
+        mobile: &str,
+    ) -> Result<miliastra_playback::KugouPhoneCodeSent, LoginHelperFailure> {
+        self.inner
+            .playback
+            .kugou_send_phone_login_code(mobile)
+            .map_err(|error| playback_failure(error, Some(ProviderId::Kugou)))
+    }
+
+    /// 用手机号 + 验证码完成酷狗概念版登录（凭据由运行时落盘）。
+    pub(crate) fn kugou_phone_login(
+        &self,
+        mobile: &str,
+        code: &str,
+    ) -> Result<CredentialStatus, LoginHelperFailure> {
+        self.inner
+            .playback
+            .kugou_phone_login(mobile, code)
             .map_err(|error| playback_failure(error, Some(ProviderId::Kugou)))
     }
 
@@ -2088,6 +2142,25 @@ mod tests {
             &self,
         ) -> Result<miliastra_playback::KugouListenReport, PlaybackError> {
             Ok(Default::default())
+        }
+
+        // 测试替身绝不发短信、不登录。
+        fn kugou_send_phone_login_code(
+            &self,
+            _mobile: &str,
+        ) -> Result<miliastra_playback::KugouPhoneCodeSent, PlaybackError> {
+            Ok(miliastra_playback::KugouPhoneCodeSent {
+                mobile_masked: "13*****0".to_owned(),
+                next_send_at_ms: 1_700_000_060_000,
+            })
+        }
+
+        fn kugou_phone_login(
+            &self,
+            _mobile: &str,
+            _code: &str,
+        ) -> Result<CredentialStatus, PlaybackError> {
+            Ok(CredentialStatus::empty("kugou"))
         }
 
         fn begin_login(&self, provider: ProviderId) -> Result<LoginSession, PlaybackError> {

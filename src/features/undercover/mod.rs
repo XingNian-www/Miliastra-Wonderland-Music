@@ -345,6 +345,14 @@ impl UndercoverMode {
             Self::Double => "双卧底",
         }
     }
+
+    /// 面板用的规则说明。`label()` 只有三个字，读不出「几个卧底、几人起局」。
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::Single => "1 名卧底，平民找出他即可获胜",
+            Self::Double => "2 名卧底，需相互配合混入平民",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -387,6 +395,23 @@ pub struct UndercoverSnapshot {
     pub completed: usize,
     pub total: usize,
     pub remaining_seconds: u64,
+    /// 本局模式的中文说明：面板上「单卧底」三个字太短，说不清规则。
+    pub mode_hint: Option<&'static str>,
+    /// 开局者展示名。空闲时为 None。
+    pub creator: Option<String>,
+    /// 存活玩家数（`players` 里 `alive` 为真的条数）。面板要显示「4 存活 / 6」。
+    pub alive_count: usize,
+    /// 当前阶段的**动作提示**：告诉主持人「现在该等谁做什么」。
+    ///
+    /// 这一条是本次扩充的核心——原来的快照只有 `phase` 代码（`voting`），
+    /// 面板只能照抄成「投票中」，看不出「还差几人投票」「等谁描述」。
+    pub phase_hint: Option<String>,
+    /// 已完成动作数 / 应完成数（描述条数、投票张数）——与 `completed/total`
+    /// 的区别：后者是**整局进度**，这两个是**当前阶段**的进度。
+    pub phase_completed: usize,
+    pub phase_total: usize,
+    /// 被淘汰玩家（按出局顺序），面板要在名单外单独列一栏。
+    pub eliminated: Vec<String>,
 }
 
 impl Default for UndercoverSnapshot {
@@ -400,6 +425,13 @@ impl Default for UndercoverSnapshot {
             completed: 0,
             total: 0,
             remaining_seconds: 0,
+            mode_hint: None,
+            creator: None,
+            alive_count: 0,
+            phase_hint: None,
+            phase_completed: 0,
+            phase_total: 0,
+            eliminated: Vec::new(),
         }
     }
 }
@@ -476,6 +508,21 @@ struct Lobby {
     last_activity: Instant,
 }
 
+impl Lobby {
+    /// 开局者展示名：用 `creator_key` 在玩家表里反查 display。
+    ///
+    /// **不能直接返回 `creator_key`**——已登记身份的比较键是 UUID，
+    /// 泄漏到面板等于把可追踪标识交出去。查不到时回退成占位符，
+    /// 同样不回退成 key。
+    fn creator_display(&self) -> &str {
+        self.players
+            .iter()
+            .find(|player| player.key == self.creator_key)
+            .map(Player::display_name)
+            .unwrap_or("未知玩家")
+    }
+}
+
 struct Playing {
     mode: UndercoverMode,
     creator_key: String,
@@ -484,6 +531,17 @@ struct Playing {
     round: u32,
     last_activity: Instant,
     phase: Phase,
+}
+
+impl Playing {
+    /// 同 `Lobby::creator_display`：只回展示名，绝不回身份键。
+    fn creator_display(&self) -> &str {
+        self.players
+            .iter()
+            .find(|player| player.key == self.creator_key)
+            .map(Player::display_name)
+            .unwrap_or("未知玩家")
+    }
 }
 
 enum Phase {
@@ -1086,6 +1144,7 @@ impl UndercoverGame {
                 completed: 0,
                 total: 0,
                 remaining_seconds: 0,
+                ..UndercoverSnapshot::default()
             },
             GameState::Lobby(lobby) => UndercoverSnapshot {
                 enabled: self.config.enabled,
@@ -1108,6 +1167,17 @@ impl UndercoverGame {
                     self.config.lobby_timeout_seconds,
                     now,
                 ),
+                mode_hint: Some(lobby.mode.hint()),
+                creator: Some(lobby.creator_display().to_string()),
+                alive_count: lobby.players.len(),
+                phase_hint: Some(if lobby.players.len() < self.config.min_players {
+                    format!("还差 {} 人才能开局", self.config.min_players - lobby.players.len())
+                } else {
+                    "人数已够，可由房主开局".to_string()
+                }),
+                phase_completed: lobby.players.len(),
+                phase_total: self.config.max_players.clamp(4, 11),
+                eliminated: Vec::new(),
             },
             GameState::Playing(game) => {
                 let (phase, completed, total) = playing_progress(game);
@@ -1132,6 +1202,18 @@ impl UndercoverGame {
                         self.config.phase_timeout_seconds,
                         now,
                     ),
+                    mode_hint: Some(game.mode.hint()),
+                    creator: Some(game.creator_display().to_string()),
+                    alive_count: alive_count(&game.players),
+                    phase_hint: Some(phase_hint_for(game)),
+                    phase_completed: completed,
+                    phase_total: total,
+                    eliminated: game
+                        .players
+                        .iter()
+                        .filter(|player| !player.alive)
+                        .map(|player| player.display_name().to_string())
+                        .collect(),
                 }
             }
         }
@@ -1294,6 +1376,41 @@ impl UndercoverGame {
             self.state = GameState::Playing(game);
         }
         deliveries
+    }
+}
+
+/// 当前阶段对「主持人」的一句话说明。
+///
+/// 快照里 `phase` 只是代码（`voting`），面板照抄成「投票中」看不出进度与
+/// 该等谁。这里给出人话，且**只说流程、不说身份**——卧底/平民的分配是
+/// 游戏秘密，任何形式进快照都等于让坐在同一台机器前的人直接看答案。
+fn phase_hint_for(game: &Playing) -> String {
+    let alive = alive_count(&game.players);
+    match &game.phase {
+        Phase::AwaitingDelivery => "正在私聊分发词语…".to_string(),
+        Phase::Describing { descriptions } => {
+            format!("描述阶段：{}/{} 人已提交", descriptions.len(), alive)
+        }
+        Phase::Voting { votes, .. } => {
+            format!("投票阶段：{}/{} 人已投票", votes.len(), alive)
+        }
+        Phase::RunoffDescribing {
+            candidates,
+            descriptions,
+        } => format!(
+            "平票加赛：{}/{} 人已补充描述（候选 {} 人）",
+            descriptions.len(),
+            candidates.len(),
+            candidates.len()
+        ),
+        Phase::RunoffVoting {
+            candidates, votes, ..
+        } => format!(
+            "平票再投：{}/{} 票（从 {} 名候选中选）",
+            votes.len(),
+            alive,
+            candidates.len()
+        ),
     }
 }
 

@@ -441,6 +441,12 @@ pub(crate) struct HttpProviderView {
     pub last_refresh_at_ms: Option<u64>,
     pub next_refresh_check_at_ms: Option<u64>,
     pub last_refresh_error: Option<String>,
+    /// 该凭据需要用户重新登录才能恢复自动续期（如酷狗网页扫码凭据缺 t1）。
+    /// 面板据此显示提示，避免用户以为「一切正常」而实际随时会掉线。
+    pub needs_reauth: bool,
+    /// `needs_reauth` 为真时的稳定原因码，供前端选择文案。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub needs_reauth_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -513,6 +519,17 @@ pub(crate) trait HttpLoginPort: Send + Sync {
     ) -> Result<Option<ProviderAccountStatus>, HttpLoginError>;
     fn kugou_claim_vip(&self) -> Result<KugouListenReport, HttpLoginError>;
     fn kugou_upgrade_vip(&self) -> Result<KugouListenReport, HttpLoginError>;
+    /// 请求发送酷狗概念版登录验证码（**会真实下发短信**，运行时含 60 秒冷却）。
+    fn kugou_send_phone_login_code(
+        &self,
+        mobile: &str,
+    ) -> Result<miliastra_playback::KugouPhoneCodeSent, HttpLoginError>;
+    /// 用手机号 + 验证码完成酷狗概念版登录（凭据由后端落盘）。
+    fn kugou_phone_login(
+        &self,
+        mobile: &str,
+        code: &str,
+    ) -> Result<CredentialStatus, HttpLoginError>;
 }
 
 /// AI 点歌端口：识歌、歌曲身份匹配与候选挑选。

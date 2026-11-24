@@ -938,6 +938,25 @@ impl HttpLoginPort for ApplicationHttpLoginFacade {
     fn kugou_upgrade_vip(&self) -> Result<miliastra_playback::KugouListenReport, HttpLoginError> {
         self.manager.kugou_upgrade_vip().map_err(login_error)
     }
+
+    fn kugou_send_phone_login_code(
+        &self,
+        mobile: &str,
+    ) -> Result<miliastra_playback::KugouPhoneCodeSent, HttpLoginError> {
+        self.manager
+            .kugou_send_phone_login_code(mobile)
+            .map_err(login_error)
+    }
+
+    fn kugou_phone_login(
+        &self,
+        mobile: &str,
+        code: &str,
+    ) -> Result<CredentialStatus, HttpLoginError> {
+        self.manager
+            .kugou_phone_login(mobile, code)
+            .map_err(login_error)
+    }
 }
 
 fn provider_view(view: ProviderView) -> HttpProviderView {
@@ -952,6 +971,8 @@ fn provider_view(view: ProviderView) -> HttpProviderView {
         last_refresh_at_ms: view.last_refresh_at_ms,
         next_refresh_check_at_ms: view.next_refresh_check_at_ms,
         last_refresh_error: view.last_refresh_error,
+        needs_reauth: view.needs_reauth,
+        needs_reauth_reason: view.needs_reauth_reason,
     }
 }
 

@@ -211,6 +211,14 @@ const BODY_ROUTES: &[BodyRouteSpec] = &[
         handler: player_login_cancel_body_route,
     },
     BodyRouteSpec {
+        path: "/player/kugou/phone/code",
+        handler: player_kugou_phone_code_body_route,
+    },
+    BodyRouteSpec {
+        path: "/player/kugou/phone/login",
+        handler: player_kugou_phone_login_body_route,
+    },
+    BodyRouteSpec {
         path: "/player/logout",
         handler: player_logout_body_route,
     },

@@ -1285,6 +1285,19 @@ input[type=range]::-moz-range-track {
   word-break: break-word;
 }
 
+/* 「需要重新登录」提示：是提醒而非报错，所以用告警色描边而不是错误红。 */
+.login-reauth-note {
+  margin-top: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  border-left: 3px solid var(--warn-soft);
+  border-radius: var(--radius-sm);
+  background: var(--warn-bg, transparent);
+  color: var(--text-2);
+  font-size: var(--fs-meta);
+  line-height: 1.5;
+  word-break: break-word;
+}
+
 .login-qr {
   display: grid;
   grid-template-columns: 180px minmax(0,1fr);

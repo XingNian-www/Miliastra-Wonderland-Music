@@ -35,7 +35,8 @@ pub use model::{
     PlayableTrack, SearchCandidate, SearchQuery, TrackKey, TrackKeyError, TrackMetadata, TrackRef,
 };
 pub use runtime::{
-    LoginOperation, LoginOperationWaitError, LoginSession, LoginStatus, PlaybackError,
-    PlaybackHandle, PlaybackOperation, PlaybackRuntime, PlaybackSnapshot, PlaylistImportOperation,
+    KugouPhoneCodeSent, LoginOperation, LoginOperationWaitError, LoginSession, LoginStatus,
+    PlaybackError, PlaybackHandle, PlaybackOperation, PlaybackRuntime, PlaybackSnapshot,
+    PlaylistImportOperation,
 };
 pub use speech::{PcmAudio, SpeechAudio, SpeechError, SpeechHealth, SpeechPlayer};

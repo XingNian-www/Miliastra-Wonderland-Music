@@ -626,6 +626,21 @@ struct LoginCancelRequest {
     session_id: Uuid,
 }
 
+/// 酷狗手机验证码发送请求。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct KugouPhoneCodeRequest {
+    mobile: String,
+}
+
+/// 酷狗手机验证码登录请求。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct KugouPhoneLoginRequest {
+    mobile: String,
+    code: String,
+}
+
 pub(super) fn player_play_track_body_route(
     body: &[u8],
     state: &HttpSharedState,
@@ -658,6 +673,44 @@ pub(super) fn player_login_start_body_route(
         "provider": session.provider,
     })
     .to_string())
+}
+
+/// 发送酷狗概念版登录验证码。
+///
+/// 这是**会真实下发短信**的端点，只应由用户在面板上点击触发；运行时内置
+/// 60 秒冷却，冷却内会返回 `kugou_phone_code_cooldown` 而不是再发一条。
+pub(super) fn player_kugou_phone_code_body_route(
+    body: &[u8],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let request = parse_json_body::<KugouPhoneCodeRequest>(body, "验证码发送请求")?;
+    let sent = state
+        .application
+        .login
+        .kugou_send_phone_login_code(request.mobile.trim())
+        .map_err(login_http_error)?;
+    serde_json::to_string(&json!({
+        "ok": true,
+        "mobileMasked": sent.mobile_masked,
+        "nextSendAtMs": sent.next_send_at_ms,
+    }))
+    .map_err(internal_error)
+}
+
+/// 用手机号 + 验证码完成酷狗概念版登录（凭据由后端落盘）。
+pub(super) fn player_kugou_phone_login_body_route(
+    body: &[u8],
+    state: &HttpSharedState,
+) -> std::result::Result<String, AppError> {
+    let request = parse_json_body::<KugouPhoneLoginRequest>(body, "验证码登录请求")?;
+    serde_json::to_string(
+        &state
+            .application
+            .login
+            .kugou_phone_login(request.mobile.trim(), request.code.trim())
+            .map_err(login_http_error)?,
+    )
+    .map_err(internal_error)
 }
 
 pub(super) fn player_login_cancel_body_route(

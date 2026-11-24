@@ -112,6 +112,11 @@
             {{ refreshInfo(item) }}
           </div>
 
+          <!-- 需要重新登录的提示：避免用户在不知情的情况下「某天突然掉线」 -->
+          <div v-if="reauthNote(item)" class="login-reauth-note">
+            {{ reauthNote(item) }}
+          </div>
+
           <div v-if="item.provider === 'kugou'" class="controls" style="margin-top:10px">
             <button class="btn small good" :disabled="busy" @click="claimVip">领取酷狗 VIP</button>
             <button class="btn small good" :disabled="busy" @click="upgradeVip">升级酷狗 VIP</button>
@@ -215,6 +220,21 @@ function refreshInfo(item) {
   }
   if (item.lastRefreshError) parts.push(item.lastRefreshError)
   return parts.join(' · ')
+}
+
+// 需要重新登录的提示。这是「不静默掉线」的关键：酷狗网页扫码登录拿不到 t1，
+// 协议上就无法自动续期，必须让用户在 token 过期前就知道，而不是某天突然不可用。
+const REAUTH_NOTES = {
+  kugou_web_credential_not_refreshable:
+    '本次登录不支持长期自动续期（网页扫码登录缺少续期字段），登录过期后需要重新登录。如需长期免登录，请改用手机号验证码登录。',
+  kugou_refresh_rejected:
+    '上游拒绝了本次登录的自动续期，请重新登录。',
+  kugou_verifycode_login_returned_no_t1:
+    '本次登录未拿到续期字段，无法自动续期，请重新登录。'
+}
+function reauthNote(item) {
+  if (!item.needsReauth) return ''
+  return REAUTH_NOTES[item.needsReauthReason] || '当前登录无法自动续期，过期后需要重新登录。'
 }
 let lastReport = { at: 0, text: '' }
 function report(error) {

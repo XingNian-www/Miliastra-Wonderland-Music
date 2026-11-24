@@ -2045,6 +2045,8 @@ impl HttpLoginPort for HttpTestLoginPort {
                     last_refresh_at_ms: status.last_refresh_at_ms,
                     next_refresh_check_at_ms: status.next_refresh_check_at_ms,
                     last_refresh_error: status.last_refresh_error,
+                    needs_reauth: status.needs_reauth,
+                    needs_reauth_reason: status.needs_reauth_reason.clone(),
                 }
             })
             .collect())
@@ -2167,6 +2169,26 @@ impl HttpLoginPort for HttpTestLoginPort {
             vip_days: 7,
             message: "升级成功".to_owned(),
         })
+    }
+
+    // 手机登录相关的替身：真实实现会发短信/登录，测试替身一律返回可预测值，
+    // 绝不触网。
+    fn kugou_send_phone_login_code(
+        &self,
+        _mobile: &str,
+    ) -> Result<miliastra_playback::KugouPhoneCodeSent, HttpLoginError> {
+        Ok(miliastra_playback::KugouPhoneCodeSent {
+            mobile_masked: "13*****0".to_owned(),
+            next_send_at_ms: 1_700_000_060_000,
+        })
+    }
+
+    fn kugou_phone_login(
+        &self,
+        _mobile: &str,
+        _code: &str,
+    ) -> Result<miliastra_playback::CredentialStatus, HttpLoginError> {
+        Ok(miliastra_playback::CredentialStatus::empty("kugou"))
     }
 }
 
@@ -3268,6 +3290,24 @@ fn remote_http_api_requires_token_when_configured() {
     assert!(requires_access_token(&config.http, &request.path));
     assert!(!has_valid_access_token(&request, &config.http.access_token));
     assert!(!requires_access_token(&config.http, "/"));
+}
+
+/// 发短信是最敏感的动作：两个手机登录端点必须落在需要令牌的通道内，
+/// 且必须是 mutating（POST）路由，不能通过 GET 触发。
+#[test]
+fn kugou_phone_login_endpoints_require_auth_and_post() {
+    let mut config: AppConfig =
+        serde_norway::from_str(crate::config::bundled_config_yaml()).expect("default config");
+    config.http.access_token = "secret".to_string();
+    for path in ["/player/kugou/phone/code", "/player/kugou/phone/login"] {
+        assert!(
+            requires_access_token(&config.http, path),
+            "{path} 必须要求访问令牌"
+        );
+        assert!(is_mutating_route(path), "{path} 必须是 mutating 路由");
+        // 只有注册成 BodyRouteSpec，enforce_method 才会要求 POST。
+        assert!(body_route_spec(path).is_some(), "{path} 必须是 POST 路由");
+    }
 }
 
 #[test]

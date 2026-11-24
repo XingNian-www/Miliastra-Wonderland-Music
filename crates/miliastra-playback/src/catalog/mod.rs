@@ -28,6 +28,17 @@ pub trait KugouAccountAdapter: Send + Sync + 'static {
     async fn account_status(&self) -> Result<kugou::KugouAccountStatus, CatalogError>;
     async fn claim_vip(&self) -> Result<kugou::KugouListenReport, CatalogError>;
     async fn upgrade_vip(&self) -> Result<kugou::KugouListenReport, CatalogError>;
+    /// 向手机号发送概念版登录验证码。
+    ///
+    /// **会真实下发短信**：只有用户在前端点「发送验证码」时才允许调用，
+    /// 实现与调用链都不得包含自动重试。
+    async fn send_phone_login_code(&self, mobile: &str) -> Result<(), CatalogError>;
+    /// 用手机号 + 验证码完成概念版登录，返回具备自动续期能力的凭据。
+    async fn login_by_phone_code(
+        &self,
+        mobile: &str,
+        code: &str,
+    ) -> Result<ProviderCredential, CatalogError>;
 }
 
 /// 支持手动凭据刷新的平台适配器（QQ 音乐、哔哩哔哩）。
@@ -60,6 +71,13 @@ pub enum CatalogError {
     AuthRequired(String),
     #[error("source credential was rejected: {0}")]
     CredentialRejected(String),
+    /// 上游明确拒绝了续期请求，且该拒绝是「凭据类型本身不支持续期」这一类。
+    ///
+    /// 与 [`Self::CredentialRejected`] 的区别：凭据当前**仍然可用**（服务端接受其会话），
+    /// 只是无法换取长期续期令牌。调用方应保留旧凭据并把状态标记为需要重新登录，
+    /// 而不是当作登录失败丢弃它。
+    #[error("source credential cannot be refreshed: {reason}")]
+    RefreshUnavailable { reason: String },
     #[error("track requires VIP membership: {0}")]
     VipRequired(String),
     #[error("track has no copyright: {0}")]
@@ -109,6 +127,13 @@ impl CatalogError {
             Self::CredentialRejected(_) => {
                 ("relogin_required", "source credential was rejected", false)
             }
+            // 凭据仍可用但无法续期：对用户是「需要重新登录」，但不是立即失效，
+            // 因此不标为可重试的临时故障。
+            Self::RefreshUnavailable { .. } => (
+                "relogin_required",
+                "source credential cannot be refreshed",
+                false,
+            ),
             Self::VipRequired(_) => ("track_vip_required", "track requires VIP membership", false),
             Self::NoCopyright(_) => ("track_no_copyright", "track has no copyright", false),
             Self::Unavailable(_) => ("track_unavailable", "track is unavailable", false),
@@ -348,7 +373,9 @@ impl AccountStatusCache {
 /// 不返回原始错误文本，因为请求错误可能包含 URL 查询参数、Cookie 或凭据。
 pub(crate) fn account_status_error_code(error: &CatalogError) -> &'static str {
     match error {
-        CatalogError::AuthRequired(_) | CatalogError::CredentialRejected(_) => "relogin_required",
+        CatalogError::AuthRequired(_)
+        | CatalogError::CredentialRejected(_)
+        | CatalogError::RefreshUnavailable { .. } => "relogin_required",
         CatalogError::RateLimited(_) => "provider_rate_limited",
         CatalogError::VerificationRequired(_) => "provider_verification_required",
         CatalogError::TimedOut(_) => "provider_timeout",

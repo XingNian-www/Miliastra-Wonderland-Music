@@ -193,6 +193,16 @@ export function undercover() {
     completed: 1,
     total: 9,
     remainingSeconds: 30,
+    // 规则说明、开局者、存活数、阶段提示、阶段进度、出局名单：
+    // 与 32c960c 扩展后的 UndercoverSnapshot 对齐；身份（谁是卧底/平民）绝不出现，
+    // 开局者也只给展示名，不给已登记身份下的 UUID 比较键。
+    modeHint: '1 名卧底，平民找出他即可获胜',
+    creator: DEMO.player,
+    aliveCount: 2,
+    phaseHint: '描述阶段：1/2 人已提交',
+    phaseCompleted: 1,
+    phaseTotal: 2,
+    eliminated: ['阿贝多'],
   }
 }
 

@@ -599,12 +599,26 @@ test('web/src 实际调用的每条路由都有假数据（覆盖范围以扫描
   assert.deepEqual([...new Set(missing)], [], `以下前端调用的路由没有假数据：${missing}`)
 })
 
-test('三个玩法状态快照的字段名与 Rust 侧一致（改名字这里先红）', () => {
+test('玩法状态快照的字段名与 Rust 侧一致（改名字这里先红）', () => {
   // 这些字段名不是随便起的：面板直接按名取值，写错一个字段的代价是
   // 「页面不报错、但那格永远是空/永远是默认值」——纯看截图很难发现。
   // 例：数字炸弹一度按 `phaseLabel` 取值，而后端只给 `phase`，
   // 于是无论是否在玩都显示「空闲」。
   const phaseIn = (allowed) => (value) => assert.ok(allowed.includes(value.phase), `未知 phase: ${value.phase}`)
+
+  // 卧底在 32c960c 扩了 7 个字段（规则/开局者/存活数/阶段提示/阶段进度/出局名单），
+  // 假数据漏同步时面板会退回占位符——字段集合这里钉死。
+  const spy = JSON.parse(mockResponse('/undercover').body)
+  assert.deepEqual(Object.keys(spy).sort(), [
+    'aliveCount', 'completed', 'creator', 'eliminated', 'enabled', 'mode', 'modeHint',
+    'phase', 'phaseCompleted', 'phaseHint', 'phaseTotal', 'players', 'remainingSeconds',
+    'round', 'total',
+  ])
+  phaseIn(['idle', 'lobby', 'delivering', 'describing', 'voting', 'runoff_describing', 'runoff_voting'])(spy)
+  // 身份红线：玩家快照只有位置/展示名/存活，没有角色。
+  for (const player of spy.players) {
+    assert.deepEqual(Object.keys(player).sort(), ['alive', 'name', 'position'])
+  }
 
   const idiom = JSON.parse(mockResponse('/idiom-chain').body)
   assert.deepEqual(Object.keys(idiom).sort(), [

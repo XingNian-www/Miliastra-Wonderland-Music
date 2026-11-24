@@ -47,13 +47,26 @@
             <div class="turtle-stat"><span>AI 待处理</span><strong>{{ numberOrDash(turtle.pendingAi) }}</strong></div>
             <div class="turtle-stat"><span>剩余题目</span><strong>{{ turtle.remainingPuzzles == null ? '未知' : turtle.remainingPuzzles }}</strong></div>
           </div>
+          <div class="turtle-stats" style="margin-top:10px">
+            <div class="turtle-stat"><span>生成号</span><strong>{{ turtle.generation == null ? '—' : turtle.generation }}</strong></div>
+            <div class="turtle-stat"><span>最近裁决</span><strong>{{ turtleJudgments.length }} 条</strong></div>
+            <div class="turtle-stat"><span>结算告警</span><strong>{{ turtle.settlementIncomplete ? '不完整' : '无' }}</strong></div>
+          </div>
+
+          <div v-if="turtleParticipants.length" class="ent-tag-row">
+            <span class="ent-tag-label">参与者</span>
+            <span v-for="name in turtleParticipants" :key="name" class="ent-tag">{{ name }}</span>
+          </div>
+
+          <div v-if="turtle.lastError" class="ent-alert">最后错误：{{ turtle.lastError }}</div>
 
           <div class="result" style="margin-top:12px;min-height:72px">
             <div v-for="(line, index) in turtleSurfaceLines" :key="index">{{ line }}</div>
           </div>
 
-          <div class="turtle-grid">
+          <div style="margin-top:12px">
             <div class="history turtle-history" style="max-height:220px">
+              <div v-if="turtleJudgments.length" class="config-field-hint" style="padding:0 0 4px">最近裁决（{{ turtleJudgments.length }} 条，最多显示 30 条）</div>
               <template v-if="turtleJudgments.length">
                 <div v-for="item in turtleJudgments" :key="item.requestId" class="history-item">
                   <div>
@@ -100,6 +113,19 @@
             <div class="turtle-stat"><span>人数</span><strong>{{ undercoverPlayers.length }}</strong></div>
             <div class="turtle-stat"><span>剩余</span><strong>{{ formatSeconds(undercover.remainingSeconds) }}</strong></div>
           </div>
+          <div class="turtle-stats" style="margin-top:10px">
+            <div class="turtle-stat"><span>存活</span><strong>{{ undercover.aliveCount ?? 0 }} / {{ undercoverPlayers.length }}</strong></div>
+            <div class="turtle-stat"><span>阶段进度</span><strong>{{ undercover.phaseCompleted || 0 }} / {{ undercover.phaseTotal || 0 }}</strong></div>
+            <div class="turtle-stat"><span>开局者</span><strong>{{ undercover.creator || '—' }}</strong></div>
+          </div>
+
+          <p v-if="undercover.modeHint" class="config-field-hint" style="margin-top:8px">规则：{{ undercover.modeHint }}</p>
+          <div v-if="undercover.phaseHint" class="ent-callout">{{ undercover.phaseHint }}</div>
+
+          <div v-if="undercoverEliminated.length" class="ent-tag-row">
+            <span class="ent-tag-label">已出局</span>
+            <span v-for="name in undercoverEliminated" :key="name" class="ent-tag out">{{ name }}</span>
+          </div>
 
           <div class="undercover-players" style="margin-top:12px">
             <div v-for="(player, index) in undercoverPlayers" :key="`${player.name}-${index}`" class="undercover-player">
@@ -130,10 +156,17 @@
             <div class="turtle-stat"><span>在场</span><strong>{{ numberBombPlayers.length }}</strong></div>
             <div class="turtle-stat"><span>已用</span><strong>{{ formatSeconds(numberBomb.elapsed_seconds) }}</strong></div>
           </div>
-          <p v-if="numberBombLive" class="config-field-hint">
-            当前区间 {{ numberBomb.lower ?? '—' }} ~ {{ numberBomb.upper ?? '—' }}，轮到第 {{ (numberBomb.turn ?? 0) + 1 }} 位；
-            已排除 {{ numberBombGuessed.length }} 个数字。
-          </p>
+          <div v-if="numberBombLive" class="turtle-stats" style="margin-top:10px">
+            <div class="turtle-stat"><span>当前区间</span><strong>{{ numberBombRange }}</strong></div>
+            <div class="turtle-stat"><span>轮到谁</span><strong>{{ numberBombTurnName }}</strong></div>
+            <div class="turtle-stat"><span>上次输家</span><strong>{{ numberBombLoserName }}</strong></div>
+            <div class="turtle-stat"><span>上轮炸弹</span><strong>{{ numberBombLastBomb }}</strong></div>
+          </div>
+          <div class="ent-tag-row">
+            <span class="ent-tag-label">已猜数字</span>
+            <span v-for="value in numberBombGuessed" :key="value" class="ent-tag">{{ value }}</span>
+            <span v-if="!numberBombGuessed.length" class="ent-tag-label">暂无</span>
+          </div>
           <p class="config-field-hint">命令 @数字炸弹；配置在「配置中心 → 娱乐玩法」修改。</p>
         </div>
       </div>
@@ -152,9 +185,19 @@
             <div class="turtle-stat"><span>已接龙</span><strong>{{ idiomChain.total ?? 0 }}</strong></div>
             <div class="turtle-stat"><span>词库条目</span><strong>{{ idiomChain.lexicon_len ?? '—' }}</strong></div>
           </div>
-          <p v-if="idiomLive" class="config-field-hint">
-            开局者 {{ idiomChain.starter || '—' }}，下一条需以「{{ idiomChain.expected_first || '—' }}」开头。
-          </p>
+          <div v-if="idiomLive" class="turtle-stats" style="margin-top:10px">
+            <div class="turtle-stat"><span>开局者</span><strong>{{ idiomChain.starter || '—' }}</strong></div>
+            <div class="turtle-stat"><span>下一条首字</span><strong>{{ idiomChain.expected_first ? `「${idiomChain.expected_first}」` : '—' }}</strong></div>
+            <div class="turtle-stat"><span>模式</span><strong>{{ idiomChain.mode || '—' }}</strong></div>
+          </div>
+          <div class="config-field-hint" style="margin-top:8px">接龙历史（{{ idiomHistory.length }} 条，按发生顺序）</div>
+          <div v-if="idiomHistory.length" class="history" style="max-height:180px">
+            <div v-for="(item, index) in idiomHistory" :key="`${item}-${index}`" class="history-item">
+              <span class="history-time">#{{ index + 1 }}</span>
+              <b>{{ item }}</b>
+            </div>
+          </div>
+          <div v-else class="config-field-hint">本局还没有接龙记录。</div>
           <p class="config-field-hint">命令 @接龙 / @接龙结束；词库缺失时会在日志里报错。</p>
         </div>
       </div>
@@ -169,12 +212,18 @@
             <div class="turtle-stat"><span>塔罗动态</span><strong>{{ tarotLogs.length }}</strong></div>
             <div class="turtle-stat"><span>卡牌动态</span><strong>{{ cardLogs.length }}</strong></div>
           </div>
+          <div class="turtle-stats" style="margin-top:10px">
+            <div class="turtle-stat"><span>当前回合</span><strong>{{ cardGameCurrentName }}</strong></div>
+            <div class="turtle-stat"><span>地主</span><strong>{{ cardGameLandlordName }}</strong></div>
+            <div class="turtle-stat"><span>累计超时</span><strong>{{ cardGameTimeouts }} 次</strong></div>
+            <div class="turtle-stat"><span>本局已用</span><strong>{{ formatSeconds(cardGame.elapsed_seconds) }}</strong></div>
+          </div>
           <div v-if="cardGamePlayers.length" class="undercover-players" style="margin-top:12px">
             <div v-for="(player, index) in cardGamePlayers" :key="`${player.name}-${index}`" class="undercover-player">
               <span class="undercover-position">{{ index + 1 }}</span>
               <span class="undercover-name">{{ player.name || '未知玩家' }}</span>
               <span class="undercover-state" :class="{ out: player.hand_count === 0 }">
-                {{ player.hand_count }} 张{{ player.trustee ? ' · 托管' : '' }}
+                {{ player.hand_count }} 张{{ player.trustee ? ' · 托管' : '' }}{{ player.timeouts ? ` · 超时 ${player.timeouts} 次` : '' }}
               </span>
             </div>
           </div>
@@ -237,9 +286,27 @@ const phaseLabel = (phase) => PHASE_LABELS[phase] || (phase ? String(phase) : '�
 const numberBombLive = computed(() => (numberBomb.value.phase || 'idle') !== 'idle')
 const numberBombPlayers = computed(() => numberBomb.value.players || [])
 const numberBombGuessed = computed(() => numberBomb.value.guessed || [])
+// 区间/轮到谁/上轮结果只在真的开局后才有意义：idle 时快照里的 0/0 不是「区间 0~0」。
+const numberBombRange = computed(() =>
+  numberBombLive.value ? `${numberBomb.value.lower ?? '—'} ~ ${numberBomb.value.upper ?? '—'}` : '—')
+const numberBombTurnName = computed(() => (numberBombLive.value
+  ? playerNameAt(numberBombPlayers.value, numberBomb.value.turn, 'display')
+  : '—'))
+// 输家和炸弹数分成两格：`.turtle-stat strong` 是 nowrap+ellipsis，
+// 合成一句「阿贝多 · 炸弹 58」在窄列里会被截成「阿贝多 · …」。
+const numberBombLoserName = computed(() => {
+  const result = numberBomb.value?.last_result
+  return result ? playerNameAt(numberBombPlayers.value, result.loser, 'display') : '—'
+})
+const numberBombLastBomb = computed(() => (numberBomb.value?.last_result ? numberBomb.value.last_result.bomb : '—'))
 const idiomLive = computed(() => (idiomChain.value.phase || 'idle') === 'active')
+const idiomHistory = computed(() => (Array.isArray(idiomChain.value?.history) ? idiomChain.value.history : []))
 const cardGameLive = computed(() => (cardGame.value.phase || 'idle') !== 'idle')
 const cardGamePlayers = computed(() => cardGame.value.players || [])
+const cardGameCurrentName = computed(() => playerNameAt(cardGamePlayers.value, cardGame.value?.current))
+const cardGameLandlordName = computed(() => playerNameAt(cardGamePlayers.value, cardGame.value?.landlord))
+const cardGameTimeouts = computed(() => cardGamePlayers.value
+  .reduce((sum, player) => sum + Number(player.timeouts || 0), 0))
 
 const rangeText = computed(() => {
   const cfg = otherConfig.value.number_bomb || {}
@@ -277,6 +344,9 @@ const turtleEnabled = computed(() => turtle.value?.enabled === true)
 const turtleActive = computed(() => Boolean(turtle.value?.phase) && turtle.value.phase !== 'idle')
 const undercoverEnabled = computed(() => undercover.value?.enabled === true)
 const undercoverPlayers = computed(() => (Array.isArray(undercover.value?.players) ? undercover.value.players : []))
+// 后端只给已出局玩家的展示名（eliminated），不给角色/身份键；这里原样渲染。
+const undercoverEliminated = computed(() => (Array.isArray(undercover.value?.eliminated) ? undercover.value.eliminated : []))
+const turtleParticipants = computed(() => (Array.isArray(turtle.value?.participants) ? turtle.value.participants : []))
 const turtleJudgments = computed(() => {
   const items = Array.isArray(turtle.value?.recentJudgments) ? turtle.value.recentJudgments : []
   return items.slice(-30).reverse()
@@ -313,15 +383,22 @@ const turtleSurfaceLines = computed(() => {
   const lines = []
   if (turtleActive.value) {
     if (value.starter) lines.push(`开局者：${value.starter}`)
-    if (Array.isArray(value.participants) && value.participants.length) lines.push(`参与者：${value.participants.join('、')}`)
+    // 参与者已在上方以 chips 形式列出，这里不再重复一行。
     lines.push(`汤面：${value.surface || '等待公布'}`)
   } else {
     lines.push(turtleEnabled.value ? '当前没有进行中的海龟汤' : '海龟汤功能未启用')
   }
-  if (value.settlementIncomplete) lines.push('上次结算消息发送不完整')
-  if (value.lastError) lines.push(`状态：${value.lastError}`)
   return lines
 })
+
+// 快照里的下标（turn/current/landlord/loser）永远相对 `players` 数组；
+// 越界时回退成「第 N 位」，绝不显示 undefined。
+function playerNameAt(players, index, field = 'name') {
+  if (index == null) return '—'
+  const position = Number(index)
+  const player = players[position]
+  return player?.[field] || `第 ${position + 1} 位`
+}
 
 function numberOrDash(value) {
   return value == null ? '—' : String(value)
@@ -458,4 +535,46 @@ onBeforeUnmount(() => {
 .entertainment-page .wide { grid-column: 1 / -1; }
 .entertainment-page .tab-meta { margin-left: 6px; color: var(--text-3); font-size: 12px; }
 .entertainment-page .turtle-toolbar .config-input { min-width: 0; }
+/* 已出局/已猜数字这类短列表：一行内换行，长名单不会把卡片撑爆。 */
+.entertainment-page .ent-tag-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-1);
+  margin-top: 8px;
+}
+.entertainment-page .ent-tag-label {
+  color: var(--text-3);
+  font-size: var(--fs-tiny);
+  line-height: var(--lh-tiny);
+  margin-right: 2px;
+}
+.entertainment-page .ent-tag {
+  padding: 0 6px;
+  border: 1px solid var(--sep-2);
+  border-radius: 999px;
+  background: var(--bg-input);
+  color: var(--text-1);
+  font-size: var(--fs-tiny);
+  line-height: 18px;
+}
+.entertainment-page .ent-tag.out { color: var(--text-3); text-decoration: line-through; }
+/* 阶段提示是「现在该做什么」的一句话，值得比普通 hint 更显眼。 */
+.entertainment-page .ent-callout {
+  margin-top: 8px;
+  padding: var(--sp-1) var(--sp-2);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-m);
+  background: var(--bg-input);
+  color: var(--text-1);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-meta);
+}
+.entertainment-page .ent-alert {
+  margin-top: 8px;
+  color: var(--danger);
+  font-size: var(--fs-meta);
+  line-height: var(--lh-meta);
+  word-break: break-word;
+}
 </style>

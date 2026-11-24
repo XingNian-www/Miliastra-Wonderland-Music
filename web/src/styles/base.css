@@ -856,10 +856,11 @@ body {
   border-right: 1px solid var(--sep-2);
 }
 
-/* 选中是系统蓝实底 + 白字（macOS Big Sur 起的侧边栏强调色），
-   半透明蓝会让文字对比度不足，也不像原生控件。 */
+/* 选中是系统蓝实底 + 白字。用 --accent-solid 而非 --accent：
+   #0a84ff 压白字只有 3.65:1，13px 正文不达 WCAG AA；--accent-solid 是
+   同色系深一档（4.78:1），视觉上仍是 macOS 侧栏蓝。 */
 .nav-link.active {
-  background: var(--accent);
+  background: var(--accent-solid);
   border-color: transparent;
   color: var(--on-accent);
   font-weight: 500;
@@ -872,7 +873,7 @@ body {
 }
 
 .nav-link.active:hover {
-  background: var(--accent-strong);
+  background: var(--accent-solid-hover);
   color: var(--on-accent);
 }
 

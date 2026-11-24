@@ -47,6 +47,13 @@
   /* ---------- 语义色 ---------- */
   --accent: #0a84ff;
   --accent-strong: #409cff;
+  /* 白字实底专用强调色。
+   *
+   * 直接拿 --accent(#0a84ff) 铺底 + 白字只有 3.65:1，低于 WCAG AA 的 4.5。
+   * 但强调色本身要留给「描边/淡底/选中边框」这类不压白字的场景（那里需要鲜亮）。
+   * 所以拆一个更深的实底色：#0070e0 压白字 4.78:1，视觉上仍是系统蓝。 */
+  --accent-solid: #0070e0;
+  --accent-solid-hover: #0064c8;
   --accent-soft: rgba(10, 132, 255, 0.18);
   --primary-hover: rgba(255, 255, 255, 0.24);
   --ok: #30d158;
@@ -170,6 +177,8 @@ html[data-theme="light"] {
   /* ---------- 语义色 ---------- */
   --accent: #007aff;
   --accent-strong: #0066d6;
+  --accent-solid: #0066cc;
+  --accent-solid-hover: #0059b3;
   --accent-soft: rgba(0, 122, 255, 0.12);
   --primary-hover: rgba(0, 0, 0, 0.14);
   --ok: #28cd41;

@@ -2870,7 +2870,7 @@ code, pre {
 /* 配置中心的二级侧栏和左侧全局导航是同一套控件语言：整块系统蓝胶囊 + 白字。
    原来是 accent-soft 的半透明蓝，在浅色下几乎看不出选中，和主侧栏也不一致。 */
 .config-section-item.active {
-  background: var(--accent);
+  background: var(--accent-solid);
   color: var(--on-accent);
   font-weight: 500;
 }
@@ -3566,7 +3566,7 @@ input:focus, select:focus, textarea:focus {
 
 /* primary 只由 `.primary` 触发：系统蓝实底 + 白字，无描边。 */
 .btn.primary {
-  background: var(--accent);
+  background: var(--accent-solid);
   border-color: transparent;
   color: var(--on-accent);
   font-weight: 500;
@@ -4283,7 +4283,7 @@ input[type="checkbox"]:checked::after {
 }
 
 .commands-mac-page .command-reply-nav button.active {
-  background: var(--accent);
+  background: var(--accent-solid);
   border-color: transparent;
   color: var(--on-accent);
   font-weight: 500;
@@ -5364,4 +5364,74 @@ label.form-mac-row:hover {
 .form-mac-page .config-num-row label {
   color: var(--text-3);
   font-size: var(--fs-tiny);
+}
+
+/* ============================================================================
+ * 分段控件全局统一（macOS Segmented Control）
+ *
+ * 背景：改造由三路并行完成，分段控件落下 5 种规格——`.form-mac-seg`（36px 轨道/
+ * 浮块）、遗留 `.tabs`（30px/无描边/白 16% 浮块）、播放模式（蓝实底按钮组）、
+ * 调试沙盒（无轨道）、视觉档案（2px 实心描边环）。同一个「当前选中」在
+ * 14 个页面里长成 5 样，是并行开发最典型的分裂。
+ *
+ * 这里把 `.tabs` / `.tab` 收敛成唯一形态（轨道 + 浮块）。全站 `.tabs` 共 6 处
+ * （娱乐/游戏/AI 两级/任务日志/命令来源筛选），全部是页签组，没有别的语义，
+ * 所以可以直接在基类上统一，不必逐个加类。
+ * ========================================================================== */
+
+:root {
+  --seg-track: var(--fill-1);
+  --seg-thumb: var(--bg-3);
+  --seg-thumb-border: var(--sep-2);
+  --seg-thumb-shadow: 0 1px 2px rgba(0, 0, 0, 0.18);
+}
+html[data-theme="light"] {
+  /* 浅色下浮块用纯白才"浮"得起来；轨道用更实的灰。 */
+  --seg-track: rgba(0, 0, 0, 0.06);
+  --seg-thumb: #ffffff;
+  --seg-thumb-border: rgba(0, 0, 0, 0.08);
+  --seg-thumb-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
+}
+
+.tabs {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  width: max-content;
+  max-width: 100%;
+  padding: 3px;
+  border: 1px solid var(--sep-1);
+  border-radius: 9px;
+  background: var(--seg-track);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.tabs::-webkit-scrollbar {
+  height: 0;
+}
+
+.tabs .tab {
+  height: 28px;
+  padding: 0 14px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: var(--fs-item);
+  font-weight: 500;
+  white-space: nowrap;
+  /* macOS 分段块瞬间跟手，不做过渡（也会让首帧截图截到插值中间态）。 */
+  transition: none;
+}
+.tabs .tab:hover {
+  background: var(--fill-1);
+  color: var(--text-1);
+}
+.tabs .tab.active,
+.tabs .tab.primary {
+  background: var(--seg-thumb);
+  border-color: var(--seg-thumb-border);
+  color: var(--text-1);
+  font-weight: 600;
+  box-shadow: var(--seg-thumb-shadow);
 }

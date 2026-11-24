@@ -31,6 +31,8 @@ srv=Q(("127.0.0.1",0), functools.partial(http.server.SimpleHTTPRequestHandler, d
 port=srv.server_address[1]
 threading.Thread(target=srv.serve_forever,daemon=True).start()
 subprocess.run(["chromium","--headless=new","--no-sandbox","--disable-gpu","--disable-web-security",
+  # 同上：声明鼠标 hover 能力，避免 hover-only 入口在截图里常显。
+  "--blink-settings=primaryHoverType=2,availableHoverTypes=2,primaryPointerType=4,availablePointerTypes=4",
   "--user-data-dir="+tempfile.mkdtemp(),"--window-size=1500,1200","--virtual-time-budget=11000",
   f"--screenshot={out}", f"http://127.0.0.1:{port}/#{route}"],capture_output=True)
 print(out)

@@ -167,6 +167,11 @@ def serve(directory):
 def run_chromium(url, screenshot, width, timeout=60):
     cmd = [
         "chromium", "--headless=new", "--no-sandbox", "--disable-gpu", "--disable-web-security",
+        # 无头 Chromium 的 (hover:hover) 恒为 false，会让 @media (hover:hover) 的规则
+        # （例如「只在鼠标悬停时淡入的操作按钮」）全部不生效——截图里这些入口会「常显」，
+        # 而真机上它们是隐藏的。这会让视觉核验系统性地偏乐观。显式声明鼠标型指针 +
+        # 支持 hover，才能让截图与真机一致。primaryHoverType/Type 用 2=hover。
+        "--blink-settings=primaryHoverType=2,availableHoverTypes=2,primaryPointerType=4,availablePointerTypes=4",
         f"--user-data-dir={tempfile.mkdtemp(prefix='layout-chrome-')}",
         f"--window-size={width},1200", "--virtual-time-budget=12000",
         f"--screenshot={screenshot}", "--dump-dom", url,

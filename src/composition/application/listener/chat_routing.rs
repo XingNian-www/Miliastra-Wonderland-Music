@@ -755,6 +755,9 @@ impl AppServices {
                                         text: message.text,
                                         sender,
                                         account: message.account,
+                                        // 「左侧列表里的名字 = 好友」的权限下界信号，
+                                        // 只在二级大厅 OCR 路径由侧栏名单算出。
+                                        sender_in_friend_list: message.sender_in_friend_list,
                                     }],
                                 },
                             }],

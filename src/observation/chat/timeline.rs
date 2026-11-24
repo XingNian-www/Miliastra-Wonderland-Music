@@ -38,6 +38,10 @@ pub(crate) struct ChatTimelineMessage {
     ///
     /// 一路带到 `CommandEnvelope`，让权限解析能用 UID 而不是昵称。
     pub(crate) account: Option<miliastra_kernel::chat_source::CommandAccount>,
+    /// 发言人是否在左侧好友列表里（OCR 大厅路径；其它路径恒 false）。
+    ///
+    /// 这是**权限下界**信号：大厅里未登记的好友也应按 Friend 处理。
+    pub(crate) sender_in_friend_list: bool,
     /// 外部源的**原始**服务端序号；OCR 路径为 0。
     ///
     /// 不能复用 `id.bubble_sequence`：那是去重键的 FNV 哈希，不保证单调，
@@ -1166,6 +1170,8 @@ impl ChatTimeline {
                 },
                 // 哨兵坐标：永不命中命令锁的 `y <= entry.y + 28` 容差。
                 block: crate::geometry::Rect::new(0, i32::MIN / 2, 1, 1),
+                // 外部源没有屏幕侧栏可看：不推断「左侧列表好友」。
+                sender_in_friend_list: false,
                 is_new: true,
                 // 原始序号：命令锁的序号锚点必须单调，不能用去重哈希。
                 source_sequence: message.sequence,
@@ -2305,6 +2311,8 @@ impl Tracker {
                 block: input.block,
                 // OCR 路径没有账号：权限只能按昵称解析。
                 account: None,
+                // 「左侧列表里的名字 = 好友」只由二级大厅 OCR 计算，经输入透传。
+                sender_in_friend_list: input.sender_in_friend_list,
                 // OCR 没有服务端序号：命令锁走屏幕锚点。
                 source_sequence: 0,
             });
@@ -2418,6 +2426,7 @@ mod tests {
             // 一级大厅消息的真实颜色是 blue；新基线只交付 blue/pink。
             message_type: "blue".into(),
             block: Rect::new(10, y, 120, 20),
+            sender_in_friend_list: false,
         }
     }
 
@@ -4529,6 +4538,7 @@ mod tests {
             block: crate::geometry::Rect::new(0, i32::MIN / 2, 1, 1),
             is_new: true,
             account: None,
+            sender_in_friend_list: false,
             source_sequence: 0,
         };
         assert_eq!(screen.lock_anchor(), LockAnchor::Screen { y: i32::MIN / 2 });

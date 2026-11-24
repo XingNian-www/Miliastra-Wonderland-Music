@@ -167,6 +167,15 @@ pub(crate) struct RecognizedChatMessage {
     pub(crate) raw_sender: Option<String>,
     pub(crate) message_type: String,
     pub(crate) block: Rect,
+    /// 发言人名字是否出现在**左侧好友列表**里（仅二级大厅 OCR 路径会算）。
+    ///
+    /// 用户规则：「只要是左侧列表中的都是好友」，所以这是**权限下界**的依据：
+    /// 大厅里未登记的好友也应拿到 Friend 级命令，而不是掉回 User。
+    ///
+    /// **失败必须是 false**：列表 OCR 读空/失败一律 `false`，退回原有的
+    /// 「HallMember → User」下界。绝不能因为列表读不到就让所有人失去权限。
+    /// 外部源恒为 `false`（它没有屏幕侧栏可看）。
+    pub(crate) sender_in_friend_list: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -290,6 +299,9 @@ pub(crate) fn recognize_prepared_chat(
                 message_type,
                 block: *block,
                 text: body,
+                // 一级大厅（primary）没有「左侧好友列表」这个概念，且权限由
+                // 第一级的粉色/蓝色标记决定，这里恒 false。
+                sender_in_friend_list: false,
             });
         }
     } else {
@@ -304,6 +316,9 @@ pub(crate) fn recognize_prepared_chat(
                 message_type,
                 block: *block,
                 text: body,
+                // 一级大厅（primary）没有「左侧好友列表」这个概念，且权限由
+                // 第一级的粉色/蓝色标记决定，这里恒 false。
+                sender_in_friend_list: false,
             });
         }
     }

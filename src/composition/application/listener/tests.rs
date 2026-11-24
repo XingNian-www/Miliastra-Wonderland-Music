@@ -901,6 +901,7 @@ fn chat_input(text: &str, y: i32) -> RecognizedChatMessage {
         raw_sender: None,
         message_type: "blue".into(),
         block: Rect::new(0, y, 100, 10),
+        sender_in_friend_list: false,
     }
 }
 

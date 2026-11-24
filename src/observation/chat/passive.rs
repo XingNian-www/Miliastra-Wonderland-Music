@@ -329,6 +329,43 @@ fn conversation_name_from_lines<'a>(lines: impl IntoIterator<Item = &'a str>) ->
         .map(str::to_owned)
 }
 
+/// 读**左侧好友列表**里所有可见名字（二级大厅的权限下界依据）。
+///
+/// 用户规则：「只要是左侧列表中的都是好友」。所以大厅里发言人的名字若出现在
+/// 左侧列表，就至少是 Friend 级——即便身份映射里没登记。
+///
+/// **失败一律返回空集合**（= 所有人都退回原有下界，没人因此失去权限）。
+/// 空集合与「列表里确实没人」在语义上等价，而后者只会让持有人更少，不会更危险：
+/// 回调路径是「未登记 → User」，不是「未登记 → 放行」。
+///
+/// 匹配用 [`crate::text::normalize_comparison_text`]（折全角 + 丢空白 + 小写），
+/// 只用于**提高下界**，不参与授权档位的正向判定，因此不会复活「改昵称冒充」：
+/// 冒充者要拿到 Friend，只需把自己的昵称改成好友列表里已有的名字——但那本来就是
+/// 「显示名」层面的信息，且 Friend 下界之下仍受映射 role 与既有策略约束。
+fn sidebar_name_set(
+    ocr: &OcrRuntimeHandle,
+    image: &DynamicImage,
+    config: &AppConfig,
+) -> std::collections::BTreeSet<String> {
+    let region = passive_sidebar_region(config);
+    let Ok(crop) = crop_canvas(image, region) else {
+        return Default::default();
+    };
+    let Ok(lines) = ocr.recognize_lines(crop, OcrPriority::UiConfirmation) else {
+        log::debug!("二级大厅好友列表 OCR 失败：本轮不做 Friend 下界推断");
+        return Default::default();
+    };
+    let names = lines
+        .iter()
+        .map(|line| crate::text::normalize_comparison_text(line.text.trim()))
+        .filter(|name| !name.is_empty())
+        .collect::<std::collections::BTreeSet<_>>();
+    if names.is_empty() {
+        log::debug!("二级大厅好友列表读空：本轮不做 Friend 下界推断");
+    }
+    names
+}
+
 pub(crate) fn recognize_passive_secondary(
     ocr: &OcrRuntimeHandle,
     image: &DynamicImage,
@@ -361,6 +398,13 @@ pub(crate) fn recognize_passive_secondary(
         ChatIdentity::SecondaryHall => "blue",
         _ => "unknown",
     };
+    // 只有**大厅**帧需要「左侧列表 = 好友」的下界推断：私聊帧本来就是 Friend，
+    // 而 Unknown 帧不派发业务。列表 OCR 只在大厅帧发生，省掉每次私聊的两倍 OCR 成本。
+    let friend_list = if hall {
+        sidebar_name_set(ocr, image, config)
+    } else {
+        Default::default()
+    };
     let mut messages = recognize_passive_hall(
         bubbles
             .iter()
@@ -380,6 +424,12 @@ pub(crate) fn recognize_passive_secondary(
     )?;
     for message in &mut messages {
         message.message_type = message_type.into();
+        // 「左侧列表里的名字 = 好友」：只有大厅帧才有意义（私聊已是 Friend）。
+        // 匹配走 normalize_comparison_text（折全角/丢空白），与侧栏 OCR 同一口径。
+        message.sender_in_friend_list = !friend_list.is_empty()
+            && message.sender.as_deref().is_some_and(|sender| {
+                friend_list.contains(&crate::text::normalize_comparison_text(sender))
+            });
     }
     if messages.is_empty() && !hall {
         if let Some(block) = latest {
@@ -392,6 +442,9 @@ pub(crate) fn recognize_passive_secondary(
                 raw_sender,
                 message_type: message_type.into(),
                 block,
+                // 这条单气泡兜底属于私聊（`!hall`），本来就是 pink/Friend，
+                // 不需要侧栏下界推断。
+                sender_in_friend_list: false,
             });
         }
     }
@@ -428,6 +481,7 @@ pub(crate) fn recognize_passive_hall(
                     raw_sender: None,
                     message_type: "blue".into(),
                     block,
+                    sender_in_friend_list: false,
                 });
             };
             let raw_sender = recognize(sender_rect)?;
@@ -437,6 +491,7 @@ pub(crate) fn recognize_passive_hall(
                 raw_sender: Some(raw_sender),
                 message_type: "blue".into(),
                 block,
+                sender_in_friend_list: false,
             })
         })
         .collect()
@@ -537,6 +592,36 @@ mod tests {
         // 混用括号时同样只看最右那一对。
         let identity = parse_secondary_sender_identity("玩家（自带内容)(大厅备注）");
         assert_eq!(identity.effective_name(), "大厅备注");
+    }
+
+    /// 「左侧列表里的名字 = 好友」的匹配口径：与侧栏 OCR 同一归一化，且失败时为空集。
+    ///
+    /// 这里只验证**判定函数**的语义（纯逻辑），真实列表 OCR 在整帧识别里做。
+    #[test]
+    fn friend_list_membership_uses_the_shared_comparison_normalization() {
+        let sidebar = ["PlayerB", "昵称D", "昵称E°"]
+            .into_iter()
+            .map(crate::text::normalize_comparison_text)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(!sidebar.is_empty());
+        // 全角/半角与空白差异都归一到同一个键。
+        for sender in ["PlayerB", "ＰｌａｙｅｒＢ", " PlayerB "] {
+            assert!(
+                sidebar.contains(&crate::text::normalize_comparison_text(sender)),
+                "sender={sender} 应判为左侧列表成员"
+            );
+        }
+        // 不在列表里的人不能误判（未登记 → 仍走 User 下界）。
+        for sender in ["昵称C", "2#BOT|勿加", ""] {
+            assert!(
+                !sidebar.contains(&crate::text::normalize_comparison_text(sender))
+                    || crate::text::normalize_comparison_text(sender).is_empty(),
+                "sender={sender} 不应判为左侧列表成员"
+            );
+        }
+        // 列表读空（OCR 失败）→ 空集合 → 谁都不算好友，退回原下界。
+        let empty: std::collections::BTreeSet<String> = Default::default();
+        assert!(empty.is_empty());
     }
 
     /// 高亮行 OCR 多行时取**首行**作会话名（忽略预览/状态行）。

@@ -376,6 +376,7 @@ fn replay_frame(
                         raw_sender: None,
                         message_type: m.message_type,
                         block: m.block,
+                        sender_in_friend_list: false,
                     }
                 })
                 .collect::<Vec<_>>();

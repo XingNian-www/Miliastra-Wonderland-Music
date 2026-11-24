@@ -718,6 +718,7 @@ mod tests {
             raw_sender: None,
             message_type: kind.into(),
             block: Rect::new(10, y, 120, 20),
+            sender_in_friend_list: false,
         };
         let chat = ChatIdentity::Friend(Arc::from("observer-confirmed friend"));
         let snapshot = shared
@@ -779,6 +780,7 @@ mod tests {
             raw_sender: None,
             message_type: "pink".into(),
             block: Rect::new(10, y, 120, 20),
+            sender_in_friend_list: false,
         };
         let chat = ChatIdentity::Friend(Arc::from("clear-baseline friend"));
         let _suppression = shared.suppress_friend_business().unwrap();

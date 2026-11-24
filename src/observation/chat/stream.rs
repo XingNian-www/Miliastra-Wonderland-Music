@@ -36,6 +36,11 @@ pub(crate) struct SecondaryObservedMessage {
     pub(crate) sender: Option<String>,
     /// 消息来源的账号（仅外部聊天 API 提供）；权限解析优先用它。
     pub(crate) account: Option<miliastra_kernel::chat_source::CommandAccount>,
+    /// 发言人是否在左侧好友列表里（仅二级大厅 OCR 路径会为 true）。
+    ///
+    /// 用户规则「左侧列表中的都是好友」→ 大厅里未登记的好友也拿到 Friend 下界。
+    /// 失败一律 false，退回原有的 HallMember → User。
+    pub(crate) sender_in_friend_list: bool,
 }
 
 #[derive(Clone)]
@@ -145,6 +150,8 @@ impl ChatObservationShared {
                 sender: message.sender,
                 // OCR 路径没有账号。
                 account: None,
+                // 这条测试专用发布入口不做左侧列表推断：保守取 false。
+                sender_in_friend_list: false,
             });
         }
         let dispatches = Self::publish_locked(

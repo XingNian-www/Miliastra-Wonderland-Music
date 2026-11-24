@@ -9,6 +9,7 @@ fn message(text: &str, y: i32) -> RecognizedChatMessage {
         text: text.to_string(),
         sender: None,
         raw_sender: None,
+        sender_in_friend_list: false,
     }
 }
 

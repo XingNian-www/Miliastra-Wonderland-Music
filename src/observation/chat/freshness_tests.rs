@@ -36,6 +36,7 @@ fn bubble_at(
         raw_sender: None,
         message_type: kind.to_string(),
         block: Rect::new(x, y, width, height),
+        sender_in_friend_list: false,
     }
 }
 

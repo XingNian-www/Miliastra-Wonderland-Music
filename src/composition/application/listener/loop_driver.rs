@@ -1675,6 +1675,7 @@ mod tests {
             raw_sender: None,
             message_type: "blue".to_string(),
             block: Rect::new(0, 0, 0, 0),
+            sender_in_friend_list: false,
             is_new: true,
             account: None,
             source_sequence: 1,

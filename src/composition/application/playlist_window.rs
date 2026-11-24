@@ -512,6 +512,7 @@ mod tests {
             raw_sender: sender.map(str::to_owned),
             message_type: color.into(),
             block: Rect::new(0, y, 100, 10),
+            sender_in_friend_list: false,
         }
     }
 

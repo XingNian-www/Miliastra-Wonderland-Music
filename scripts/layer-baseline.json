@@ -2428,7 +2428,7 @@
       "pub_items": 51
     },
     "src/features/card_games/mod.rs": {
-      "lines": 59,
+      "lines": 58,
       "pub_items": 9
     },
     "src/features/card_games/outcome.rs": {
@@ -2588,8 +2588,8 @@
       "pub_items": 42
     },
     "src/features/undercover/mod.rs": {
-      "lines": 2534,
-      "pub_items": 59
+      "lines": 2651,
+      "pub_items": 60
     },
     "src/features/undercover/repository.rs": {
       "lines": 233,

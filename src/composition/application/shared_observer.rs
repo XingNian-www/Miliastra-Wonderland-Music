@@ -144,9 +144,20 @@ impl ApplicationRuntime {
                         // 变化判据用 v5.9.4 的「均值差 / 变化比例」而不是精确像素哈希：
                         // 聊天区透出 3D 场景、粒子、半透明底纹的轻微抖动会被阈值吸收；
                         // 真实消息（文字出现）差异远大于阈值，仍能及时触发。
+                        //
+                        // **ROI 必须跟 layout 走**：`config.screen.chat_rect` 是**一级**
+                        // 聊天区 `(39,879,416,143)`，与二级消息区 `(390,87)-(1180,957)`
+                        // **完全不相交**。旧实现在二级帧上也用一级 ROI 算指纹，指纹恒定
+                        // → 门控永远判「无变化」→ 只能靠 `timing.chat_scan.fallback_ms`
+                        // 兜底（默认 2s），线上就是「发了命令半天没反应」。
+                        //
+                        // 同一 layout 恒用同一 ROI，所以「与上一帧比较」始终是同区域比较，
+                        // layout 切换时 ROI 也切换（跨 layout 比较无意义，此时首个新 layout
+                        // 帧本就是基线）。
+                        let scan_roi = scan_roi_for_layout(&layout, config.screen.chat_rect.into());
                         let fingerprint = crate::change_detection::rect_chat_change_fingerprint(
                             &frame.image,
-                            config.screen.chat_rect.into(),
+                            scan_roi,
                         )?;
                         hash_time = finish_observer_stage(&mut stage_started);
                         let now = Instant::now();
@@ -350,6 +361,18 @@ impl ReloadDrainingGate {
 /// 入参必须是**当前** live 快照（`live_configs.snapshot()`），而不是启动期
 /// 缓存的配置：`ocr.change_mean_threshold` / `ocr.change_pixel_threshold`
 /// 接线为 Live 后，保存配置应在下一帧生效，无需重载子进程。
+/// 变化门控用的 ROI：**二级用二级消息区，其余仍用配置的一级聊天区**。
+///
+/// 抽成函数是为了能脱离观察线程单测「Secondary 布局选的是二级区域」。
+fn scan_roi_for_layout(layout: &PassiveLayout, configured_primary: Rect) -> Rect {
+    match layout {
+        PassiveLayout::Secondary { .. } => crate::observation::chat::SECONDARY_MESSAGE_SCAN_RECT,
+        // 一级与「没有聊天」都用配置的一级聊天区：前者本就该看它，
+        // 后者没有可信的二级几何（面板可能不在），沿用旧行为最安全。
+        PassiveLayout::Primary(_) | PassiveLayout::NoChat => configured_primary,
+    }
+}
+
 fn chat_change_thresholds(config: &crate::config::AppConfig) -> (f32, f32) {
     (
         config.ocr.change_mean_threshold,
@@ -584,8 +607,8 @@ mod tests {
     #[test]
     fn ordinary_and_empty_texts_always_recognize_their_sender_rectangles() {
         let regions = [
-            (Rect::new(1, 1, 10, 10), Rect::new(1, 20, 10, 10)),
-            (Rect::new(1, 40, 10, 10), Rect::new(1, 60, 10, 10)),
+            (Rect::new(1, 1, 10, 10), Some(Rect::new(1, 20, 10, 10))),
+            (Rect::new(1, 40, 10, 10), Some(Rect::new(1, 60, 10, 10))),
         ];
         let mut visited = Vec::new();
         let messages = recognize_passive_hall(regions, |rect| {

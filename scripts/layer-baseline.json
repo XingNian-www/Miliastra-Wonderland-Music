@@ -432,7 +432,7 @@
         },
         {
           "path": "src/composition/application/shared_observer.rs",
-          "count": 3
+          "count": 4
         }
       ]
     },
@@ -929,6 +929,10 @@
           "count": 1
         },
         {
+          "path": "src/features/identity.rs",
+          "count": 2
+        },
+        {
           "path": "src/features/number_bomb.rs",
           "count": 1
         },
@@ -1254,7 +1258,7 @@
         },
         {
           "path": "src/observation/chat/visual.rs",
-          "count": 1
+          "count": 2
         }
       ]
     },
@@ -1368,7 +1372,7 @@
       "files": [
         {
           "path": "src/observation/chat/passive.rs",
-          "count": 5
+          "count": 6
         },
         {
           "path": "src/observation/chat/scan.rs",
@@ -1737,7 +1741,7 @@
         },
         {
           "path": "src/ui/routines/secondary_unread.rs",
-          "count": 2
+          "count": 3
         },
         {
           "path": "src/ui/state/args.rs",
@@ -1936,8 +1940,8 @@
       "pub_items": 11
     },
     "src/change_detection.rs": {
-      "lines": 70,
-      "pub_items": 4
+      "lines": 86,
+      "pub_items": 5
     },
     "src/composition.rs": {
       "lines": 137,
@@ -2088,7 +2092,7 @@
       "pub_items": 16
     },
     "src/composition/application/shared_observer.rs": {
-      "lines": 699,
+      "lines": 722,
       "pub_items": 2
     },
     "src/composition/application/shutdown.rs": {
@@ -2112,7 +2116,7 @@
       "pub_items": 13
     },
     "src/composition/application/listener/chat_routing.rs": {
-      "lines": 1749,
+      "lines": 1892,
       "pub_items": 36
     },
     "src/composition/application/listener/display.rs": {
@@ -2332,7 +2336,7 @@
       "pub_items": 28
     },
     "src/features/identity.rs": {
-      "lines": 2384,
+      "lines": 2491,
       "pub_items": 47
     },
     "src/features/idiom_chain.rs": {
@@ -2588,7 +2592,7 @@
       "pub_items": 42
     },
     "src/features/undercover/mod.rs": {
-      "lines": 2651,
+      "lines": 2654,
       "pub_items": 60
     },
     "src/features/undercover/repository.rs": {
@@ -2708,7 +2712,7 @@
       "pub_items": 11
     },
     "src/observation/chat/passive.rs": {
-      "lines": 384,
+      "lines": 563,
       "pub_items": 15
     },
     "src/observation/chat/scan.rs": {
@@ -2728,23 +2732,23 @@
       "pub_items": 20
     },
     "src/observation/chat/timeline.rs": {
-      "lines": 4462,
-      "pub_items": 49
+      "lines": 4736,
+      "pub_items": 51
     },
     "src/observation/chat/visual.rs": {
-      "lines": 578,
-      "pub_items": 12
+      "lines": 642,
+      "pub_items": 13
     },
     "src/observation/chat/secondary_hall_vision/detection.rs": {
       "lines": 269,
       "pub_items": 8
     },
     "src/observation/chat/secondary_hall_vision/mod.rs": {
-      "lines": 47,
+      "lines": 79,
       "pub_items": 2
     },
     "src/observation/chat/secondary_hall_vision/sender_label.rs": {
-      "lines": 673,
+      "lines": 757,
       "pub_items": 3
     },
     "src/runtime/business.rs": {
@@ -2904,7 +2908,7 @@
       "pub_items": 25
     },
     "src/ui/routines/invite.rs": {
-      "lines": 1296,
+      "lines": 1300,
       "pub_items": 18
     },
     "src/ui/routines/mod.rs": {
@@ -2920,7 +2924,7 @@
       "pub_items": 30
     },
     "src/ui/routines/secondary_unread.rs": {
-      "lines": 1038,
+      "lines": 1042,
       "pub_items": 12
     },
     "src/ui/routines/startup.rs": {
@@ -2944,8 +2948,8 @@
       "pub_items": 39
     },
     "src/ui/routines/friend_delivery/navigation.rs": {
-      "lines": 578,
-      "pub_items": 29
+      "lines": 607,
+      "pub_items": 30
     },
     "src/ui/state/anchors.rs": {
       "lines": 310,

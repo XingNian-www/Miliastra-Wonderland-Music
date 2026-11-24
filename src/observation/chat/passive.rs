@@ -36,24 +36,35 @@ impl SecondarySenderIdentity {
     }
 }
 
+/// 解析发言人名字里的「游戏内备注」：`昵称(备注)` / `昵称（备注）`。
+///
+/// **括号必须跨类型配对**：半角 `()` 与全角 `（）` 在游戏里是同一个语义，OCR 却经常
+/// 一半读半角一半读全角（真实样本 `昵称A(备注A）`）。旧实现把两种括号当两套
+/// 独立配对，混用就解析不出备注，sender 保留整串 → 身份精确匹配落空 → 权限掉回
+/// User 下界。这是**稳定失败**（不会自愈）：同一玩家的名字每次都这样读。
+///
+/// 因此先找最右侧的**任意**闭括号，再从它左边找最近的**任意**开括号。
+/// 只在解析层放宽，`remark_key` 的精确匹配语义不动。
 pub(crate) fn parse_secondary_sender_identity(value: &str) -> SecondarySenderIdentity {
+    const BRACKETS: [(char, char); 2] = [('(', ')'), ('（', '）')];
     let value = value.trim();
-    let mut rightmost_pair = None;
-    for (open, close) in [('(', ')'), ('（', '）')] {
-        let Some(close_index) = value.rfind(close) else {
-            continue;
-        };
-        let Some(open_index) = value[..close_index].rfind(open) else {
-            continue;
-        };
-        if rightmost_pair
-            .as_ref()
-            .is_none_or(|(best_close, _, _)| close_index > *best_close)
-        {
-            rightmost_pair = Some((close_index, open_index, open.len_utf8()));
-        }
-    }
-    if let Some((close_index, open_index, open_len)) = rightmost_pair {
+    // 最右侧闭括号：取所有闭括号里位置最后的那一个。
+    let rightmost_close = BRACKETS
+        .iter()
+        .filter_map(|(_, close)| value.rfind(*close))
+        .max();
+    // 从它左边找最近的任意开括号（半角/全角之一定义了字符串里最靠右的那对）。
+    let pair = rightmost_close.and_then(|close_index| {
+        BRACKETS
+            .iter()
+            .filter_map(|(open, _)| {
+                value[..close_index]
+                    .rfind(*open)
+                    .map(|open_index| (close_index, open_index, open.len_utf8()))
+            })
+            .max_by_key(|(_, open_index, _)| *open_index)
+    });
+    if let Some((close_index, open_index, open_len)) = pair {
         let remark = value[open_index + open_len..close_index].trim();
         if !remark.is_empty() {
             return SecondarySenderIdentity {
@@ -117,9 +128,11 @@ pub(crate) fn passive_layout(
         &config.templates.secondary_hall,
         config.templates.marker_threshold,
     )?;
-    let selected = crate::ui::routines::highlighted_conversation_row(
+    let selected = select_conversation_row(
         &frame.image,
         passive_sidebar_region(config),
+        hall_hit.as_ref(),
+        friends,
     );
     // A visible hall shortcut does not mean it is the selected conversation.
     let hall = selected
@@ -172,7 +185,11 @@ impl PassiveLayout {
                 if *hall || !bubbles.is_empty() {
                     for bubble in bubbles {
                         hash_region(image, bubble.rect, &mut hash)?;
-                        hash_region(image, bubble.sender_rect(), &mut hash)?;
+                        // 发言人区域可能缺失（气泡在、署名证据不足）：缺就只哈希正文，
+                        // 不能因为「没有署名」让整帧指纹计算失败。
+                        if let Some(sender_rect) = bubble.sender_rect() {
+                            hash_region(image, sender_rect, &mut hash)?;
+                        }
                     }
                 } else if let Some(rect) = latest {
                     hash_region(image, *rect, &mut hash)?;
@@ -252,6 +269,66 @@ pub(crate) fn passive_sidebar_region(config: &AppConfig) -> Rect {
     )
 }
 
+/// 从侧栏亮带里挑「最可能是当前选中会话」的那一条（**只读**，不点击）。
+///
+/// 旧实现要求**恰好一条**亮带，多一条就 `None` → `ChatIdentity::Unknown` →
+/// 命令被身份闸丢弃、未读任务永远等不到 `Friend(_)` 而死循环。侧栏行数多、
+/// 有红点行、头像亮时出现 ≥2 条亮带是常态，所以这里多候选择优。
+///
+/// 判据（先验，不靠 OCR 猜）：
+/// 1. **大厅快捷入口所在那条**：若大厅模板命中点落在某条亮带内，那条就是
+///    「当前大厅」行——这是唯一有像素级外部证据的选择，优先返回它。
+///    （它同时让 `hall` 判定照旧成立，行为与旧实现一致。）
+/// 2. 否则取**最高**的那条（选中行是整行色带；细亮带多是头像/红点误报）。
+/// 3. 高度相同时取**会话列表区内、最靠上**的那条（列表自上而下排版）。
+fn select_conversation_row(
+    image: &DynamicImage,
+    sidebar: Rect,
+    hall_hit: Option<&crate::ui::template::TemplateHit>,
+    friends: Rect,
+) -> Option<Rect> {
+    let rows = crate::ui::routines::highlighted_conversation_row_candidates(image, sidebar);
+    if rows.is_empty() {
+        return None;
+    }
+    if let Some(center) = hall_hit.map(|hit| hit.center()) {
+        if let Some(row) = rows
+            .iter()
+            .find(|row| (row.y..row.bottom()).contains(&center.y))
+        {
+            return Some(*row);
+        }
+    }
+    // 候选已按「高者优先」排序；这里只在同高时按「落在会话列表区、位置更靠上」微调。
+    rows.iter().copied().min_by(|left, right| {
+        right
+            .height
+            .cmp(&left.height)
+            .then_with(|| {
+                let in_list = |row: &Rect| (row.y..row.bottom()).contains(&friends.y);
+                in_list(right).cmp(&in_list(left))
+            })
+            .then_with(|| left.y.cmp(&right.y))
+    })
+}
+
+/// 从高亮会话行的 OCR 行里取**会话名**：最上面一条非空行，忽略其余。
+///
+/// 旧实现要求「恰好一行」，多出一行（末尾消息预览、未读数、时间戳）就整体判
+/// `None` → `ChatIdentity::Unknown` → 命令被身份闸丢弃。真实好友私聊截图的高亮行
+/// 常带预览，这是「进去后命令不生效」的直接上游。
+///
+/// 为什么取**首行**而不是「最长行/最像名字的行」：侧栏行自上而下排版，名字恒在
+/// 第一行，预览/状态在下面。按内容猜（长度、字符集）会把「预览恰好更长」判成名字，
+/// 让身份变成错误玩家——那比 Unknown 更危险（会把命令授权给错的人）。
+fn conversation_name_from_lines<'a>(lines: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    lines
+        .into_iter()
+        .map(str::trim)
+        .find(|text| !text.is_empty())
+        .map(str::to_owned)
+}
+
 pub(crate) fn recognize_passive_secondary(
     ocr: &OcrRuntimeHandle,
     image: &DynamicImage,
@@ -266,16 +343,9 @@ pub(crate) fn recognize_passive_secondary(
             .map(|row| -> Result<Option<String>> {
                 let lines =
                     ocr.recognize_lines(crop_canvas(image, row)?, OcrPriority::ChatObservation)?;
-                let names = lines
-                    .iter()
-                    .map(|line| line.text.trim())
-                    .filter(|text| !text.is_empty())
-                    .collect::<Vec<_>>();
-                // More than one OCR name in the actual highlight is ambiguous.
-                Ok(match names.as_slice() {
-                    [name] => Some((*name).to_owned()),
-                    _ => None,
-                })
+                Ok(conversation_name_from_lines(
+                    lines.iter().map(|line| line.text.as_str()),
+                ))
             })
             .transpose()?
             .flatten()
@@ -294,7 +364,18 @@ pub(crate) fn recognize_passive_secondary(
     let mut messages = recognize_passive_hall(
         bubbles
             .iter()
-            .map(|bubble| (bubble.rect, bubble.sender_rect())),
+            // 署名缺失时传 `None`：正文照常识别，sender 走空串 + 一条带原因的 warn。
+            // 旧行为是整条气泡在更上游就被丢掉，大厅又无单气泡兜底 → 整帧零消息。
+            .map(|bubble| {
+                let sender_rect = bubble.sender_rect();
+                if sender_rect.is_none() {
+                    log::warn!(
+                        "二级大厅气泡缺少发言人区域（头像边界/纹理证据不足），仅按正文交付：block {:?}",
+                        bubble.rect
+                    );
+                }
+                (bubble.rect, sender_rect)
+            }),
         |rect| passive_text(ocr, image, rect, config.ocr.same_line_y_tolerance),
     )?;
     for message in &mut messages {
@@ -331,13 +412,24 @@ pub(crate) fn passive_text(
 }
 
 pub(crate) fn recognize_passive_hall(
-    regions: impl IntoIterator<Item = (Rect, Rect)>,
+    regions: impl IntoIterator<Item = (Rect, Option<Rect>)>,
     mut recognize: impl FnMut(Rect) -> Result<String>,
 ) -> Result<Vec<RecognizedChatMessage>> {
     regions
         .into_iter()
         .map(|(block, sender_rect)| {
             let text = recognize(block)?;
+            // 没有署名区域：保留消息（正文比署名重要），sender/raw_sender 留空，
+            // 让身份闸按「无身份」处理并记带原因的 warn。
+            let Some(sender_rect) = sender_rect else {
+                return Ok(RecognizedChatMessage {
+                    text,
+                    sender: None,
+                    raw_sender: None,
+                    message_type: "blue".into(),
+                    block,
+                });
+            };
             let raw_sender = recognize(sender_rect)?;
             Ok(RecognizedChatMessage {
                 text,
@@ -380,5 +472,92 @@ pub(crate) fn passive_secondary_identity(hall: bool, selected_name: Option<&str>
             ChatIdentity::Friend(name.into())
         }
         _ => ChatIdentity::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 括号**跨类型**配对：半角/全角混用也必须解析出备注。
+    ///
+    /// 真实样本 `昵称A(备注A）` 是症状1的触发源（9 条真实帧都由它引起）：
+    /// 旧实现把 `()` 与 `（）` 当两套独立配对，混用就解析不出备注 → sender 保留
+    /// 整串 → 身份精确匹配落空 → 权限掉回 User 下界，且**稳定失败**（不会自愈）。
+    #[test]
+    fn sender_identity_parses_every_bracket_combination() {
+        // (半角开, 半角闭)
+        let identity = parse_secondary_sender_identity("昵称A(备注A)");
+        assert_eq!(identity.nickname, "昵称A");
+        assert_eq!(identity.remark.as_deref(), Some("备注A"));
+        assert_eq!(identity.effective_name(), "备注A");
+
+        // (半角开, 全角闭) —— 真实线上样本
+        let identity = parse_secondary_sender_identity("昵称A(备注A）");
+        assert_eq!(identity.nickname, "昵称A");
+        assert_eq!(identity.remark.as_deref(), Some("备注A"));
+        assert_eq!(identity.effective_name(), "备注A");
+
+        // (全角开, 半角闭)
+        let identity = parse_secondary_sender_identity("昵称A（备注A)");
+        assert_eq!(identity.nickname, "昵称A");
+        assert_eq!(identity.remark.as_deref(), Some("备注A"));
+        assert_eq!(identity.effective_name(), "备注A");
+
+        // (全角开, 全角闭)
+        let identity = parse_secondary_sender_identity("昵称A（备注A）");
+        assert_eq!(identity.nickname, "昵称A");
+        assert_eq!(identity.remark.as_deref(), Some("备注A"));
+        assert_eq!(identity.effective_name(), "备注A");
+    }
+
+    /// 无括号 / 未闭合 / 空备注时，整串就是身份键（不能凭空造备注）。
+    #[test]
+    fn sender_identity_without_a_complete_pair_keeps_the_whole_string() {
+        for raw in [
+            "PlayerB",
+            "昵称C",
+            "2#BOT|勿加",
+            "玩家(未闭合",
+            "玩家）未闭合（",
+        ] {
+            let identity = parse_secondary_sender_identity(raw);
+            assert_eq!(identity.remark, None, "raw={raw}");
+            assert_eq!(identity.effective_name(), raw, "raw={raw}");
+        }
+    }
+
+    /// 最右侧配对优先：名字里自带括号时，外层备注才是身份键。
+    #[test]
+    fn sender_identity_uses_the_rightmost_pair() {
+        let identity = parse_secondary_sender_identity("玩家(自带内容)(大厅备注)");
+        assert_eq!(identity.nickname, "玩家(自带内容)");
+        assert_eq!(identity.effective_name(), "大厅备注");
+
+        // 混用括号时同样只看最右那一对。
+        let identity = parse_secondary_sender_identity("玩家（自带内容)(大厅备注）");
+        assert_eq!(identity.effective_name(), "大厅备注");
+    }
+
+    /// 高亮行 OCR 多行时取**首行**作会话名（忽略预览/状态行）。
+    ///
+    /// 旧实现要求恰好一行，多行就 `None` → `Unknown` → 好友私聊命令被丢弃。
+    #[test]
+    fn conversation_name_takes_the_top_non_empty_line() {
+        assert_eq!(
+            conversation_name_from_lines(["昵称E°", "今晚一起玩吗"]).as_deref(),
+            Some("昵称E°")
+        );
+        assert_eq!(
+            conversation_name_from_lines(["   ", "", "昵称D", "预览"]).as_deref(),
+            Some("昵称D")
+        );
+        assert_eq!(conversation_name_from_lines(["  "]), None);
+        assert_eq!(conversation_name_from_lines(Vec::<&str>::new()), None);
+        // 恰好一行仍然正确（旧行为不能退化）。
+        assert_eq!(
+            conversation_name_from_lines(["PlayerB"]).as_deref(),
+            Some("PlayerB")
+        );
     }
 }

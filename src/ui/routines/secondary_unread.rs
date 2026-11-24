@@ -372,7 +372,11 @@ fn process_unread(
             // 提升只把这条气泡放行给共享观察的业务订阅者；这里必须确认它真的被取走，
             // 否则 UI 事务立刻恢复大厅，这次提升就没有可消费的后续帧，最后什么都不派发。
             let promoted = chat_timeline
-                .deliver_unread_baseline(&snapshot, &message.id)
+                .deliver_unread_selected(
+                    &snapshot,
+                    &message.id,
+                    crate::observation::chat::UnreadPromotion::ExplicitSelection,
+                )
                 .map_err(|error| after_input_failure("deliver_secondary_unread", error))?;
             if promoted {
                 wait_promoted_unread_consumed(context, chat_timeline, &message.id, deadline)?;
@@ -385,7 +389,7 @@ fn process_unread(
                 // 账本里那一条仍是待处理的（新修订还要交付），只查账本会说"仍在队列里"，
                 // 让排查误以为是消费端卡住了。
                 log::warn!(
-                    "二级好友未读提升未生效（步骤：提升未读消息）：好友「{}」的这条气泡不在首屏基线内，无法据此派发命令；该气泡可能已按常规路径交付过（{}）",
+                    "二级好友未读提升未生效（步骤：提升未读消息）：好友「{}」的这条气泡无法作为本次未读打开的命令派发（可能已被永久确认、已按常规路径交付过，或正处于好友业务抑制期）；（{}）",
                     friend_name,
                     if chat_timeline
                         .is_business_pending_at(&message.id, snapshot.captured_at)

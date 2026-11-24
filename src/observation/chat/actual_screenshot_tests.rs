@@ -413,10 +413,7 @@ fn replay_frame(
                 latest,
             )?;
             if !bubbles.is_empty() {
-                regions = bubbles
-                    .iter()
-                    .map(|b| (b.rect, Some(b.sender_rect())))
-                    .collect();
+                regions = bubbles.iter().map(|b| (b.rect, b.sender_rect())).collect();
             } else if let Some(rect) = latest {
                 if !messages.is_empty() {
                     regions.push((rect, selected));

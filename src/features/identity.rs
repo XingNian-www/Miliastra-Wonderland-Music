@@ -472,6 +472,17 @@ impl IdentityAccess {
     }
 
     /// 精确解析昵称；未映射返回 None。
+    ///
+    /// ## 比较时折全角，但**不改存储**
+    ///
+    /// 游戏内备注是玩家自己敲的，全角/半角在屏幕上肉眼几乎无差别，OCR 却会在两者
+    /// 之间抖动（同一个字时而读成全角 `Ａ`、时而读成半角 `A`）。不折全角，
+    /// 同一个人的备注会「有时认得出、有时认不出」，表现为权限随机掉档。
+    ///
+    /// 折的**只有比较**这一侧：`remark_key` 本体（写路径、`validate()` 判重）
+    /// 保持原语义，存量配置不会被悄悄改写。折全角是**无损纠错**——`crate::text::fold_wide`
+    /// 只把 `Ａ`→`A`，不丢空白、不转小写、不做任何模糊匹配，因此不会让
+    /// 「改昵称冒充」复活：冒充者仍然要写出**完全相同**的字符。
     pub fn resolve(&self, nickname: &str) -> Option<ResolvedIdentity> {
         // 空昵称永不匹配：OCR 失败时发送者是空串，若不挡住会命中
         // 昵称为空的映射，权限与歌单全部错乱。
@@ -480,6 +491,8 @@ impl IdentityAccess {
         if nickname.trim().is_empty() {
             return None;
         }
+        // 输入侧折全角；有全角字符时才会分配新串。
+        let comparison = crate::text::fold_wide(nickname);
         let config = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         // 只归一化存下来的那一侧：面板粘贴/手改可能带首尾空白，
         // 而 OCR 读出来是干净的，不 trim 就永远匹配不上。
@@ -487,7 +500,7 @@ impl IdentityAccess {
         config
             .mappings
             .iter()
-            .find(|mapping| remark_key(&mapping.remark) == nickname)
+            .find(|mapping| crate::text::fold_wide(remark_key(&mapping.remark)) == comparison)
             .map(|mapping| ResolvedIdentity {
                 id: mapping.id,
                 role: mapping.role,
@@ -1214,6 +1227,100 @@ mod tests {
                 mapping("好友甲", Uuid::from_u128(3), IdentityRole::Friend),
             ],
         }
+    }
+
+    /// `resolve` 比较时折叠全角，但**不改存储**：OCR 在 `Ａlice`/`Alice` 之间抖动时，
+    /// 同一个玩家不能被判成「有时认得出、有时认不出」（权限随机掉档）。
+    ///
+    /// 同时钉死：这不是模糊匹配。「改昵称冒充」必须继续被拒——
+    /// 折叠只把全角 ASCII 折成半角，不丢空白、不转小写、不做任何前缀/相似匹配。
+    #[test]
+    fn resolve_folds_fullwidth_on_the_comparison_side_only() {
+        // 配置里存半角，OCR 读成全角 → 命中。
+        let mut config = sample_config();
+        config.mappings.push(IdentityMapping {
+            remark: "Alice".to_owned(),
+            id: Uuid::from_u128(9),
+            role: IdentityRole::Admin,
+            ..mapping("Alice", Uuid::from_u128(9), IdentityRole::Admin)
+        });
+        let identity = IdentityAccess::new(config);
+        assert_eq!(
+            identity.resolve("Ａlice").map(|resolved| resolved.role),
+            Some(IdentityRole::Admin),
+            "OCR 把 A 读成全角 Ａ 时仍必须命中"
+        );
+        assert_eq!(
+            identity.resolve("Alice").map(|resolved| resolved.role),
+            Some(IdentityRole::Admin)
+        );
+        // 存储侧没被改写：面板里看到的仍是原样。
+        let snapshot = identity.snapshot();
+        assert!(
+            snapshot
+                .mappings
+                .iter()
+                .any(|mapping| mapping.remark == "Alice"),
+            "折叠只用于比较，绝不能改写存量配置"
+        );
+
+        // 反过来：配置是全角、OCR 读半角也要命中。
+        let mut config = sample_config();
+        config.mappings.push(IdentityMapping {
+            remark: "Ａdmin".to_owned(),
+            id: Uuid::from_u128(10),
+            role: IdentityRole::Admin,
+            ..mapping("Ａdmin", Uuid::from_u128(10), IdentityRole::Admin)
+        });
+        let identity = IdentityAccess::new(config);
+        assert_eq!(
+            identity.resolve("Admin").map(|resolved| resolved.role),
+            Some(IdentityRole::Admin)
+        );
+
+        // 全角备注（中文场景下的 `（）`、数字全角）同样折叠命中。
+        let mut config = sample_config();
+        config.mappings.push(IdentityMapping {
+            remark: "昵称A（备注A）".to_owned(),
+            id: Uuid::from_u128(11),
+            role: IdentityRole::Friend,
+            ..mapping(
+                "昵称A（备注A）",
+                Uuid::from_u128(11),
+                IdentityRole::Friend,
+            )
+        });
+        let identity = IdentityAccess::new(config);
+        assert_eq!(
+            identity
+                .resolve("昵称A(备注A)")
+                .map(|resolved| resolved.role),
+            Some(IdentityRole::Friend),
+            "OCR 把全角括号读成半角时必须命中"
+        );
+    }
+
+    /// 红线：折叠全角**不是**模糊匹配，「改昵称冒充」仍必须失败。
+    #[test]
+    fn folding_fullwidth_does_not_revive_nickname_impersonation() {
+        let identity = IdentityAccess::new(sample_config());
+        // 只是大小写/空白/前后缀不同 —— 一律不命中。
+        for attempt in [
+            "派蒙本蒙 ",
+            " 派蒙本蒙",
+            "派蒙本蒙2",
+            "派蒙",
+            "Paimon",
+            "管理小助手x",
+        ] {
+            assert!(
+                identity.resolve(attempt).is_none(),
+                "「{attempt}」不是精确备注，不能命中任何映射"
+            );
+        }
+        // 空串永不放行。
+        assert!(identity.resolve("").is_none());
+        assert!(identity.resolve("   ").is_none());
     }
 
     /// 回归：外部源的发起人只有 UID 时，邀请必须能搜到好友列表里的名字。

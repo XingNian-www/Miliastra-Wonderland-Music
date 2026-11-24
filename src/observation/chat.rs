@@ -60,8 +60,8 @@ pub(crate) use stream::{
     SecondaryObservedMessage,
 };
 pub(crate) use visual::{
-    SecondaryChatIdentity, SecondaryHallBubble, latest_incoming_bubble_rect,
-    latest_incoming_fingerprint, secondary_hall_bubbles,
+    SECONDARY_MESSAGE_SCAN_RECT, SecondaryChatIdentity, SecondaryHallBubble,
+    latest_incoming_bubble_rect, latest_incoming_fingerprint, secondary_hall_bubbles,
 };
 
 // 单元测试（composition::application::shared_observer 等）需要这些纯函数；

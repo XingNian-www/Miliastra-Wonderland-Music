@@ -466,11 +466,14 @@ fn click_current_friend_avatar(
             "select_invite_avatar",
             InputCertainty::AfterInputUnknown,
         )?;
+        // 只考虑**有头像**的气泡：没有发言人证据的气泡拿不到可点击的头像，
+        // 让它们参与 `max_by_key` 会把点击目标变成「无」（`None` 被 map 掉）。
         let point = secondary_hall_bubbles(&image)
             .map_err(|error| after_input_failure("select_invite_avatar", error))?
             .into_iter()
-            .max_by_key(|bubble| bubble.avatar_rect().y)
-            .map(|bubble| bubble.avatar_rect().center());
+            .filter_map(|bubble| bubble.avatar_rect())
+            .max_by_key(|avatar| avatar.y)
+            .map(|avatar| avatar.center());
         match point {
             Some(point)
                 if stable_point.is_some_and(|previous: (i32, i32)| {
@@ -1142,9 +1145,10 @@ mod tests {
         let (x, y) = secondary_hall_bubbles(&frame)
             .expect("检测真实二级帧的来消息头像失败")
             .into_iter()
-            .max_by_key(|bubble| bubble.avatar_rect().y)
-            .map(|bubble| {
-                let center = bubble.avatar_rect().center();
+            .filter_map(|bubble| bubble.avatar_rect())
+            .max_by_key(|avatar| avatar.y)
+            .map(|avatar| {
+                let center = avatar.center();
                 (center.x, center.y)
             })
             .expect("真实二级帧里应当有来消息头像");

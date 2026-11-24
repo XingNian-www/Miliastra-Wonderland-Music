@@ -10,6 +10,22 @@ const MIN_VISIBLE_AVATAR_BOUNDARY_SAMPLES: usize = 24;
 const SENDER_MAX_FULLWIDTH_CHARS: u32 = 18;
 const SENDER_FULLWIDTH_CHAR_WIDTH: u32 = 21;
 const SENDER_HORIZONTAL_PADDING: u32 = 8;
+/// 发言人名字按亮像素收紧时的相对亮度阈值（高于本行中位数的量）。
+const SENDER_TEXT_LUMINANCE_DELTA: u32 = 40;
+/// 末尾至少这么多列「空白」才认定文字已结束（名字内部字距远小于它）。
+const SENDER_TRAILING_GAP_PX: usize = 24;
+/// 收紧后右端再留一点余量，避免切在最后一笔上。
+const SENDER_TRAILING_PADDING_PX: i32 = 8;
+/// 收紧后的最小宽度；比它更窄说明判断不可信，退回配置宽度。
+///
+/// 取 24 而不是「一个名字的典型宽度」：两字昵称（`昵称D`、`昵称E`）在真实帧上
+/// 只有 ~40px 宽，阈值定高会把**短名**错误地判成不可信而退回 394px 固定宽，
+/// 背景照样被吃进 OCR。真正的可信度由「文字列数」与「末尾空白长度」两个条件
+/// 保证（见 [`tight_sender_right`]）。
+const SENDER_MIN_TEXT_WIDTH_PX: u32 = 24;
+/// 至少要这么多列被判为文字，才认为「这一行确实有名字」。
+/// 单列亮点（噪点、边框反光）不算。
+const SENDER_MIN_TEXT_COLUMNS: usize = 6;
 
 #[derive(Clone, Copy, Debug)]
 struct AvatarAnchorScore {
@@ -446,13 +462,19 @@ fn associate_bubbles(
         .enumerate()
         .filter_map(|(position, anchor)| {
             let sender_top = (anchor.rect.y + config.sender_top_offset).max(0);
-            let sender_right =
+            let configured_right =
                 (config.sender_left + config.sender_width as i32).min(image.width() as i32);
             let sender_bottom =
                 (sender_top + config.sender_height as i32).min(image.height() as i32);
-            if sender_right <= config.sender_left || sender_bottom <= sender_top {
+            if configured_right <= config.sender_left || sender_bottom <= sender_top {
                 return None;
             }
+            // 固定宽度会吃进右侧 3D 场景：场景里的名牌同样是白色文字，OCR 会把
+            // `2#BOT|勿加` 读成 `2#BOT|勿加安娜`（README 人工核验过）。按本行
+            // 实际亮像素把右边界收紧到文字末尾，读不到可信文字时**保持原宽**
+            // （宁可多吃背景，也不能把窄名字裁没）。
+            let sender_right =
+                tight_sender_right(image, config, sender_top, sender_bottom, configured_right);
             let sender_rect = Rect::new(
                 config.sender_left,
                 sender_top,
@@ -479,6 +501,68 @@ fn associate_bubbles(
             })
         })
         .collect()
+}
+
+/// 按**本行实际亮像素**把发言人名字的右边界收紧到文字末尾。
+///
+/// 背景：`sender_width` 是 18 个全角字符的固定预算（394px）。名字短时，右端会
+/// 一路吃进 3D 场景；场景里的白色名牌同样是高亮文字，OCR 会把
+/// `2#BOT|勿加` 读成 `2#BOT|勿加安娜`（README:110 人工核验）。
+///
+/// 判据与界：
+/// - 用本行中位数亮度做自适应阈值（`+SENDER_TEXT_LUMINANCE_DELTA`），不假设绝对亮度；
+/// - 只在**末尾连续空白之后**裁，且只在空白宽度足够大
+///   （`SENDER_TRAILING_GAP_PX`）时才裁——名字内部字间距、名字末尾的小图标都不会被切；
+/// - 任何异常（整行读不到文字、裁完过窄、裁完只剩很小一段）都**保持原宽**：
+///   宁可多吃背景，也绝不把窄名字裁没。
+fn tight_sender_right(
+    image: &DynamicImage,
+    config: &SenderLabelConfig,
+    top: i32,
+    bottom: i32,
+    configured_right: i32,
+) -> i32 {
+    let left = config.sender_left;
+    if configured_right <= left || bottom <= top {
+        return configured_right;
+    }
+    let mut luminance = Vec::with_capacity((configured_right - left) as usize);
+    for x in left..configured_right {
+        let mut sum = 0u32;
+        let mut rows = 0u32;
+        for y in top..bottom {
+            let pixel = image.get_pixel(x as u32, y as u32).0;
+            // Rec.601 亮度；只用于「亮/暗」二分，不需要色彩精度。
+            let luma =
+                (u32::from(pixel[0]) * 299 + u32::from(pixel[1]) * 587 + u32::from(pixel[2]) * 114)
+                    / 1000;
+            sum += luma;
+            rows += 1;
+        }
+        luminance.push(if rows == 0 { 0 } else { sum / rows });
+    }
+    let mut sorted = luminance.clone();
+    sorted.sort_unstable();
+    let median = sorted[sorted.len() / 2];
+    let threshold = median.saturating_add(SENDER_TEXT_LUMINANCE_DELTA);
+    let is_text: Vec<bool> = luminance.iter().map(|value| *value > threshold).collect();
+    let Some(last_text) = is_text.iter().rposition(|is_text| *is_text) else {
+        // 整行没有可信文字：保持原宽，让 OCR 去处理（可能整段是低对比文字）。
+        return configured_right;
+    };
+    let text_columns = is_text.iter().filter(|is_text| **is_text).count();
+    if text_columns < SENDER_MIN_TEXT_COLUMNS {
+        return configured_right;
+    }
+    let trailing_gap = is_text.len() - 1 - last_text;
+    if trailing_gap < SENDER_TRAILING_GAP_PX {
+        return configured_right;
+    }
+    let candidate = left + last_text as i32 + SENDER_TRAILING_PADDING_PX;
+    if candidate - left < SENDER_MIN_TEXT_WIDTH_PX as i32 {
+        return configured_right;
+    }
+    candidate.min(configured_right)
 }
 
 fn avatar_boundary_observation(

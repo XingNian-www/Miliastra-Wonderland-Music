@@ -181,6 +181,19 @@ struct Tracker {
     visible: Vec<ChatTimelineMessage>,
 }
 
+/// 未读提升的两种授权来源。
+///
+/// - [`UnreadPromotion::BaselineOnly`]：只认「冷启动首屏写进 `unread_baseline`」的
+///   那一条。这是**历史**语义，保留给既有调用方与测试。
+/// - [`UnreadPromotion::ExplicitSelection`]：未读例程**显式指名**的最后一条入站命令。
+///   它绕开 `unread_baseline` 死锁（见 `deliver_unread_selected` 的说明），
+///   但仍受「Friend 桶 / 本快照内 / 非外部源 / 非抑制期 / 未被永久确认」五道限制。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UnreadPromotion {
+    BaselineOnly,
+    ExplicitSelection,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BusinessMessageRevision {
     text: String,
@@ -1379,6 +1392,40 @@ impl ChatTimeline {
         snapshot: &ChatTimelineSnapshot,
         id: &ObservedChatMessageId,
     ) -> Result<bool> {
+        self.deliver_unread_selected(snapshot, id, UnreadPromotion::BaselineOnly)
+    }
+
+    /// 未读例程**显式指定**一条气泡并请求派发它（不要求它先在首屏基线里）。
+    ///
+    /// ## 为什么需要这条窄通道
+    ///
+    /// `unread_baseline` 只在「冷启动首屏 + 粉色」那一个分支写入
+    /// （见 [`Self::publish`] 里的 `initial` 判据），而 `cold_baseline_consumed`
+    /// **一旦消费就永不复位**。进程通常先看到大厅，于是之后点红点打开好友会话时
+    /// `initial` 恒为 false → 该会话的粉色命令**从不进 `unread_baseline`** →
+    /// `deliver_unread_baseline` 恒返回 false → 未读例程只 warn「提升未生效」，
+    /// 但任务照旧算成功、红点照旧被清。线上表现正是
+    /// 「好友私聊红点能测到，进去后命令完全不生效」。
+    ///
+    /// ## 为什么不能直接把 `initial` 放宽成「tracker 首帧」
+    ///
+    /// 那会让**每次重开**好友会话的首屏粉色历史都变成可派发 —— 历史命令被重放。
+    /// 这里的边界收得更紧，只放行调用方**显式指名**的那一条：
+    ///
+    /// - 仍然要求是 `Friend` 屏幕桶、仍在本次快照里、不是外部源、不在业务抑制期；
+    /// - 仍然走**同一套**交付机制（推进未读围栏 + 入 pending + 写最新修订），
+    ///   所以「派发恰好一次」由既有的 `claimed` 墓碑与围栏保证，不新增重复派发面；
+    /// - **不看** `unread_baseline`：那正是本通道要绕开的死锁。
+    /// - 已在 `claimed` 里的 id 直接拒绝（历史已执行过的命令不会因此复活）。
+    ///
+    /// 调用方（`secondary_unread`）只在「用户明确点开一个带新未读的会话、并且它
+    /// 就是屏幕最下方那条入站命令」时传这条 id。
+    pub(crate) fn deliver_unread_selected(
+        &self,
+        snapshot: &ChatTimelineSnapshot,
+        id: &ObservedChatMessageId,
+        promotion: UnreadPromotion,
+    ) -> Result<bool> {
         let mut state = self.lock()?;
         if state.ledger.friend_suppressions > 0
             || !matches!(snapshot.chat.as_ref(), Some(ChatIdentity::Friend(_)))
@@ -1392,8 +1439,31 @@ impl ChatTimeline {
         if !snapshot.source.is_ocr() {
             return Ok(false);
         }
-        if !state.ledger.unread_baseline.contains(id) {
+        // 已永久确认（执行过或明确判过历史）的 id 不能借这条通道复活。
+        if state.ledger.claimed.contains(id) {
             return Ok(false);
+        }
+        if promotion == UnreadPromotion::BaselineOnly && !state.ledger.unread_baseline.contains(id)
+        {
+            return Ok(false);
+        }
+        // ExplicitSelection 的第二道结构限制：**只接受本帧最下方的那条粉色入站气泡**。
+        //
+        // 未读例程的语义是「用户点开未读会话时，读取最后发送的那条命令」。
+        // 把「最下方粉色」这个判据放进时间线而不是只留在调用方，是为了让这条窄通道
+        // **在结构上无法重放历史**：即便调用方传错 id，只要它不是最下方那条就被拒。
+        // 判据与 `secondary_unread::latest_unread_message` 完全一致
+        // （pink + 最大 y），两处漂移会立刻在这里拒绝派发。
+        if promotion == UnreadPromotion::ExplicitSelection {
+            let latest_pink = snapshot
+                .messages
+                .iter()
+                .filter(|message| message.message_type == "pink")
+                .max_by_key(|message| message.block.y)
+                .map(|message| &message.id);
+            if latest_pink != Some(id) {
+                return Ok(false);
+            }
         }
         // Use the most recent actual OCR revision so eligibility cannot append
         // an older capture behind newer queued frames or dispatch stale OCR text.
@@ -2777,6 +2847,210 @@ mod tests {
                 message.raw_sender.as_deref(),
             )
             .unwrap()
+    }
+
+    /// 红线（缺陷 #1）：**Unknown 身份不能永久 ACK**。
+    ///
+    /// 现场：二级面板昵称 OCR 失败 → `ChatIdentity::Unknown` → 旧实现在该分支调
+    /// `acknowledge_business_at`（永久 ACK，写 `claimed` 墓碑）。之后同一气泡被 OCR
+    /// 补出真实身份，也**再也救不回来**——这正是「好友私聊进去后命令完全不生效」
+    /// 且不可恢复的那条数据丢失。
+    ///
+    /// 现在 Unknown 走 `acknowledge_ignored`：只忽略本次未识别修订，
+    /// 后续有效修订到达时恰好重新交付**一次**（`claimed` 墓碑仍兜住重复派发）。
+    #[test]
+    fn unknown_identity_ack_is_recoverable_exactly_once() {
+        let shared = ChatTimeline::new();
+        // 一条未识别身份的气泡（没有 sender / raw_sender）。
+        let unrecognized = publish(&shared, vec![input("#加入", 40)]);
+        let id = unrecognized.messages[0].id.clone();
+        assert!(unrecognized.messages[0].sender.is_none());
+
+        // 旧路径会在这里永久 ACK；新路径必须只忽略本次修订。
+        assert!(
+            shared
+                .acknowledge_ignored(
+                    &id,
+                    unrecognized.captured_at,
+                    &unrecognized.messages[0].text,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            "未识别修订应被记录为「可恢复的忽略」"
+        );
+        assert!(
+            !shared
+                .is_business_pending_at(&id, unrecognized.captured_at)
+                .unwrap(),
+            "本帧未识别修订不该立刻可派发"
+        );
+        assert!(
+            !shared
+                .claim_business_at(
+                    &id,
+                    unrecognized.captured_at,
+                    "#加入",
+                    LockAnchor::Screen { y: 40 }
+                )
+                .unwrap()
+                .is_some(),
+            "未识别修订本轮不得被认领"
+        );
+
+        // 后续帧认出真实身份（同一气泡 id）：必须是**尚未**被永久 ACK。
+        let identified_snapshot = publish(&shared, vec![identified("#加入")]);
+        assert_eq!(
+            identified_snapshot.messages[0].id, id,
+            "身份修订必须落在同一个气泡 id 上"
+        );
+        assert!(
+            shared
+                .is_business_pending_at(&id, identified_snapshot.captured_at)
+                .unwrap(),
+            "认出身份后必须重新具备派发资格（旧实现这里恒 false）"
+        );
+
+        // 派发恰好一次：认领成功后 id 进入 claimed 墓碑，再次认领必须失败。
+        let message = identified_snapshot.messages[0].clone();
+        let claim = claim(&shared, &message, identified_snapshot.captured_at)
+            .expect("认出身份后应能认领一次");
+        claim.complete_as_command().unwrap();
+        let repeated = publish(&shared, vec![identified("#加入")]);
+        assert_eq!(repeated.messages[0].id, id);
+        assert!(
+            !shared
+                .is_business_pending_at(&id, repeated.captured_at)
+                .unwrap(),
+            "已派发过的同一 id 不得重新交付，否则命令会重复执行"
+        );
+        assert!(
+            !shared
+                .claim_business_at(
+                    &id,
+                    repeated.captured_at,
+                    "#加入",
+                    LockAnchor::Screen { y: 40 }
+                )
+                .unwrap()
+                .is_some(),
+            "claimed 墓碑必须挡住第二次派发"
+        );
+    }
+
+    /// 红线（R2）：进程**已消费冷基线**后点红点开好友会话，未读例程显式指名的
+    /// 那条命令必须恰好派发一次；重开同一会话不得重放历史。
+    ///
+    /// 旧实现只有 `unread_baseline` 一条通道，而它只在冷启动首屏 + 粉色时写入；
+    /// `cold_baseline_consumed` 一旦为 true 永不复位，于是真实用户（先去大厅、
+    /// 后开好友私聊）永远提升不成功 → 命令一条都不派发，红点却被清掉。
+    #[test]
+    fn explicit_unread_promotion_delivers_once_after_cold_baseline_consumed() {
+        let shared = ChatTimeline::new();
+        let listener = shared.subscribe().unwrap();
+
+        // 先看到大厅：这一步把 `cold_baseline_consumed` 置位（真实用户常态）。
+        publish(&shared, vec![input("hall chatter", 40)]);
+        // 排空大厅那一帧的投递，后面断言只针对好友会话的提升结果。
+        listener.read().unwrap();
+        assert!(
+            shared
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .ledger
+                .cold_baseline_consumed,
+            "前提：冷基线必须已被消费，否则测的不是真实现场"
+        );
+
+        // 之后点红点打开好友会话：首屏两条历史 + 一条待派发命令。
+        let snapshot = friend(
+            &shared,
+            vec![input("old history command", 10), input("@邀请465", 40)],
+        );
+        // 排空这一帧的常规投递，后面只断言「提升」产生的那一份资格修订。
+        listener.read().unwrap();
+        let command = snapshot.messages[1].id.clone();
+        // 关键前提：这条**没有**进 unread_baseline（旧实现因此恒返回 false）。
+        assert!(
+            !shared
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .ledger
+                .unread_baseline
+                .contains(&command),
+            "前提：非冷启动首屏不会写 unread_baseline，这正是死锁点"
+        );
+        assert!(
+            !shared.deliver_unread_baseline(&snapshot, &command).unwrap(),
+            "旧通道必须仍然拒绝（证明死锁真实存在）"
+        );
+
+        // 新的窄通道：显式指名的那条可以派发。
+        assert!(
+            shared
+                .deliver_unread_selected(&snapshot, &command, UnreadPromotion::ExplicitSelection)
+                .unwrap(),
+            "显式指名的未读命令必须能派发"
+        );
+        let delivered = listener.read().unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].messages.len(), 1, "只派发被指名的那一条");
+        assert_eq!(delivered[0].messages[0].id, command);
+        assert!(
+            !delivered.iter().any(|revision| revision
+                .messages
+                .iter()
+                .any(|message| message.text == "old history command")),
+            "历史命令不得被一并放行"
+        );
+
+        // 派发并置墓碑后，同一 id 不能再提升（防重复派发）。
+        assert!(
+            shared
+                .claim_business_at(
+                    &command,
+                    delivered[0].captured_at,
+                    "@邀请465",
+                    LockAnchor::Screen { y: 40 }
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            shared
+                .acknowledge_business_at(&command, delivered[0].captured_at)
+                .unwrap()
+        );
+        assert!(
+            !shared
+                .deliver_unread_selected(&snapshot, &command, UnreadPromotion::ExplicitSelection)
+                .unwrap(),
+            "已被永久确认的命令不得再次提升"
+        );
+
+        // 重开同一会话（气泡 id 因跨帧对齐而相同）：历史不得重放。
+        let reopened = friend(
+            &shared,
+            vec![input("old history command", 10), input("@邀请465", 40)],
+        );
+        assert_eq!(reopened.messages[1].id, command, "重开必须复用同一气泡 id");
+        let history = reopened.messages[0].id.clone();
+        assert!(
+            !shared
+                .deliver_unread_selected(&reopened, &history, UnreadPromotion::ExplicitSelection)
+                .unwrap(),
+            "重开同一会话不得把历史命令重放"
+        );
+        assert!(
+            !shared
+                .deliver_unread_selected(&reopened, &command, UnreadPromotion::ExplicitSelection)
+                .unwrap(),
+            "已派发过的命令不得因重开而再派发"
+        );
     }
 
     /// 构造一条「已被更新修订推进围栏」的消息，返回 (id, 旧快照时间, 新快照时间)。

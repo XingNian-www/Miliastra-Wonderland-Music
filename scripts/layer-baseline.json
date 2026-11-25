@@ -2720,7 +2720,7 @@
       "pub_items": 11
     },
     "src/observation/chat/passive.rs": {
-      "lines": 664,
+      "lines": 669,
       "pub_items": 15
     },
     "src/observation/chat/scan.rs": {
@@ -2752,7 +2752,7 @@
       "pub_items": 8
     },
     "src/observation/chat/secondary_hall_vision/mod.rs": {
-      "lines": 79,
+      "lines": 83,
       "pub_items": 2
     },
     "src/observation/chat/secondary_hall_vision/sender_label.rs": {

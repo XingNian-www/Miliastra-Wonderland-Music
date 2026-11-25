@@ -408,20 +408,25 @@ pub(crate) fn recognize_passive_secondary(
     } else {
         Default::default()
     };
+    // 署名缺失时仍交付正文（旧实现是整条丢掉，大厅又无单气泡兜底 → 整帧零消息）。
+    // 告警只在**这里**发一次，不在布局阶段发：布局阶段（`passive_layout`）在聊天桥
+    // 接管期间照跑，那一帧的气泡随后会被整帧丢弃，报警只会刷出假故障。
+    let orphaned_senders = bubbles
+        .iter()
+        .filter(|bubble| bubble.sender_rect().is_none())
+        .count();
     let mut messages = recognize_passive_hall(
         bubbles
             .iter()
-            // 署名缺失时传 `None`：正文照常识别，sender 走空串 + 一条带原因的 warn。
-            // 旧行为是整条气泡在更上游就被丢掉，大厅又无单气泡兜底 → 整帧零消息。
-            .map(|bubble| {
-                let sender_rect = bubble.sender_rect();
-                if sender_rect.is_none() {
-                    log::warn!("二级大厅气泡缺少发言人区域（头像边界/纹理证据不足），仅按正文交付");
-                }
-                (bubble.rect, sender_rect)
-            }),
+            .map(|bubble| (bubble.rect, bubble.sender_rect())),
         |rect| passive_text(ocr, image, rect, config.ocr.same_line_y_tolerance),
     )?;
+    if orphaned_senders > 0 {
+        log::warn!(
+            "二级大厅视觉：{} 个气泡中有 {orphaned_senders} 个没能关联到发言人证据（头像边界/纹理证据不足），这些气泡仍按正文交付，但署名为空——身份/权限会因此退回来源下界；若持续出现请核对该分辨率的头像定位常量",
+            bubbles.len()
+        );
+    }
     for message in &mut messages {
         message.message_type = message_type.into();
         // 「左侧列表里的名字 = 好友」：只有大厅帧才有意义（私聊已是 Friend）。

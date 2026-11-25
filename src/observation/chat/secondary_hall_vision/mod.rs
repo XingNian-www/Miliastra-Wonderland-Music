@@ -65,10 +65,14 @@ pub(super) fn confirmed_secondary_hall_bubbles(
     if total_detected == 0 {
         log::debug!("二级大厅视觉：本帧没有检测到气泡（画面可能没有新消息）");
     } else if orphaned > 0 {
-        log::warn!(
-            "二级大厅视觉：{total_detected} 个气泡中有 {orphaned} 个没能关联到发言人证据\
-             （头像边界/纹理证据不足），这些气泡仍按正文交付，但署名为空——\
-             身份/权限会因此退回来源下界；若持续出现请核对该分辨率的头像定位常量"
+        // 这里**只记 debug**：本函数由 `passive_layout`（界面判断）调用，而界面判断
+        // 在外部聊天源（聊天桥）接管期间**仍然照跑**——那些气泡随后会被整帧丢弃，
+        // 对它报 warn 只会刷出「接管期间也提示发言人缺失」的假故障。
+        // 真正可行动的告警在 `recognize_passive_secondary`：那里只在确实要 OCR 交付时
+        // 才执行，接管期间不会跑。
+        log::debug!(
+            "二级大厅视觉（仅布局阶段，结果可能被丢弃）：{total_detected} 个气泡中有 \
+             {orphaned} 个没能关联到发言人证据（头像边界/纹理证据不足）"
         );
     }
     bubbles

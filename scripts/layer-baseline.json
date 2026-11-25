@@ -2072,7 +2072,7 @@
       "pub_items": 1
     },
     "src/composition/application/external_chat.rs": {
-      "lines": 3834,
+      "lines": 3846,
       "pub_items": 52
     },
     "src/composition/application/formal_task.rs": {

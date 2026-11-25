@@ -184,7 +184,7 @@ impl ApplicationRuntime {
                                 // 外部源接管：内容由 WS 提供，这里不再 OCR。
                                 // 不发布任何帧——空帧会把 cold_baseline_consumed 置 true，
                                 // 影响 API 断开后回落 OCR 的首帧语义；而注入本身不依赖界面帧。
-                                if external_chat.is_active() {
+                                if crate::composition::application::external_chat::should_skip_ocr(&external_chat) {
                                     outcome = "external";
                                     monitor.publish_chat_scan(ChatScanTelemetry {
                                         marker_count: 0,
@@ -223,7 +223,7 @@ impl ApplicationRuntime {
                                 bubbles,
                                 latest,
                             } => {
-                                if external_chat.is_active() {
+                                if crate::composition::application::external_chat::should_skip_ocr(&external_chat) {
                                     // 外部源接管：这个聊天桶由 `inject_external` 独占。
                                     // 这里**什么都不发布**——连空帧也不发：
                                     //   · 空帧会把 `cold_baseline_consumed` 置 true，

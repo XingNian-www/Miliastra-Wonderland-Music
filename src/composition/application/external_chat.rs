@@ -2522,6 +2522,18 @@ mod tests {
     }
 
     #[test]
+    fn active_state_skips_ocr_so_takeover_frames_do_no_interface_recognition() {
+        // 接管后内容由 socket 注入：观察线程必须整帧跳过界面识别。
+        // `shared_observer` 把这个判断放在 `passive_layout` **之前**，
+        // 因为布局判定要扫整块气泡像素，接管期间它的结果只用于日志。
+        let state = ExternalChatState::default();
+        state.mark_active_for_test();
+        assert!(state.is_active());
+        assert!(should_skip_ocr(&state));
+        assert!(state.supplies_hall_messages());
+    }
+
+    #[test]
     fn watermark_is_set_once_and_ignores_startup_history() {
         let state = ExternalChatState::default();
         // 握手前没有水位：不过滤。

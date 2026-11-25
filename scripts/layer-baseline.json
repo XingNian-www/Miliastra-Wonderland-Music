@@ -2344,7 +2344,7 @@
       "pub_items": 28
     },
     "src/features/identity.rs": {
-      "lines": 2491,
+      "lines": 2487,
       "pub_items": 47
     },
     "src/features/idiom_chain.rs": {
@@ -2720,8 +2720,8 @@
       "pub_items": 11
     },
     "src/observation/chat/passive.rs": {
-      "lines": 669,
-      "pub_items": 15
+      "lines": 757,
+      "pub_items": 16
     },
     "src/observation/chat/scan.rs": {
       "lines": 840,

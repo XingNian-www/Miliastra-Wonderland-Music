@@ -39,7 +39,7 @@ impl SecondarySenderIdentity {
 /// 解析发言人名字里的「游戏内备注」：`昵称(备注)` / `昵称（备注）`。
 ///
 /// **括号必须跨类型配对**：半角 `()` 与全角 `（）` 在游戏里是同一个语义，OCR 却经常
-/// 一半读半角一半读全角（真实样本 `昵称A(备注A）`）。旧实现把两种括号当两套
+/// 一半读半角一半读全角（线上样本 `昵称(备注）`）。旧实现把两种括号当两套
 /// 独立配对，混用就解析不出备注，sender 保留整串 → 身份精确匹配落空 → 权限掉回
 /// User 下界。这是**稳定失败**（不会自愈）：同一玩家的名字每次都这样读。
 ///
@@ -427,6 +427,8 @@ pub(crate) fn recognize_passive_secondary(
             bubbles.len()
         );
     }
+    // 私聊：缺失署名用**左侧选中行**补（比逐条名字行更快也更稳，见函数文档）。
+    fill_private_sender_from_selection(&identity, selected_name.as_deref(), &mut messages);
     for message in &mut messages {
         message.message_type = message_type.into();
         // 「左侧列表里的名字 = 好友」：只有大厅帧才有意义（私聊已是 Friend）。
@@ -509,6 +511,43 @@ pub(crate) fn passive_sender(raw: &str) -> Option<String> {
     (!effective.is_empty()).then(|| effective.to_owned())
 }
 
+/// 私聊气泡的缺失署名用「左侧选中行」补上。
+///
+/// 抽成纯函数是为了能脱离 OCR 单测这段策略本身（它决定面板上显示谁、以及
+/// 歌单/记忆归属到谁）。
+///
+/// 规则：
+/// 1. **只补缺失的**：气泡若自己读到了名字（例如系统通知的独立署名），保留原值，
+///    不强行覆盖——逐条证据比会话级推断更具体。
+/// 2. 只在**私聊**（`ChatIdentity::Friend`）时补：大厅里多个发言人必须逐条区分。
+/// 3. `raw_sender` 与 `sender` 一起填：下游 `ChatTimelineMessage` 的比较口径看
+///    `raw_sender`，只填一个会让「有效修订」比对不上。
+///
+/// 为什么私聊可以直接用会话身份：
+/// - 私聊里入站消息只可能是对面那一个人发的（BOT 的白色气泡已被色窗过滤）；
+/// - 左侧选中行只 OCR 一次，逐条名字行要每气泡各一次，更慢；
+/// - 逐条名字行更脆：首条消息的名字行常滚出搜索区顶边（实测 dm-01 名字行
+///   y=82 < search_top=87），那条永远读不到 → 同一会话里有的有署名有的没有。
+pub(crate) fn fill_private_sender_from_selection(
+    identity: &ChatIdentity,
+    selected_name: Option<&str>,
+    messages: &mut [RecognizedChatMessage],
+) {
+    if !matches!(identity, ChatIdentity::Friend(_)) {
+        return;
+    }
+    let Some(name) = selected_name else {
+        return;
+    };
+    for message in messages {
+        if message.sender.is_some() {
+            continue;
+        }
+        message.sender = passive_sender(name);
+        message.raw_sender = Some(name.to_string());
+    }
+}
+
 pub(crate) fn passive_secondary_identity(hall: bool, selected_name: Option<&str>) -> ChatIdentity {
     if hall {
         return ChatIdentity::SecondaryHall;
@@ -542,7 +581,8 @@ mod tests {
 
     /// 括号**跨类型**配对：半角/全角混用也必须解析出备注。
     ///
-    /// 真实样本 `昵称A(备注A）` 是症状1的触发源（9 条真实帧都由它引起）：
+    /// 线上样本形如 `昵称(备注）`（括号半角/全角混用）是症状1的触发源
+    /// （9 条真实帧都由它引起）：
     /// 旧实现把 `()` 与 `（）` 当两套独立配对，混用就解析不出备注 → sender 保留
     /// 整串 → 身份精确匹配落空 → 权限掉回 User 下界，且**稳定失败**（不会自愈）。
     #[test]
@@ -613,6 +653,7 @@ mod tests {
         assert!(!sidebar.is_empty());
 
         // 全角/半角差异被折平 → 同一个键（OCR 常见抖动，必须命中）。
+        // 用带拉丁字母的占位符来演示：中文没有「全角/半角对偶形」可折。
         for sender in ["PlayerB", "ＰｌａｙｅｒＢ"] {
             assert!(
                 sidebar.contains(&crate::text::fold_wide(sender)),
@@ -643,6 +684,53 @@ mod tests {
         // 列表读空（OCR 失败）→ 空集合 → 谁都不算好友，退回原下界。
         let empty: std::collections::BTreeSet<String> = Default::default();
         assert!(empty.is_empty());
+    }
+
+    /// 私聊：缺失署名用左侧选中行补，但**不覆盖**已有署名，也不影响大厅帧。
+    ///
+    /// 线上形态：私聊里入站消息只可能是对面那一个人发的（BOT 白色气泡已被色窗过滤），
+    /// 所以「会话是谁」等价于「每条是谁」。左侧选中行只 OCR 一次，比逐条名字行更快；
+    /// 而逐条名字行更脆——首条消息的名字行常滚出搜索区顶边（实测名字行 y=82 <
+    /// search_top=87），那条永远读不到，于是同一个会话里有的有署名有的没有。
+    #[test]
+    fn private_chat_fills_missing_senders_from_the_selected_conversation() {
+        let message = |sender: Option<&str>| RecognizedChatMessage {
+            text: "@邀请123".into(),
+            sender: sender.map(str::to_string),
+            raw_sender: sender.map(str::to_string),
+            message_type: "pink".into(),
+            block: Rect::new(410, 100, 200, 60),
+            sender_in_friend_list: false,
+        };
+
+        // 私聊：缺失的被补上，已有署名保持不动（逐条证据比会话级推断更具体）。
+        let mut messages = vec![message(None), message(Some("系统通知"))];
+        fill_private_sender_from_selection(
+            &ChatIdentity::Friend("对面玩家".into()),
+            Some("对面玩家"),
+            &mut messages,
+        );
+        assert_eq!(messages[0].sender.as_deref(), Some("对面玩家"));
+        assert_eq!(messages[0].raw_sender.as_deref(), Some("对面玩家"));
+        assert_eq!(
+            messages[1].sender.as_deref(),
+            Some("系统通知"),
+            "已有署名不得被会话身份覆盖"
+        );
+
+        // 大厅：多个发言人必须逐条区分，绝不能用会话身份统一填。
+        let mut hall = vec![message(None)];
+        fill_private_sender_from_selection(
+            &ChatIdentity::SecondaryHall,
+            Some("对面玩家"),
+            &mut hall,
+        );
+        assert_eq!(hall[0].sender, None, "大厅帧不得用选中行补署名");
+
+        // 左侧没读到名字：什么都不做，保持空署名（不知道就留空，不猜）。
+        let mut unknown = vec![message(None)];
+        fill_private_sender_from_selection(&ChatIdentity::Friend("x".into()), None, &mut unknown);
+        assert_eq!(unknown[0].sender, None);
     }
 
     /// 高亮行 OCR 多行时取**首行**作会话名（忽略预览/状态行）。

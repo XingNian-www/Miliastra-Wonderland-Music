@@ -1284,11 +1284,7 @@ mod tests {
             remark: "昵称A（备注A）".to_owned(),
             id: Uuid::from_u128(11),
             role: IdentityRole::Friend,
-            ..mapping(
-                "昵称A（备注A）",
-                Uuid::from_u128(11),
-                IdentityRole::Friend,
-            )
+            ..mapping("昵称A（备注A）", Uuid::from_u128(11), IdentityRole::Friend)
         });
         let identity = IdentityAccess::new(config);
         assert_eq!(

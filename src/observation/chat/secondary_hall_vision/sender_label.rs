@@ -461,7 +461,17 @@ fn associate_bubbles(
         .iter()
         .enumerate()
         .filter_map(|(position, anchor)| {
-            let sender_top = (anchor.rect.y + config.sender_top_offset).max(0);
+            // 头像贴到视口顶部时，它**上方**那行名字会被裁掉：读出来的名字不可信，
+            // 一旦拿它去归属气泡就会产生错误署名（比没有署名更糟——权限/歌单会记到
+            // 别人头上）。这种头像整体跳过，它的气泡保持无署名。
+            //
+            // 判定用**未裁剪**的标签顶：一旦被 `.max(0)` 夹到 0 就分不清「本来就在顶部」
+            // 和「被裁掉了」。
+            let sender_top_raw = anchor.rect.y + config.sender_top_offset;
+            if sender_top_raw < config.search_rect.y {
+                return None;
+            }
+            let sender_top = sender_top_raw.max(0);
             let configured_right =
                 (config.sender_left + config.sender_width as i32).min(image.width() as i32);
             let sender_bottom =
@@ -481,10 +491,20 @@ fn associate_bubbles(
                 (sender_right - config.sender_left) as u32,
                 (sender_bottom - sender_top) as u32,
             );
-            let first_bubble_y = sender_rect.bottom();
+            // 归属窗口 = `[本头像顶, 下一个头像顶)`，**不是**「标签框底 → 下一个标签框顶」。
+            //
+            // 标签框是固定的 36px 高，而名字实际只占约 20px，所以「标签框底」
+            // （= 头像顶 + 26px）落在**头像内部**。游戏排版里每组的第一条气泡紧贴
+            // 头像下沿，气泡顶常常只比头像顶低 10~15px，正好被这个下界排除：
+            // 实测真图组0 气泡顶 193 / 窗口起点 207（差 14px）→ 首条气泡永远丢署名，
+            // 而头像证据本身是充足的（boundary 72/24、texture 588/250）。
+            //
+            // 用头像顶做下界后，相邻两组首尾相接、不重不漏；比该头像更早的气泡
+            // 仍归上一组（或第一组之外不归属），不会串到别人头上。
+            let first_bubble_y = anchor.rect.y;
             let next_label_y = avatar_anchors
                 .get(position + 1)
-                .map(|anchor| anchor.rect.y + config.sender_top_offset)
+                .map(|anchor| anchor.rect.y)
                 .unwrap_or(config.search_rect.bottom());
             let bubble_indices = bubbles
                 .iter()
@@ -676,7 +696,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn associates_a_first_bubble_at_the_smallest_reviewed_visible_label_gap() {
+    fn associates_a_bubble_that_sits_just_below_its_avatar() {
         let image = DynamicImage::new_rgba8(1920, 1080);
         let config = SenderLabelConfig::default();
         let anchors = vec![
@@ -695,6 +715,73 @@ mod tests {
 
         assert_eq!(labels.len(), 1);
         assert_eq!(labels[0].bubble_indices, vec![0]);
+    }
+
+    /// 回归：每组**第一条**气泡紧贴头像下沿时也必须拿到署名。
+    ///
+    /// 旧实现把归属窗口下界设成「标签框底」= 头像顶 + 26px。标签框固定 36px 高、
+    /// 名字实际只占约 20px，于是这个下界落在**头像内部**；而游戏排版里每组第一条
+    /// 气泡的顶边通常只比头像顶低 10~15px → 永远落在窗口之前、永远没有署名。
+    /// 真图实测：头像 y=181 → 窗口起点 207，气泡顶 193（差 14px）→ 丢署名；
+    /// 而同一帧头像证据是充足的（boundary 72/24、texture 588/250），
+    /// 所以线上那条「头像证据不足」的告警其实一直在误导排查方向。
+    #[test]
+    fn first_bubble_touching_the_avatar_still_gets_its_sender() {
+        let image = DynamicImage::new_rgba8(1920, 1080);
+        let config = SenderLabelConfig::default();
+        let anchors = vec![
+            DetectedAvatarAnchor {
+                rect: Rect::new(302, 181, 88, 88),
+            },
+            DetectedAvatarAnchor {
+                rect: Rect::new(302, 367, 88, 88),
+            },
+        ];
+        let bubbles = vec![
+            // 紧贴头像下沿（旧实现下界 207，这里 193 → 差 14px 落空）
+            DetectedBubble {
+                rect: Rect::new(410, 193, 284, 157),
+            },
+            // 第二组：正常间距
+            DetectedBubble {
+                rect: Rect::new(410, 400, 256, 65),
+            },
+        ];
+
+        let labels = associate_bubbles(&image, &bubbles, &config, &anchors);
+
+        assert_eq!(labels.len(), 2, "两个头像都应各自关联到气泡");
+        assert_eq!(
+            labels[0].bubble_indices,
+            vec![0],
+            "第一条气泡属于第一个头像"
+        );
+        assert_eq!(
+            labels[1].bubble_indices,
+            vec![1],
+            "第二条气泡属于第二个头像"
+        );
+    }
+
+    /// 边界安全：比第一个头像更早的气泡不归属任何人，绝不串到第一个发言人头上。
+    #[test]
+    fn a_bubble_above_the_first_avatar_is_never_attributed_to_it() {
+        let image = DynamicImage::new_rgba8(1920, 1080);
+        let config = SenderLabelConfig::default();
+        let anchors = vec![DetectedAvatarAnchor {
+            rect: Rect::new(302, 181, 88, 88),
+        }];
+        // 头像之上（画面顶部那条头像被搜索区裁掉的消息）
+        let bubbles = vec![DetectedBubble {
+            rect: Rect::new(410, 110, 300, 60),
+        }];
+
+        let labels = associate_bubbles(&image, &bubbles, &config, &anchors);
+
+        assert!(
+            labels.is_empty(),
+            "头像之上没有锚点的气泡不得归给该发言人：{labels:?}"
+        );
     }
 
     #[test]

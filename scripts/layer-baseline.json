@@ -2756,7 +2756,7 @@
       "pub_items": 2
     },
     "src/observation/chat/secondary_hall_vision/sender_label.rs": {
-      "lines": 757,
+      "lines": 844,
       "pub_items": 3
     },
     "src/runtime/business.rs": {

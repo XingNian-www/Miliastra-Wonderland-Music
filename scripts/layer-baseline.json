@@ -2720,7 +2720,7 @@
       "pub_items": 11
     },
     "src/observation/chat/passive.rs": {
-      "lines": 757,
+      "lines": 773,
       "pub_items": 16
     },
     "src/observation/chat/scan.rs": {
@@ -2748,7 +2748,7 @@
       "pub_items": 13
     },
     "src/observation/chat/secondary_hall_vision/detection.rs": {
-      "lines": 269,
+      "lines": 270,
       "pub_items": 8
     },
     "src/observation/chat/secondary_hall_vision/mod.rs": {
@@ -2848,7 +2848,7 @@
       "pub_items": 3
     },
     "src/runtime/ocr/batch.rs": {
-      "lines": 327,
+      "lines": 504,
       "pub_items": 3
     },
     "src/runtime/ocr/engine.rs": {

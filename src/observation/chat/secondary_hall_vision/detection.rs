@@ -1,6 +1,7 @@
 use image::{DynamicImage, GenericImageView};
 
 const MAX_RIGHT_EDGE_GAP: i32 = 8;
+
 const STRONG_ROW_PERCENT: usize = 45;
 const MAX_INTERNAL_WEAK_ROWS: usize = 24;
 

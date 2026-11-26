@@ -408,17 +408,33 @@ pub(crate) fn recognize_passive_secondary(
     } else {
         Default::default()
     };
+    // **私聊跳过逐条署名 OCR**：署名一律由左侧选中行给出（见
+    // `fill_private_sender_from_selection`）。
+    //
+    // 理由：私聊里入站消息只可能是对面那一个人发的（BOT 的白色气泡已被色窗过滤），
+    // 逐条读「气泡上方那行名字」除了多花 N 次串行 OCR 之外不提供任何额外信息。
+    // OCR 是单 worker 串行队列，一个 10 条消息的私聊帧原本要 `1 + 2N` 次调用
+    // （约 1~3 秒）；跳过署名后降到 `1 + N`，延迟直接减半。
+    //
+    // 大厅不能这么做：那里一条屏幕上可能同时有多个发言人，必须逐条区分。
+    let read_senders = hall;
     // 署名缺失时仍交付正文（旧实现是整条丢掉，大厅又无单气泡兜底 → 整帧零消息）。
     // 告警只在**这里**发一次，不在布局阶段发：布局阶段（`passive_layout`）在聊天桥
     // 接管期间照跑，那一帧的气泡随后会被整帧丢弃，报警只会刷出假故障。
-    let orphaned_senders = bubbles
-        .iter()
-        .filter(|bubble| bubble.sender_rect().is_none())
-        .count();
-    let mut messages = recognize_passive_hall(
+    let orphaned_senders = if read_senders {
         bubbles
             .iter()
-            .map(|bubble| (bubble.rect, bubble.sender_rect())),
+            .filter(|bubble| bubble.sender_rect().is_none())
+            .count()
+    } else {
+        0
+    };
+    let mut messages = recognize_passive_hall(
+        bubbles.iter().map(|bubble| {
+            // 私聊不读署名，把署名区当作「没有」传下去，正文照常识别。
+            let sender_rect = read_senders.then(|| bubble.sender_rect()).flatten();
+            (bubble.rect, sender_rect)
+        }),
         |rect| passive_text(ocr, image, rect, config.ocr.same_line_y_tolerance),
     )?;
     if orphaned_senders > 0 {
